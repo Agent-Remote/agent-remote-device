@@ -1,0 +1,125 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate Rust coverage report
+        run: cargo llvm-cov --workspace --fail-under-lines 75 --lcov --output-path rust-lcov.info
+      - name: Upload Rust coverage to Codecov
+        uses: codecov/codecov-action@v7.0.0
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: ./rust-lcov.info
+          flags: rust
+          use_oidc: true
+      - name: Resolve proxy package version
+        id: package-version
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --format-version=1 --no-deps | python3 -c \
+            'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "agent-remote-device-proxy"))')
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid proxy package version: $version" >&2
+            exit 1
+          fi
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+      - name: Package native Linux proxy artifact
+        env:
+          VERSION: ${{ steps.package-version.outputs.value }}
+        run: scripts/package-proxy-release.sh
+      - name: Verify proxy artifact metadata
+        env:
+          VERSION: ${{ steps.package-version.outputs.value }}
+        run: |
+          test -x dist/device-proxies/linux-amd64-glibc/agent-remote-device-proxy
+          test "$(cat dist/device-proxies/linux-amd64-glibc/VERSION)" = "$VERSION"
+          cd dist/device-proxies/linux-amd64-glibc
+          sha256sum --check SHA256SUMS
+
+  swift:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - run: bash tests/release_scripts_test.sh
+      - run: ruby tests/localization_catalog_test.rb
+      - run: ruby tests/logging_privacy_contract_test.rb
+      - run: ruby tests/isolation_evidence_verifier_test.rb
+      - name: Run Swift tests with coverage
+        run: swift test --enable-code-coverage
+      - name: Enforce Swift coverage floor
+        run: scripts/check-swift-coverage.sh
+      - name: Verify packaged XPC process chain
+        run: scripts/verify-development-xpc.sh
+      - name: Generate Swift coverage report
+        run: |
+          test_binary=".build/debug/AgentRemoteDevicePackageTests.xctest/Contents/MacOS/AgentRemoteDevicePackageTests"
+          test -x "$test_binary"
+          xcrun llvm-cov export \
+            -format=lcov \
+            -instr-profile .build/debug/codecov/default.profdata \
+            -ignore-filename-regex='(/\.build/checkouts/|/Tests/|/\.build/)' \
+            "$test_binary" > swift-lcov.info
+      - name: Upload Swift coverage to Codecov
+        uses: codecov/codecov-action@v7.0.0
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: ./swift-lcov.info
+          flags: swift
+          use_oidc: true
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Run bounded protocol parser fuzzing
+        run: cargo fuzz run protocol fuzz/corpus/protocol -- -max_total_time=60 -timeout=10
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Reject known vulnerable Rust dependencies
+        run: cargo audit --json > cargo-audit.json
+      - name: Enforce dependency licenses and trusted sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: Reject known vulnerable Swift dependencies
+        run: scripts/audit-swift-dependencies.sh Package.resolved swift-osv.json
+      - name: Upload dependency vulnerability reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: agent-remote-device-vulnerability-reports
+          path: |
+            cargo-audit.json
+            swift-osv.json
+          if-no-files-found: error

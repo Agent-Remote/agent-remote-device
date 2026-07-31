@@ -1,0 +1,257 @@
+import CoreGraphics
+import DeviceProtocol
+import DeviceSecurity
+import Foundation
+import ImageIO
+import Testing
+import UniformTypeIdentifiers
+@testable import GUIExecutor
+
+@Test func captureScalingPreservesAspectRatioWithoutUpscaling() {
+    #expect(WindowCapture.scaledSize(
+        sourceWidth: 2_000,
+        sourceHeight: 1_000,
+        maximumWidth: 1_000,
+        maximumHeight: 1_000
+    ) == (1_000, 500))
+    #expect(WindowCapture.scaledSize(
+        sourceWidth: 400,
+        sourceHeight: 300,
+        maximumWidth: 1_000,
+        maximumHeight: 1_000
+    ) == (400, 300))
+    #expect(WindowCapture.scaledSize(
+        sourceWidth: 0,
+        sourceHeight: 300,
+        maximumWidth: 1_000,
+        maximumHeight: 1_000
+    ) == (0, 0))
+}
+
+@Test func coordinateMappingUsesImageRelativeCoordinates() throws {
+    let point = try #require(CoordinateMapper.screenPoint(
+        imagePoint: .init(x: 500, y: 250),
+        pixelWidth: 1_000,
+        pixelHeight: 500,
+        windowFrame: CGRect(x: 100, y: 200, width: 2_000, height: 1_000)
+    ))
+    #expect(point == CGPoint(x: 1_100, y: 700))
+    #expect(CoordinateMapper.screenPoint(
+        imagePoint: .init(x: 1_000, y: 0),
+        pixelWidth: 1_000,
+        pixelHeight: 500,
+        windowFrame: CGRect(x: 0, y: 0, width: 100, height: 100)
+    ) == nil)
+}
+
+@Test func displaySelectionUsesLargestWindowIntersectionIndependentOfInputOrder() {
+    let displays: [(displayID: CGDirectDisplayID, frame: CGRect)] = [
+        (20, CGRect(x: 0, y: 0, width: 1_000, height: 800)),
+        (10, CGRect(x: -1_000, y: 0, width: 1_000, height: 800)),
+    ]
+    let window = CGRect(x: -200, y: 100, width: 600, height: 400)
+
+    #expect(WindowCapture.selectedDisplayID(for: window, from: displays) == 20)
+    #expect(WindowCapture.selectedDisplayID(for: window, from: Array(displays.reversed())) == 20)
+}
+
+@Test func displaySelectionUsesStableIDForEqualIntersectionsAndRejectsEdgeContact() {
+    let displays: [(displayID: CGDirectDisplayID, frame: CGRect)] = [
+        (20, CGRect(x: 0, y: 0, width: 1_000, height: 800)),
+        (10, CGRect(x: -1_000, y: 0, width: 1_000, height: 800)),
+    ]
+
+    #expect(WindowCapture.selectedDisplayID(
+        for: CGRect(x: -100, y: 100, width: 200, height: 200),
+        from: displays
+    ) == 10)
+    #expect(WindowCapture.selectedDisplayID(
+        for: CGRect(x: 1_000, y: 100, width: 200, height: 200),
+        from: displays
+    ) == nil)
+}
+
+@Test func zoomCropProducesANewImageRelativeCoordinateFrame() throws {
+    let application = ApplicationIdentity(
+        bundleIdentifier: "dev.example.App",
+        signingIdentifier: "dev.example.App"
+    )
+    let capture = CapturedWindow(
+        pngData: try testPNG(width: 4, height: 4),
+        pixelWidth: 4,
+        pixelHeight: 4,
+        windowID: 1,
+        windowFrame: CGRect(x: 100, y: 200, width: 40, height: 40),
+        coordinateFrame: CGRect(x: 100, y: 200, width: 40, height: 40),
+        processID: 2,
+        application: application,
+        displayFingerprint: "display"
+    )
+
+    let cropped = try WindowCapture.cropped(
+        capture,
+        to: Region(x: 1, y: 1, width: 2, height: 2)
+    )
+
+    #expect(cropped.pixelWidth == 2)
+    #expect(cropped.pixelHeight == 2)
+    #expect(cropped.windowFrame == capture.windowFrame)
+    #expect(cropped.coordinateFrame == CGRect(x: 110, y: 210, width: 20, height: 20))
+    let source = try #require(CGImageSourceCreateWithData(cropped.pngData as CFData, nil))
+    let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+    #expect(image.width == 2)
+    #expect(image.height == 2)
+}
+
+@Test func escapeMonitorRecognizesOnlyTheGlobalEscapeKeyCode() {
+    #expect(GlobalStopMonitor.isEscape(keyCode: 53))
+    #expect(!GlobalStopMonitor.isEscape(keyCode: 36))
+    #expect(!GlobalStopMonitor.isEscape(keyCode: 0))
+}
+
+@Test func visibilityJournalUsesOwnerOnlyFileAndRoundTripsBoundedRecords() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let journal = VisibilityJournal(
+        fileURL: directory.appendingPathComponent("hidden-applications.json")
+    )
+    let records = [
+        HiddenApplicationRecord(processIdentifier: 42, bundleIdentifier: "dev.example.App"),
+    ]
+
+    try journal.save(records)
+    #expect(try journal.load() == records)
+    let attributes = try FileManager.default.attributesOfItem(atPath: journal.fileURL.path)
+    #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    try journal.remove()
+    #expect(!FileManager.default.fileExists(atPath: journal.fileURL.path))
+}
+
+@Test func visibilityJournalRejectsGroupReadableFiles() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let fileURL = directory.appendingPathComponent("hidden-applications.json")
+    FileManager.default.createFile(
+        atPath: fileURL.path,
+        contents: Data("[]".utf8),
+        attributes: [.posixPermissions: 0o640]
+    )
+    let journal = VisibilityJournal(fileURL: fileURL)
+
+    #expect(throws: VisibilityJournalFailure.unsafeFile) {
+        try journal.load()
+    }
+}
+
+@Test func visibilityJournalRejectsDuplicateAndUnknownRecordFields() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let fileURL = directory.appendingPathComponent("hidden-applications.json")
+    let journal = VisibilityJournal(fileURL: fileURL)
+    for data in [
+        Data("[{\"processIdentifier\":42,\"processIdentifier\":43,\"bundleIdentifier\":\"dev.example.App\"}]".utf8),
+        Data("[{\"processIdentifier\":42,\"bundleIdentifier\":\"dev.example.App\",\"title\":\"secret\"}]".utf8),
+    ] {
+        try data.write(to: fileURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: fileURL.path
+        )
+        #expect(throws: VisibilityJournalFailure.unsafeFile) {
+            try journal.load()
+        }
+    }
+}
+
+@Test func visibilityJournalRejectsSymbolicLinks() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let targetURL = directory.appendingPathComponent("target.json")
+    let linkURL = directory.appendingPathComponent("hidden-applications.json")
+    FileManager.default.createFile(
+        atPath: targetURL.path,
+        contents: Data("[]".utf8),
+        attributes: [.posixPermissions: 0o600]
+    )
+    try FileManager.default.createSymbolicLink(at: linkURL, withDestinationURL: targetURL)
+
+    #expect(throws: VisibilityJournalFailure.unsafeFile) {
+        try VisibilityJournal(fileURL: linkURL).load()
+    }
+}
+
+@Test func visibilityJournalRejectsFilesThatExceedTheReadLimit() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        UUID().uuidString,
+        isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let fileURL = directory.appendingPathComponent("hidden-applications.json")
+    FileManager.default.createFile(
+        atPath: fileURL.path,
+        contents: Data(repeating: 0x20, count: VisibilityJournal.maximumBytes + 1),
+        attributes: [.posixPermissions: 0o600]
+    )
+
+    #expect(throws: VisibilityJournalFailure.oversizedFile) {
+        try VisibilityJournal(fileURL: fileURL).load()
+    }
+}
+
+private func testPNG(width: Int, height: Int) throws -> Data {
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let context = try #require(CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ))
+    context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    let image = try #require(context.makeImage())
+    let data = NSMutableData()
+    let destination = try #require(CGImageDestinationCreateWithData(
+        data,
+        UTType.png.identifier as CFString,
+        1,
+        nil
+    ))
+    CGImageDestinationAddImage(destination, image, nil)
+    #expect(CGImageDestinationFinalize(destination))
+    return data as Data
+}

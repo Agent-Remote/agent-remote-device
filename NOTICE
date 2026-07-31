@@ -1,0 +1,9 @@
+Agent Remote Device
+
+This project is distributed under the GNU General Public License version 3 only.
+See LICENSE for the complete license text.
+
+The project includes and links to third-party software. Those components remain
+subject to their respective copyright notices and license terms. Release
+artifacts must include a machine-readable SBOM that identifies the exact
+third-party dependency versions used for that build.

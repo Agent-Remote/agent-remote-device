@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>AgentRemoteTeamIdentifier</key>
+    <string>DEVELOPMENT</string>
+    <key>AgentRemoteOutboundPolicyAttestorMachService</key>
+    <string></string>
+    <key>AgentRemoteOutboundPolicyAttestorPublicKey</key>
+    <string></string>
+    <key>AgentRemoteOutboundPolicyIdentifier</key>
+    <string></string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>AgentRemoteNetworkBroker</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.agentremote.device.network-broker</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Agent Remote Network Broker</string>
+    <key>CFBundlePackageType</key>
+    <string>XPC!</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0-dev</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>XPCService</key>
+    <dict>
+        <key>ServiceType</key>
+        <string>Application</string>
+    </dict>
+</dict>
+</plist>

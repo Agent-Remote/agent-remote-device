@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "request_id": "10000000-0000-4000-8000-000000000001",
+  "context": {
+    "user_id": "10000000-0000-4000-8000-000000000002",
+    "device_id": "10000000-0000-4000-8000-000000000003",
+    "tool_session_id": "10000000-0000-4000-8000-000000000004",
+    "device_session_id": "10000000-0000-4000-8000-000000000005",
+    "node_id": "10000000-0000-4000-8000-000000000006",
+    "platform": "macos",
+    "generation": 3,
+    "monotonic_sequence": 7,
+    "current_screenshot_generation": 11
+  },
+  "lease_until": "2030-01-01T00:00:00Z",
+  "action": { "type": "left_click", "coordinate": [320, 240] }
+}

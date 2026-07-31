@@ -1,0 +1,33 @@
+[package]
+name = "agent-remote-device-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5.42", features = ["derive"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2.175"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "ring"] }
+rmcp = { version = "3.0.1", features = ["server", "transport-io"] }
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std"] }
+schemars = "1.0.4"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+time = "0.3.44"
+tokio = { version = "1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring"] }
+uuid = { version = "1.17.0", features = ["serde", "v4"] }
+x509-parser = { version = "0.18.0", default-features = false }
+
+[dev-dependencies]
+proptest = "1.7.0"
+tempfile = "3.20.0"

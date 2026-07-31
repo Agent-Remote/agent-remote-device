@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-remote.dev/schema/device/action-request-v1.json",
+  "title": "Agent Remote device action request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "request_id", "context", "lease_until", "action"],
+  "properties": {
+    "version": { "const": 1 },
+    "request_id": { "type": "string", "format": "uuid" },
+    "lease_until": { "type": "string", "format": "date-time" },
+    "context": { "$ref": "#/$defs/context" },
+    "action": { "$ref": "#/$defs/action" }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "format": "uuid" },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "device_id", "tool_session_id", "device_session_id", "node_id", "platform", "generation", "monotonic_sequence", "current_screenshot_generation"],
+      "properties": {
+        "user_id": { "$ref": "#/$defs/uuid" },
+        "device_id": { "$ref": "#/$defs/uuid" },
+        "tool_session_id": { "$ref": "#/$defs/uuid" },
+        "device_session_id": { "$ref": "#/$defs/uuid" },
+        "node_id": { "$ref": "#/$defs/uuid" },
+        "platform": { "const": "macos" },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 9223372036854775806 },
+        "monotonic_sequence": { "type": "integer", "minimum": 1 },
+        "current_screenshot_generation": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "point": {
+      "type": "array",
+      "prefixItems": [{ "type": "integer", "minimum": 0, "maximum": 65535 }, { "type": "integer", "minimum": 0, "maximum": 65535 }],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "action": {
+      "oneOf": [
+        { "$ref": "#/$defs/noArgsScreenshot" },
+        { "$ref": "#/$defs/pointAction" },
+        { "$ref": "#/$defs/typeAction" },
+        { "$ref": "#/$defs/keyAction" },
+        { "$ref": "#/$defs/scrollAction" },
+        { "$ref": "#/$defs/dragAction" },
+        { "$ref": "#/$defs/holdAction" },
+        { "$ref": "#/$defs/waitAction" },
+        { "$ref": "#/$defs/zoomAction" }
+      ]
+    },
+    "noArgsScreenshot": {
+      "type": "object", "additionalProperties": false, "required": ["type"],
+      "properties": { "type": { "enum": ["screenshot", "left_mouse_down", "left_mouse_up"] } }
+    },
+    "pointAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "coordinate"],
+      "properties": {
+        "type": { "enum": ["left_click", "right_click", "middle_click", "double_click", "triple_click", "mouse_move"] },
+        "coordinate": { "$ref": "#/$defs/point" }
+      }
+    },
+    "typeAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "text"],
+      "properties": { "type": { "const": "type" }, "text": { "type": "string", "minLength": 1, "maxLength": 4096 } }
+    },
+    "keyAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "key"],
+      "properties": { "type": { "const": "key" }, "key": { "type": "string", "pattern": "^[A-Za-z0-9_+ -]{1,64}$" } }
+    },
+    "scrollAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "delta_x", "delta_y"],
+      "properties": { "type": { "const": "scroll" }, "delta_x": { "type": "integer", "minimum": -10000, "maximum": 10000 }, "delta_y": { "type": "integer", "minimum": -10000, "maximum": 10000 }, "coordinate": { "$ref": "#/$defs/point" } }
+    },
+    "dragAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "start", "end"],
+      "properties": { "type": { "const": "left_click_drag" }, "start": { "$ref": "#/$defs/point" }, "end": { "$ref": "#/$defs/point" }, "duration_ms": { "type": "integer", "minimum": 100, "maximum": 5000 } }
+    },
+    "holdAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "key", "duration_ms"],
+      "properties": { "type": { "const": "hold_key" }, "key": { "type": "string", "pattern": "^[A-Za-z0-9_+ -]{1,64}$" }, "duration_ms": { "type": "integer", "minimum": 50, "maximum": 5000 } }
+    },
+    "waitAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "duration_ms"],
+      "properties": { "type": { "const": "wait" }, "duration_ms": { "type": "integer", "minimum": 50, "maximum": 10000 } }
+    },
+    "zoomAction": {
+      "type": "object", "additionalProperties": false, "required": ["type", "region"],
+      "properties": { "type": { "const": "zoom" }, "region": { "type": "array", "prefixItems": [{ "type": "integer", "minimum": 0, "maximum": 65535 }, { "type": "integer", "minimum": 0, "maximum": 65535 }, { "type": "integer", "minimum": 1, "maximum": 65535 }, { "type": "integer", "minimum": 1, "maximum": 65535 }], "items": false, "minItems": 4, "maxItems": 4 } }
+    }
+  }
+}
