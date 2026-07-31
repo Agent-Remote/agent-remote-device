@@ -33,7 +33,7 @@ not relax the production client's `https/wss` requirement.
 Build a Linux proxy artifact for Node packaging:
 
 ```sh
-VERSION=0.1.3 scripts/package-proxy-release.sh
+VERSION=0.1.4 scripts/package-proxy-release.sh
 ```
 
 `VERSION` must exactly match the Rust workspace package version. Prepare a new
