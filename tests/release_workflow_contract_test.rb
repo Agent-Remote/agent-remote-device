@@ -95,5 +95,9 @@ macos_build = macos_job["steps"].find { |step| step["name"] == "Build hardened c
 raise "community application build step is missing" unless macos_build
 raise "community build does not pin the certificate" unless macos_build.fetch("env", {}).key?("SIGNER_CERTIFICATE_SHA1")
 raise "community build does not import its persistent P12" unless macos_job["steps"].any? { |step| step["name"] == "Import persistent community signing certificate" }
-raise "community build does not establish ephemeral runner trust" unless macos_job["steps"].any? { |step| step["name"] == "Trust community certificate on the ephemeral build runner" }
+trust_step = macos_job["steps"].find { |step| step["name"] == "Trust community certificate on the ephemeral build runner" }
+raise "community build does not establish ephemeral runner trust" unless trust_step
+trust_commands = trust_step.fetch("run", "")
+raise "community trust must use the imported temporary keychain" unless trust_commands.include?("community_signing.keychain-db")
+raise "community trust must not modify the system keychain" if trust_commands.include?("System.keychain")
 raise "community build does not verify the packaged XPC chain" unless macos_job["steps"].any? { |step| step["name"] == "Verify packaged community XPC process chain" }

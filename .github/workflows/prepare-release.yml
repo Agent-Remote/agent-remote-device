@@ -174,19 +174,19 @@ jobs:
         with:
           p12-file-base64: ${{ secrets.COMMUNITY_SIGNING_P12_BASE64 }}
           p12-password: ${{ secrets.COMMUNITY_SIGNING_P12_PASSWORD }}
+          keychain: community_signing
       - name: Trust community certificate on the ephemeral build runner
         env:
-          CERTIFICATE_BASE64: ${{ secrets.COMMUNITY_SIGNING_P12_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.COMMUNITY_SIGNING_P12_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.COMMUNITY_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
-          p12="$RUNNER_TEMP/community-signing.p12"
           certificate="$RUNNER_TEMP/community-signing.pem"
-          printf '%s' "$CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$p12"
-          openssl pkcs12 -in "$p12" -clcerts -nokeys -legacy \
-            -passin env:CERTIFICATE_PASSWORD -out "$certificate"
-          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
-            -k /Library/Keychains/System.keychain "$certificate"
+          keychain="$HOME/Library/Keychains/community_signing.keychain-db"
+          security find-certificate -c "$SIGNING_IDENTITY" -p "$keychain" > "$certificate"
+          security add-trusted-cert -r trustRoot -p codeSign \
+            -k "$keychain" "$certificate"
+          security find-identity -v -p codesigning "$keychain" \
+            | grep -Fq "$SIGNING_IDENTITY"
       - name: Build hardened community-signed application
         env:
           BUILD_NUMBER: ${{ inputs.build_number }}
