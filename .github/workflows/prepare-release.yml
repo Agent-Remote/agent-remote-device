@@ -164,7 +164,7 @@ jobs:
 
   macos:
     name: signed and notarized macOS application
-    runs-on: macos-14
+    runs-on: macos-15
     needs: validate
     environment: production-device-release
     steps:

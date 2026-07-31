@@ -10,3 +10,4 @@ All notable changes to this repository are recorded here.
 - feat: attest the outbound network policy before activating encrypted relays
 - build: package version-matched app, XPC services, and standalone proxy releases
 - test: cover Rust and Swift security contracts and the cross-component control path
+- ci: run Swift 6 builds on macOS 15 and install the protocol fuzz runner explicitly
