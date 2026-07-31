@@ -4,6 +4,14 @@ import Security
 import SwiftASN1
 import X509
 
+// Xcode 16's Security overlay omits this macOS 10.12 API even though the symbol is public.
+@_silgen_name("SecIdentityCreate")
+private func createSecIdentity(
+    _ allocator: CFAllocator?,
+    _ certificate: SecCertificate,
+    _ privateKey: SecKey
+) -> Unmanaged<SecIdentity>?
+
 public enum NestedTLSIdentityFailure: Error, Equatable {
     case privateKeyConversionFailed
     case identityCreationFailed
@@ -67,7 +75,8 @@ public struct NestedTLSGenerationIdentity: @unchecked Sendable {
         ) else {
             throw NestedTLSIdentityFailure.privateKeyConversionFailed
         }
-        guard let securityIdentity = SecIdentityCreate(nil, secCertificate, secKey) else {
+        guard let securityIdentity = createSecIdentity(nil, secCertificate, secKey)?.takeRetainedValue()
+        else {
             throw NestedTLSIdentityFailure.identityCreationFailed
         }
         return NestedTLSGenerationIdentity(
