@@ -4,7 +4,7 @@ import CoreGraphics
 import DeviceProtocol
 import DeviceSecurity
 import Foundation
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 
 public enum ExecutionFailure: Error, Equatable {
     case accessibilityPermissionMissing

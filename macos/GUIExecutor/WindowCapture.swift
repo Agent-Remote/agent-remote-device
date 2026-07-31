@@ -5,7 +5,7 @@ import DeviceProtocol
 import DeviceSecurity
 import Foundation
 import ImageIO
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 import Security
 import UniformTypeIdentifiers
 
