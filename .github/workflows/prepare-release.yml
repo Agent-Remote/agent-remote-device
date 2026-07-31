@@ -175,18 +175,6 @@ jobs:
           p12-file-base64: ${{ secrets.COMMUNITY_SIGNING_P12_BASE64 }}
           p12-password: ${{ secrets.COMMUNITY_SIGNING_P12_PASSWORD }}
           keychain: community_signing
-      - name: Trust community certificate on the ephemeral build runner
-        env:
-          SIGNING_IDENTITY: ${{ secrets.COMMUNITY_SIGNING_IDENTITY }}
-        run: |
-          set -euo pipefail
-          certificate="$RUNNER_TEMP/community-signing.pem"
-          keychain="$HOME/Library/Keychains/community_signing.keychain-db"
-          security find-certificate -c "$SIGNING_IDENTITY" -p "$keychain" > "$certificate"
-          security add-trusted-cert -r trustRoot -p codeSign \
-            -k "$keychain" "$certificate"
-          security find-identity -v -p codesigning "$keychain" \
-            | grep -Fq "$SIGNING_IDENTITY"
       - name: Build hardened community-signed application
         env:
           BUILD_NUMBER: ${{ inputs.build_number }}
