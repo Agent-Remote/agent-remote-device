@@ -33,6 +33,18 @@ if count != 1:
     raise SystemExit("workspace package version was not updated exactly once")
 cargo_path.write_text(updated, encoding="utf-8")
 
+lock_path = Path("Cargo.lock")
+lock = lock_path.read_text(encoding="utf-8")
+updated, count = re.subn(
+    r'(?s)(\[\[package\]\]\nname = "agent-remote-device-proxy"\nversion = ")[^"]+("\n)',
+    rf'\g<1>{version}\2',
+    lock,
+    count=1,
+)
+if count != 1:
+    raise SystemExit("proxy lockfile version was not updated exactly once")
+lock_path.write_text(updated, encoding="utf-8")
+
 readme_path = Path("README.md")
 readme = readme_path.read_text(encoding="utf-8")
 readme = re.sub(

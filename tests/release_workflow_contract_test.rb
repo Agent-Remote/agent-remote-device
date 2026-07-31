@@ -13,6 +13,8 @@ prepare_version = YAML.safe_load(File.read(prepare_version_path), aliases: true)
 prepare_commands = prepare_version.dig("jobs", "prepare", "steps").map { |step| step["run"] }.compact.join("\n")
 raise "version preparation does not create an immutable tag" unless prepare_commands.include?('git tag "v${VERSION}"')
 raise "version preparation does not dispatch the protected release" unless prepare_commands.include?("prepare-release.yml")
+prepare_script = File.read(File.join(repository_root, "scripts/prepare-version.sh"))
+raise "version preparation does not update Cargo.lock" unless prepare_script.include?('lock_path = Path("Cargo.lock")')
 
 rust_steps = ci.dig("jobs", "rust", "steps")
 raise "CI Rust job is missing" unless rust_steps
