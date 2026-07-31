@@ -6,6 +6,24 @@ import Testing
 
 private let policyNow = Date(timeIntervalSince1970: 4_000_000_000)
 private let policyTeamIdentifier = "AB12CD34EF"
+
+@Test func applicationPolicyAllowsOnlyNormalizedNonAnthropicDNSHosts() async throws {
+    let checker = ApplicationOutboundNetworkPolicyChecker()
+    try await checker.verify(controlPlaneHost: "control.example.com", now: Date())
+
+    for host in [
+        "api.anthropic.com",
+        "claude.ai",
+        "127.0.0.1",
+        "control.example.com:443",
+        "*.example.com",
+        "LOCALHOST",
+    ] {
+        await #expect(throws: OutboundNetworkPolicyFailure.destinationMismatch) {
+            try await checker.verify(controlPlaneHost: host, now: Date())
+        }
+    }
+}
 private let policyIdentifier = "dev.agentremote.outbound-policy.production"
 
 private enum ProofMutation: Sendable {

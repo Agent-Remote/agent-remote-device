@@ -130,6 +130,42 @@ public struct UnavailableOutboundNetworkPolicyChecker: OutboundNetworkPolicyChec
     }
 }
 
+public struct ApplicationOutboundNetworkPolicyChecker: OutboundNetworkPolicyChecking {
+    private static let deniedHostSuffixes = [
+        "anthropic.com",
+        "claude.ai",
+    ]
+
+    public init() {}
+
+    public func verify(controlPlaneHost: String, now _: Date = Date()) async throws {
+        let host = controlPlaneHost.lowercased()
+        guard Self.isHost(host),
+              !Self.deniedHostSuffixes.contains(where: { suffix in
+                  host == suffix || host.hasSuffix(".\(suffix)")
+              })
+        else {
+            throw OutboundNetworkPolicyFailure.destinationMismatch
+        }
+    }
+
+    private static func isHost(_ value: String) -> Bool {
+        guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              value.utf8.count <= 253,
+              !value.hasPrefix("."),
+              !value.hasSuffix("."),
+              !value.contains("*"),
+              !value.contains(":"),
+              value.contains("."),
+              value.contains(where: { $0.isASCII && $0.isLetter })
+        else { return false }
+        return value.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "-")
+        }
+    }
+}
+
 public struct SignedOutboundNetworkPolicyChecker: OutboundNetworkPolicyChecking {
     private let loader: any OutboundPolicyAttestationLoading
     private let publicKey: Curve25519.Signing.PublicKey
@@ -360,6 +396,11 @@ public final class XPCOutboundPolicyAttestationLoader: OutboundPolicyAttestation
 
 public enum ManagedOutboundNetworkPolicyChecker {
     public static func load(bundle: Bundle = .main) throws -> any OutboundNetworkPolicyChecking {
+        if bundle.object(forInfoDictionaryKey: "AgentRemoteOutboundPolicyMode") as? String
+            == "application"
+        {
+            return ApplicationOutboundNetworkPolicyChecker()
+        }
         guard let teamIdentifier = bundle.object(
             forInfoDictionaryKey: "AgentRemoteTeamIdentifier"
         ) as? String,

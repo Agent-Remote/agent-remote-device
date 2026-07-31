@@ -1,3 +1,4 @@
+import Darwin
 import DeviceProtocol
 import Foundation
 import LocalAuthentication
@@ -15,6 +16,7 @@ public enum NetworkBrokerCredentialFailure: Error, Equatable, Sendable {
     case accessGroupUnavailable
     case itemNotFound
     case keychain(OSStatus)
+    case fileSystem(Int32)
     case malformed
     case expired
 }
@@ -159,6 +161,58 @@ public struct KeychainNetworkBrokerCredentialStore: NetworkBrokerCredentialLoadi
             throw NetworkBrokerCredentialFailure.malformed
         }
         return try NetworkBrokerCredential.decode(data, now: now)
+    }
+}
+
+public struct CommunityFileNetworkBrokerCredentialStore: NetworkBrokerCredentialLoading, Sendable {
+    private let fileURL: URL
+
+    public init(fileURL: URL? = nil) {
+        self.fileURL = fileURL ?? Self.defaultFileURL()
+    }
+
+    public func loadCredential(now: Date = Date()) throws -> NetworkBrokerCredential {
+        let descriptor = open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            if errno == ENOENT {
+                throw NetworkBrokerCredentialFailure.itemNotFound
+            }
+            throw NetworkBrokerCredentialFailure.fileSystem(errno)
+        }
+        let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              metadata.st_uid == getuid(),
+              metadata.st_nlink == 1,
+              metadata.st_mode & 0o777 == 0o600,
+              metadata.st_size > 0,
+              metadata.st_size <= Int64(DeviceCredentialBounds.maximumEncodedBytes)
+        else {
+            throw NetworkBrokerCredentialFailure.malformed
+        }
+        let data: Data
+        do {
+            data = try file.read(upToCount: DeviceCredentialBounds.maximumEncodedBytes + 1) ?? Data()
+        } catch {
+            throw NetworkBrokerCredentialFailure.fileSystem(errno)
+        }
+        guard Int64(data.count) == metadata.st_size else {
+            throw NetworkBrokerCredentialFailure.malformed
+        }
+        return try NetworkBrokerCredential.decode(data, now: now)
+    }
+
+    private static func defaultFileURL() -> URL {
+        if let override = ProcessInfo.processInfo.environment["AGENT_REMOTE_HOME"],
+           override.hasPrefix("/")
+        {
+            return URL(fileURLWithPath: override, isDirectory: true)
+                .appendingPathComponent("device-broker-credential.json")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/agent-remote", isDirectory: true)
+            .appendingPathComponent("device-broker-credential.json")
     }
 }
 

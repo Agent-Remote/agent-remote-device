@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 release_script="$repo_root/scripts/build-release-app.sh"
+community_release_script="$repo_root/scripts/build-community-release-app.sh"
+packaged_xpc_verifier="$repo_root/scripts/verify-packaged-xpc.sh"
 development_script="$repo_root/scripts/build-development-app.sh"
 proxy_script="$repo_root/scripts/package-proxy-release.sh"
 prepare_version_script="$repo_root/scripts/prepare-version.sh"
@@ -26,6 +28,21 @@ expect_failure \
   "VERSION must be a semantic version" \
   env VERSION=invalid BUILD_NUMBER=1 SIGNING_IDENTITY=Developer TEAM_IDENTIFIER=AB12CD34EF \
   "$release_script"
+expect_failure \
+  "VERSION must be a semantic version" \
+  env VERSION=invalid BUILD_NUMBER=1 SIGNING_IDENTITY=Community \
+  SIGNER_CERTIFICATE_SHA1=0123456789ABCDEF0123456789ABCDEF01234567 \
+  "$community_release_script"
+expect_failure \
+  "SIGNER_CERTIFICATE_SHA1 must be 40 uppercase hexadecimal characters" \
+  env VERSION=1.0.0 BUILD_NUMBER=1 SIGNING_IDENTITY=Community \
+  SIGNER_CERTIFICATE_SHA1=invalid \
+  "$community_release_script"
+expect_failure \
+  "community releases require a persistent self-signed identity" \
+  env VERSION=1.0.0 BUILD_NUMBER=1 SIGNING_IDENTITY=- \
+  SIGNER_CERTIFICATE_SHA1=0123456789ABCDEF0123456789ABCDEF01234567 \
+  "$community_release_script"
 expect_failure \
   "proxy release version does not match the Rust package version" \
   env VERSION=999.0.0 "$proxy_script"
@@ -113,6 +130,11 @@ for field in \
   fi
 done
 
+if ! grep -Fq 'pwd -P' "$packaged_xpc_verifier"; then
+  echo "packaged XPC verifier does not canonicalize the application path" >&2
+  exit 1
+fi
+
 for signature_check in \
   'TeamIdentifier=$team_identifier' \
   'Authority=Developer ID Application:' \
@@ -132,6 +154,21 @@ for script in "$release_script" "$development_script"; do
   fi
   if ! grep -Fq 'macos/App/Resources/.' "$script"; then
     echo "localization catalog installation is missing from $script" >&2
+    exit 1
+  fi
+done
+
+for community_check in \
+  'AgentRemoteSignerCertificateSHA1' \
+  'AgentRemoteReleaseProfile string community-local-trust' \
+  'AgentRemoteOutboundPolicyMode string application' \
+  'AgentRemoteCredentialMode string community-file' \
+  'certificate_sha256' \
+  'production_ready: true' \
+  'apple_notarized: false' \
+  'codesign --verify --deep --strict'; do
+  if ! grep -Fq "$community_check" "$community_release_script"; then
+    echo "community release build is missing: $community_check" >&2
     exit 1
   fi
 done

@@ -4,8 +4,12 @@ Security-sensitive macOS device bridge and managed MCP proxy for agent-remote.
 
 This repository owns the versioned device protocol, the native macOS components,
 the remote `agent-remote-device` MCP proxy, and release packaging. Production
-activation is fail-closed until signing, notarization, outbound-policy, security
-review, and compatibility evidence are supplied to the release verifier.
+activation is fail-closed until evidence for one explicit release profile is
+supplied to the release verifier. The default `community-local-trust` profile
+uses persistent project self-signing, official GitHub runners, application-level
+egress enforcement, and explicit reduced-risk acceptance without claiming Apple
+notarization. The stricter Apple Developer ID profile remains documented for
+deployments that can obtain it.
 
 ## Development
 
@@ -16,7 +20,7 @@ scripts/run-quality-checks.sh
 The local quality gate requires `cargo-deny` and `cargo-llvm-cov` in addition to
 the Rust and Swift toolchains.
 
-The unsigned development application can only be used with synthetic data. See
+The ad-hoc development application can only be used with synthetic data. See
 `docs/release-signing.md` and `docs/macos-security.md` before testing TCC-backed
 features.
 

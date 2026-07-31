@@ -1,5 +1,32 @@
 # Release signing and activation
 
+## Community local-trust profile
+
+The default release workflow supports an account-free `community-local-trust` profile on the
+official `macos-15` GitHub runner. Create one persistent self-signed identity and configure the
+protected environment with:
+
+```sh
+scripts/create-community-signing-identity.sh
+scripts/configure-community-release-environment.sh
+```
+
+Back up `dist/community-signing-identity` outside the repository before deleting the local copy.
+The directory contains the private key and P12 password and must never be committed or attached to
+a release. The workflow temporarily trusts the public certificate only on the ephemeral runner so
+`codesign` can use it. Installed Macs do not trust it as an Apple Developer ID; the verified CLI
+removes quarantine after it pins the embedded leaf certificate on the app and both XPC services.
+
+Community packages set `production_ready=true`, `apple_notarized=false`,
+`public_distribution=false`, and `profile=community-local-trust`. They use application-enforced
+destination checks and an owner-only Broker credential file rather than Apple access groups and a
+managed Network Extension.
+
+The Apple Developer ID profile below remains available as a stricter future option, but it is not
+used by the default workflow.
+
+## Apple Developer ID profile
+
 Production packages require all of the following evidence:
 
 - The application and nested XPC services have valid Developer ID Application signatures.

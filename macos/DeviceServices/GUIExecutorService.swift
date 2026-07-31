@@ -2,16 +2,16 @@ import DeviceIPC
 import Foundation
 
 public final class GUIExecutorService: NSObject, GUIExecutorXPCProtocol, @unchecked Sendable {
-    private let teamIdentifier: String
+    private let signerIdentity: XPCSignerIdentity
     private let controller: GUIExecutorSessionController
     private var brokerListener: NSXPCListener?
     private var brokerDelegate: AuthenticatedXPCListenerDelegate?
 
     public init(
-        teamIdentifier: String,
+        signerIdentity: XPCSignerIdentity,
         controller: GUIExecutorSessionController = GUIExecutorSessionController()
     ) {
-        self.teamIdentifier = teamIdentifier
+        self.signerIdentity = signerIdentity
         self.controller = controller
     }
 
@@ -26,7 +26,7 @@ public final class GUIExecutorService: NSObject, GUIExecutorXPCProtocol, @unchec
         }
         guard let policy = try? XPCPeerPolicy(
             bundleIdentifier: DeviceIPCServiceIdentifier.networkBroker,
-            teamIdentifier: teamIdentifier
+            signerIdentity: signerIdentity
         ) else {
             reply(nil, DeviceIPCFailure.peerRejected.nsError)
             return

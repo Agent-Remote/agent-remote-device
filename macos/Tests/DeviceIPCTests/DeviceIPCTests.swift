@@ -100,6 +100,35 @@ import DeviceSecurity
     #expect(policy.codeSigningRequirement == "identifier \"dev.agentremote.device\"")
 }
 
+@Test func communityPeerPolicyPinsTheExactCertificateAndIdentifier() throws {
+    let fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567"
+    let policy = try XPCPeerPolicy(
+        bundleIdentifier: "dev.agentremote.device.network-broker",
+        certificateSHA1: fingerprint
+    )
+
+    #expect(
+        policy.codeSigningRequirement
+            == "identifier \"dev.agentremote.device.network-broker\" and certificate leaf = H\"\(fingerprint)\""
+    )
+    #expect(!policy.codeSigningRequirement.contains("anchor apple"))
+}
+
+@Test func communityPeerPolicyRejectsMalformedCertificateFingerprints() {
+    for fingerprint in [
+        "0123456789ABCDEF",
+        "0123456789abcdef0123456789abcdef01234567",
+        "0123456789ABCDEF0123456789ABCDEF0123456G",
+    ] {
+        #expect(throws: XPCPeerPolicyFailure.invalidCertificateSHA1) {
+            try XPCPeerPolicy(
+                bundleIdentifier: "dev.agentremote.device.network-broker",
+                certificateSHA1: fingerprint
+            )
+        }
+    }
+}
+
 @Test func ipcMessagesRejectTheTerminalOnlyGeneration() {
     let binding = binding(generation: maximumDeviceSessionGeneration)
     let application = ApplicationIdentity(

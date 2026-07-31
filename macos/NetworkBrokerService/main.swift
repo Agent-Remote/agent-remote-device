@@ -4,18 +4,26 @@ import Darwin
 import Foundation
 
 guard DeviceProcessHardening.disableCoreDumps(),
-      let teamIdentifier = XPCServiceBootstrap.teamIdentifier(),
+      let signerIdentity = XPCServiceBootstrap.signerIdentity(),
       let policy = try? XPCPeerPolicy(
           bundleIdentifier: DeviceIPCServiceIdentifier.approvalUI,
-          teamIdentifier: teamIdentifier
+          signerIdentity: signerIdentity
       )
 else {
     exit(EXIT_FAILURE)
 }
 
 private let discovery: NetworkBrokerDiscoveryCoordinator? = {
-    guard let credentialStore = try? KeychainNetworkBrokerCredentialStore() else {
-        return nil
+    let credentialStore: any NetworkBrokerCredentialLoading
+    if Bundle.main.object(forInfoDictionaryKey: "AgentRemoteCredentialMode") as? String
+        == "community-file"
+    {
+        credentialStore = CommunityFileNetworkBrokerCredentialStore()
+    } else {
+        guard let keychainStore = try? KeychainNetworkBrokerCredentialStore() else {
+            return nil
+        }
+        credentialStore = keychainStore
     }
     let policyChecker = (try? ManagedOutboundNetworkPolicyChecker.load())
         ?? UnavailableOutboundNetworkPolicyChecker()

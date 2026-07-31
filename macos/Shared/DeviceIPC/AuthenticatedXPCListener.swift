@@ -4,11 +4,29 @@ import Foundation
 public enum XPCPeerPolicyFailure: Error, Equatable, Sendable {
     case invalidIdentifier
     case invalidTeamIdentifier
+    case invalidCertificateSHA1
+}
+
+public enum XPCSignerIdentity: Equatable, Sendable {
+    case appleTeam(String)
+    case certificateSHA1(String)
+    case development
+
+    fileprivate var codeSigningConstraint: String {
+        switch self {
+        case let .appleTeam(teamIdentifier):
+            return "anchor apple generic and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+        case let .certificateSHA1(fingerprint):
+            return "certificate leaf = H\"\(fingerprint)\""
+        case .development:
+            return ""
+        }
+    }
 }
 
 public struct XPCPeerPolicy: Equatable, Sendable {
     public let bundleIdentifier: String
-    public let teamIdentifier: String
+    public let signerIdentity: XPCSignerIdentity
 
     public init(bundleIdentifier: String, teamIdentifier: String) throws {
         guard Self.isIdentifier(bundleIdentifier) else {
@@ -18,15 +36,39 @@ public struct XPCPeerPolicy: Equatable, Sendable {
             throw XPCPeerPolicyFailure.invalidTeamIdentifier
         }
         self.bundleIdentifier = bundleIdentifier
-        self.teamIdentifier = teamIdentifier
+        signerIdentity = teamIdentifier == "DEVELOPMENT"
+            ? .development
+            : .appleTeam(teamIdentifier)
+    }
+
+    public init(bundleIdentifier: String, certificateSHA1: String) throws {
+        guard Self.isIdentifier(bundleIdentifier) else {
+            throw XPCPeerPolicyFailure.invalidIdentifier
+        }
+        guard Self.isCertificateSHA1(certificateSHA1) else {
+            throw XPCPeerPolicyFailure.invalidCertificateSHA1
+        }
+        self.bundleIdentifier = bundleIdentifier
+        signerIdentity = .certificateSHA1(certificateSHA1)
+    }
+
+    public init(bundleIdentifier: String, signerIdentity: XPCSignerIdentity) throws {
+        switch signerIdentity {
+        case let .appleTeam(teamIdentifier):
+            try self.init(bundleIdentifier: bundleIdentifier, teamIdentifier: teamIdentifier)
+        case let .certificateSHA1(fingerprint):
+            try self.init(bundleIdentifier: bundleIdentifier, certificateSHA1: fingerprint)
+        case .development:
+            try self.init(bundleIdentifier: bundleIdentifier, teamIdentifier: "DEVELOPMENT")
+        }
     }
 
     public var codeSigningRequirement: String {
-        if teamIdentifier == "DEVELOPMENT" {
+        let constraint = signerIdentity.codeSigningConstraint
+        if constraint.isEmpty {
             return "identifier \"\(bundleIdentifier)\""
         }
-        return "anchor apple generic and identifier \"\(bundleIdentifier)\" "
-            + "and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+        return "identifier \"\(bundleIdentifier)\" and \(constraint)"
     }
 
     private static func isIdentifier(_ value: String) -> Bool {
@@ -38,6 +80,12 @@ public struct XPCPeerPolicy: Equatable, Sendable {
     private static func isTeamIdentifier(_ value: String) -> Bool {
         (1 ... 32).contains(value.count) && value.allSatisfy { character in
             character.isASCII && (character.isUppercase || character.isNumber)
+        }
+    }
+
+    private static func isCertificateSHA1(_ value: String) -> Bool {
+        value.count == 40 && value.allSatisfy {
+            $0.isASCII && ($0.isNumber || ("A" ... "F").contains(String($0)))
         }
     }
 }
@@ -111,5 +159,19 @@ private final class OneShotInvalidationCallback: @unchecked Sendable {
 public enum XPCServiceBootstrap {
     public static func teamIdentifier(bundle: Bundle = .main) -> String? {
         bundle.object(forInfoDictionaryKey: "AgentRemoteTeamIdentifier") as? String
+    }
+
+    public static func signerIdentity(bundle: Bundle = .main) -> XPCSignerIdentity? {
+        if let fingerprint = bundle.object(
+            forInfoDictionaryKey: "AgentRemoteSignerCertificateSHA1"
+        ) as? String {
+            return .certificateSHA1(fingerprint)
+        }
+        if let teamIdentifier = teamIdentifier(bundle: bundle) {
+            return teamIdentifier == "DEVELOPMENT"
+                ? .development
+                : .appleTeam(teamIdentifier)
+        }
+        return nil
     }
 }

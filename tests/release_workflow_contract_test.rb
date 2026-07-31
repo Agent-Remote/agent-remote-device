@@ -59,13 +59,12 @@ required_evidence = {
   "macos" => [
     "shasum -a 256 --check",
     "spdxVersion",
-    ".status == \"Accepted\"",
+    ".profile == \"community-local-trust\"",
+    ".apple_notarized == false",
     "cosign verify-blob",
     "gh attestation verify",
     "application_sha256",
-    "outbound_policy_identifier",
-    "attestor_public_key_sha256",
-    "signing-notarization.json",
+    "community-signing.json",
     "cosign sign-blob",
     "$sbom.sigstore.json",
   ],
@@ -86,14 +85,13 @@ end
 
 raise "release does not publish SBOM signatures" unless File.read(release_path).include?(".spdx.json.sigstore.json")
 
-macos_build = release.dig("jobs", "macos", "steps").find { |step| step["name"] == "Build hardened signed application" }
-raise "signed application build step is missing" unless macos_build
+macos_job = release.dig("jobs", "macos")
+raise "community release must use the protected environment" unless macos_job["environment"] == "production-community-release"
+raise "community release must use an official macOS runner" unless macos_job["runs-on"] == "macos-15"
 
-required_policy_configuration = %w[
-  OUTBOUND_POLICY_ATTESTOR_MACH_SERVICE
-  OUTBOUND_POLICY_ATTESTOR_PUBLIC_KEY_BASE64
-  OUTBOUND_POLICY_IDENTIFIER
-]
-required_policy_configuration.each do |name|
-  raise "signed application does not require #{name}" unless macos_build.fetch("env", {}).key?(name)
-end
+macos_build = macos_job["steps"].find { |step| step["name"] == "Build hardened community-signed application" }
+raise "community application build step is missing" unless macos_build
+raise "community build does not pin the certificate" unless macos_build.fetch("env", {}).key?("SIGNER_CERTIFICATE_SHA1")
+raise "community build does not import its persistent P12" unless macos_job["steps"].any? { |step| step["name"] == "Import persistent community signing certificate" }
+raise "community build does not establish ephemeral runner trust" unless macos_job["steps"].any? { |step| step["name"] == "Trust community certificate on the ephemeral build runner" }
+raise "community build does not verify the packaged XPC chain" unless macos_job["steps"].any? { |step| step["name"] == "Verify packaged community XPC process chain" }

@@ -163,70 +163,54 @@ jobs:
             agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.spdx.json.sigstore.json
 
   macos:
-    name: signed and notarized macOS application
+    name: community local-trust macOS application
     runs-on: macos-15
     needs: validate
-    environment: production-device-release
+    environment: production-community-release
     steps:
       - uses: actions/checkout@v7.0.0
-      - name: Import Developer ID certificate
+      - name: Import persistent community signing certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.COMMUNITY_SIGNING_P12_BASE64 }}
+          p12-password: ${{ secrets.COMMUNITY_SIGNING_P12_PASSWORD }}
+      - name: Trust community certificate on the ephemeral build runner
         env:
-          CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_BUILD_KEYCHAIN_PASSWORD }}
+          CERTIFICATE_BASE64: ${{ secrets.COMMUNITY_SIGNING_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.COMMUNITY_SIGNING_P12_PASSWORD }}
         run: |
-          certificate="$RUNNER_TEMP/developer-id.p12"
-          keychain="$RUNNER_TEMP/agent-remote-build.keychain-db"
-          printf '%s' "$CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$certificate"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          security list-keychains -d user -s "$keychain"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
-      - name: Build hardened signed application
+          set -euo pipefail
+          p12="$RUNNER_TEMP/community-signing.p12"
+          certificate="$RUNNER_TEMP/community-signing.pem"
+          printf '%s' "$CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$p12"
+          openssl pkcs12 -in "$p12" -clcerts -nokeys -legacy \
+            -passin env:CERTIFICATE_PASSWORD -out "$certificate"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$certificate"
+      - name: Build hardened community-signed application
         env:
           BUILD_NUMBER: ${{ inputs.build_number }}
-          SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY }}
-          TEAM_IDENTIFIER: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_IDENTITY: ${{ secrets.COMMUNITY_SIGNING_IDENTITY }}
+          SIGNER_CERTIFICATE_SHA1: ${{ vars.COMMUNITY_SIGNER_CERTIFICATE_SHA1 }}
           VERSION: ${{ inputs.version }}
-          OUTBOUND_POLICY_ATTESTOR_MACH_SERVICE: ${{ vars.OUTBOUND_POLICY_ATTESTOR_MACH_SERVICE }}
-          OUTBOUND_POLICY_ATTESTOR_PUBLIC_KEY_BASE64: ${{ secrets.OUTBOUND_POLICY_ATTESTOR_PUBLIC_KEY_BASE64 }}
-          OUTBOUND_POLICY_IDENTIFIER: ${{ vars.OUTBOUND_POLICY_IDENTIFIER }}
-        run: scripts/build-release-app.sh
-      - name: Submit application for notarization
-        env:
-          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_NOTARY_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          submission="$RUNNER_TEMP/agent-remote-device-notary.zip"
-          ditto -c -k --keepParent "dist/release/Agent Remote Device.app" "$submission"
-          xcrun notarytool submit "$submission" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait \
-            --output-format json > "dist/release/notarization-${VERSION}.json"
-          xcrun stapler staple "dist/release/Agent Remote Device.app"
-          xcrun stapler validate "dist/release/Agent Remote Device.app"
-          spctl --assess --type execute --verbose=2 "dist/release/Agent Remote Device.app"
-      - name: Create notarized application archive
+        run: scripts/build-community-release-app.sh
+      - name: Verify packaged community XPC process chain
+        run: scripts/verify-packaged-xpc.sh "dist/community-release/Agent Remote Device.app"
+      - name: Create community application archive
         env:
           VERSION: ${{ inputs.version }}
         run: |
           archive="agent-remote-device-macos-${VERSION}.zip"
-          ditto -c -k --keepParent "dist/release/Agent Remote Device.app" "$archive"
+          ditto -c -k --keepParent "dist/community-release/Agent Remote Device.app" "$archive"
           shasum -a 256 "$archive" > "$archive.sha256"
       - name: Generate application SBOM
         uses: anchore/sbom-action@v0
         with:
-          path: dist/release/Agent Remote Device.app
+          path: dist/community-release/Agent Remote Device.app
           format: spdx-json
           output-file: agent-remote-device-macos-${{ inputs.version }}.spdx.json
       - uses: sigstore/cosign-installer@v4.0.0
-      - name: Sign notarized application update archive and SBOM
+      - name: Sign community application update archive and SBOM
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -254,7 +238,10 @@ jobs:
               "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/prepare-release.yml@${GITHUB_REF}" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "$sbom"
-          jq -e '.status == "Accepted"' "dist/release/notarization-${VERSION}.json" >/dev/null
+          jq -e \
+            '.profile == "community-local-trust" and .production_ready == true and
+             .apple_notarized == false and .signing_type == "project-self-signed"' \
+            "dist/community-release/community-signing-${VERSION}.json" >/dev/null
           cosign verify-blob \
             --bundle "$archive.sigstore.json" \
             --certificate-identity \
@@ -262,38 +249,23 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "$archive"
           gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
-      - name: Create and sign application signing and notarization evidence
+      - name: Create and sign community signing evidence
         env:
-          TEAM_IDENTIFIER: ${{ secrets.APPLE_TEAM_ID }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           archive="agent-remote-device-macos-${VERSION}.zip"
-          evidence="agent-remote-device-macos-${VERSION}.signing-notarization.json"
+          source="dist/community-release/community-signing-${VERSION}.json"
+          evidence="agent-remote-device-macos-${VERSION}.community-signing.json"
           application_sha256=$(shasum -a 256 "$archive" | awk '{print $1}')
-          notarization_id=$(jq -er '.id' "dist/release/notarization-${VERSION}.json")
-          broker_plist="dist/release/Agent Remote Device.app/Contents/XPCServices/AgentRemoteNetworkBroker.xpc/Contents/Info.plist"
+          broker_plist="dist/community-release/Agent Remote Device.app/Contents/XPCServices/AgentRemoteNetworkBroker.xpc/Contents/Info.plist"
           broker_bundle_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$broker_plist")
-          broker_team_identifier=$(/usr/libexec/PlistBuddy -c 'Print :AgentRemoteTeamIdentifier' "$broker_plist")
-          signed_team_identifier=$(codesign --display --verbose=4 "dist/release/Agent Remote Device.app" 2>&1 | sed -n 's/^TeamIdentifier=//p')
-          outbound_policy_identifier=$(/usr/libexec/PlistBuddy -c 'Print :AgentRemoteOutboundPolicyIdentifier' "$broker_plist")
-          attestor_mach_service=$(/usr/libexec/PlistBuddy -c 'Print :AgentRemoteOutboundPolicyAttestorMachService' "$broker_plist")
-          attestor_public_key=$(/usr/libexec/PlistBuddy -c 'Print :AgentRemoteOutboundPolicyAttestorPublicKey' "$broker_plist")
-          attestor_public_key_sha256=$(printf '%s' "$attestor_public_key" | /usr/bin/base64 -D | shasum -a 256 | awk '{print $1}')
           test "$broker_bundle_identifier" = "dev.agentremote.device.network-broker"
-          test "$broker_team_identifier" = "$TEAM_IDENTIFIER"
-          test "$signed_team_identifier" = "$TEAM_IDENTIFIER"
-          jq -n \
+          jq \
             --arg application_sha256 "$application_sha256" \
-            --arg attestor_mach_service "$attestor_mach_service" \
-            --arg attestor_public_key_sha256 "$attestor_public_key_sha256" \
             --arg broker_bundle_identifier "$broker_bundle_identifier" \
-            --arg notarization_submission_id "$notarization_id" \
-            --arg outbound_policy_identifier "$outbound_policy_identifier" \
-            --arg team_identifier "$signed_team_identifier" \
-            --arg version "$VERSION" \
-            '{schema_version:1,release_version:$version,status:"passed",application_sha256:$application_sha256,team_identifier:$team_identifier,bundle_identifier:"dev.agentremote.device",broker_bundle_identifier:$broker_bundle_identifier,outbound_policy_identifier:$outbound_policy_identifier,attestor_mach_service:$attestor_mach_service,attestor_public_key_sha256:$attestor_public_key_sha256,notarization_submission_id:$notarization_submission_id,notarization_status:"Accepted",artifact_signature_verified:true,hardened_runtime:true,stapler_validated:true,gatekeeper_assessed:true}' \
-            > "$evidence"
+            '. + {application_sha256:$application_sha256,bundle_identifier:"dev.agentremote.device",broker_bundle_identifier:$broker_bundle_identifier}' \
+            "$source" > "$evidence"
           shasum -a 256 "$evidence" > "$evidence.sha256"
           cosign sign-blob --yes --bundle "$evidence.sigstore.json" "$evidence"
           cosign verify-blob \
@@ -312,10 +284,9 @@ jobs:
             agent-remote-device-macos-${{ inputs.version }}.zip.sigstore.json
             agent-remote-device-macos-${{ inputs.version }}.spdx.json
             agent-remote-device-macos-${{ inputs.version }}.spdx.json.sigstore.json
-            agent-remote-device-macos-${{ inputs.version }}.signing-notarization.json
-            agent-remote-device-macos-${{ inputs.version }}.signing-notarization.json.sha256
-            agent-remote-device-macos-${{ inputs.version }}.signing-notarization.json.sigstore.json
-            dist/release/notarization-${{ inputs.version }}.json
+            agent-remote-device-macos-${{ inputs.version }}.community-signing.json
+            agent-remote-device-macos-${{ inputs.version }}.community-signing.json.sha256
+            agent-remote-device-macos-${{ inputs.version }}.community-signing.json.sigstore.json
 
   publish:
     runs-on: ubuntu-latest

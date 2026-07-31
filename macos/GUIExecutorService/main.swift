@@ -4,16 +4,16 @@ import Darwin
 import Foundation
 
 guard DeviceProcessHardening.disableCoreDumps(),
-      let teamIdentifier = XPCServiceBootstrap.teamIdentifier(),
+      let signerIdentity = XPCServiceBootstrap.signerIdentity(),
       let policy = try? XPCPeerPolicy(
           bundleIdentifier: DeviceIPCServiceIdentifier.approvalUI,
-          teamIdentifier: teamIdentifier
+          signerIdentity: signerIdentity
       )
 else {
     exit(EXIT_FAILURE)
 }
 
-private let service = GUIExecutorService(teamIdentifier: teamIdentifier)
+private let service = GUIExecutorService(signerIdentity: signerIdentity)
 private let delegate = AuthenticatedXPCListenerDelegate(
     exportedInterface: NSXPCInterface(with: GUIExecutorXPCProtocol.self),
     exportedObject: service,
