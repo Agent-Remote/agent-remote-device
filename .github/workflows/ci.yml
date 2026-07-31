@@ -94,9 +94,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
+      - name: Install cargo-fuzz for the runner host
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Run bounded protocol parser fuzzing
         run: cargo fuzz run protocol fuzz/corpus/protocol -- -max_total_time=60 -timeout=10
 

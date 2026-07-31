@@ -12,4 +12,4 @@ All notable changes to this repository are recorded here.
 - test: cover Rust and Swift security contracts and the cross-component control path
 - ci: run Swift 6 builds on macOS 15 and install the protocol fuzz runner explicitly
 - fix: compile ScreenCaptureKit calls under Swift 6 strict concurrency checks
-- ci: run bounded protocol fuzzing with the required nightly toolchain
+- ci: run bounded protocol fuzzing with the required nightly toolchain and a host-built runner
