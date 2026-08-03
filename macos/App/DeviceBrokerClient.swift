@@ -81,6 +81,55 @@ final class DeviceBrokerClient: @unchecked Sendable {
         return pending
     }
 
+    func sessionCandidates() async throws -> [BrokerSessionCandidate] {
+        let broker = try brokerProxy()
+        let response = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Data, Error>) in
+            broker.listSessionCandidates { data, error in
+                guard error == nil, let data else {
+                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    return
+                }
+                continuation.resume(returning: Data(referencing: data))
+            }
+        }
+        let envelope = try DeviceIPCEnvelope.decode(response)
+        let candidates = try DeviceIPCDecoder.decode(
+            BrokerSessionCandidateList.self,
+            from: envelope.payload
+        )
+        try candidates.validate()
+        return candidates.items
+    }
+
+    func claimSession(toolSessionID: UUID) async throws {
+        let request = BrokerClaimRequest(toolSessionID: toolSessionID)
+        try request.validate()
+        let envelope = try DeviceIPCEnvelope(
+            requestID: UUID(),
+            payload: JSONEncoder().encode(request)
+        ).encoded() as NSData
+        let broker = try brokerProxy()
+        let response = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Data, Error>) in
+            broker.claimSession(envelope) { data, error in
+                guard error == nil, let data else {
+                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    return
+                }
+                continuation.resume(returning: Data(referencing: data))
+            }
+        }
+        let responseEnvelope = try DeviceIPCEnvelope.decode(response)
+        let pending = try DeviceIPCDecoder.decode(
+            BrokerPendingSession.self,
+            from: responseEnvelope.payload
+        )
+        try pending.validate()
+        setPendingSession(pending)
+        setActiveBinding(nil)
+    }
+
     func approve(_ approvals: [LocalApproval]) async throws {
         _ = try await decide(approvals, result: .allowed)
     }

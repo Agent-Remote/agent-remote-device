@@ -2,6 +2,8 @@
 "failure.title" = "Device control stopped";
 "failure.closed" = "The session failed closed.";
 "status.ready" = "Ready";
+"status.selecting_session" = "Select a Claude session";
+"status.claiming_session" = "Claiming Claude session";
 "status.permission_required" = "Permissions required";
 "status.approval_required" = "Approval required";
 "status.activating" = "Starting control";
@@ -33,6 +35,15 @@
 "warning.system_settings" = "Can change system settings";
 "session.stop_action" = "Stop current action";
 "session.end" = "End session";
+"session.switch" = "Switch session";
+"session.select_title" = "Choose a running Claude session";
+"session.claiming_session" = "Claiming Claude session";
+"session.refresh" = "Refresh";
+"session.no_candidates" = "No controllable Claude sessions are available";
+"session.current_device" = "Currently controlled by %@";
+"session.claim" = "Switch control";
+"session.rebind_title" = "Switch device control?";
+"session.rebind_message" = "This Claude session is already controlled by another device. Switching will end that device's control and require approval on this Mac.";
 "stop.escape" = "Stopped with Esc";
 "stop.sleep" = "Stopped before sleep";
 "stop.screen_locked" = "Stopped because the screen locked";

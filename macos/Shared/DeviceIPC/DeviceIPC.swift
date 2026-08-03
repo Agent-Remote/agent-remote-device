@@ -120,6 +120,8 @@ private func hasIdenticalJSONStructure(_ lhs: Any, _ rhs: Any) -> Bool {
         _ endpoint: NSXPCListenerEndpoint,
         reply: @escaping (NSError?) -> Void
     )
+    func listSessionCandidates(reply: @escaping (NSData?, NSError?) -> Void)
+    func claimSession(_ request: NSData, reply: @escaping (NSData?, NSError?) -> Void)
     func pollPendingSession(reply: @escaping (NSData?, NSError?) -> Void)
     func approveSession(_ request: NSData, reply: @escaping (NSData?, NSError?) -> Void)
     func stopCurrentAction(_ request: NSData, reply: @escaping (NSError?) -> Void)

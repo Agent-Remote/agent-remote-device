@@ -3,6 +3,9 @@ import Foundation
 
 public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @unchecked Sendable {
     public typealias PendingSessionProvider = @Sendable () async throws -> BrokerPendingSession?
+    public typealias CandidateProvider = @Sendable () async throws -> [BrokerSessionCandidate]
+    public typealias ClaimProvider = @Sendable (BrokerClaimRequest) async throws
+        -> BrokerPendingSession
     public typealias ApprovalProvider = @Sendable (BrokerApprovalDecision) async throws
         -> ExecutorSessionConfiguration?
     public typealias AbortProvider = @Sendable (BrokerAbortRequest) async throws
@@ -17,6 +20,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     private let lock = NSLock()
     private let executorOverride: GUIExecutorXPCProtocol?
     private let pendingSessionProvider: PendingSessionProvider
+    private let candidateProvider: CandidateProvider
+    private let claimProvider: ClaimProvider
     private let approvalProvider: ApprovalProvider
     private let abortProvider: AbortProvider
     private let endProvider: EndProvider
@@ -38,6 +43,12 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     public init(
         executorOverride: GUIExecutorXPCProtocol? = nil,
         pendingSessionProvider: @escaping PendingSessionProvider = {
+            throw DeviceIPCFailure.serviceUnavailable
+        },
+        candidateProvider: @escaping CandidateProvider = {
+            throw DeviceIPCFailure.serviceUnavailable
+        },
+        claimProvider: @escaping ClaimProvider = { _ in
             throw DeviceIPCFailure.serviceUnavailable
         },
         approvalProvider: @escaping ApprovalProvider = { _ in
@@ -63,6 +74,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     ) {
         self.executorOverride = executorOverride
         self.pendingSessionProvider = pendingSessionProvider
+        self.candidateProvider = candidateProvider
+        self.claimProvider = claimProvider
         self.approvalProvider = approvalProvider
         self.abortProvider = abortProvider
         self.endProvider = endProvider
@@ -88,6 +101,62 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                     payload: payload
                 ).encoded()
                 reply.resolve(data: envelope as NSData, error: nil)
+            } catch {
+                reply.resolve(data: nil, error: DeviceIPCFailure.serviceUnavailable.nsError)
+            }
+        }
+    }
+
+    public func listSessionCandidates(reply: @escaping (NSData?, NSError?) -> Void) {
+        let reply = DataReply(reply)
+        Task {
+            do {
+                let candidates = try await candidateProvider()
+                let list = BrokerSessionCandidateList(items: candidates)
+                try list.validate()
+                let payload = try JSONEncoder().encode(list)
+                let envelope = try DeviceIPCEnvelope(
+                    requestID: UUID(),
+                    payload: payload
+                ).encoded()
+                reply.resolve(data: envelope as NSData, error: nil)
+            } catch let failure as DeviceIPCFailure {
+                reply.resolve(data: nil, error: failure.nsError)
+            } catch {
+                reply.resolve(data: nil, error: DeviceIPCFailure.serviceUnavailable.nsError)
+            }
+        }
+    }
+
+    public func claimSession(
+        _ request: NSData,
+        reply: @escaping (NSData?, NSError?) -> Void
+    ) {
+        let reply = DataReply(reply)
+        let claimRequest: BrokerClaimRequest
+        do {
+            let envelope = try DeviceIPCEnvelope.decode(request as Data)
+            claimRequest = try DeviceIPCDecoder.decode(
+                BrokerClaimRequest.self,
+                from: envelope.payload
+            )
+            try claimRequest.validate()
+        } catch {
+            reply.resolve(data: nil, error: DeviceIPCFailure.invalidMessage.nsError)
+            return
+        }
+        Task {
+            do {
+                let pending = try await claimProvider(claimRequest)
+                try pending.validate()
+                let payload = try JSONEncoder().encode(pending)
+                let envelope = try DeviceIPCEnvelope(
+                    requestID: UUID(),
+                    payload: payload
+                ).encoded()
+                reply.resolve(data: envelope as NSData, error: nil)
+            } catch let failure as DeviceIPCFailure {
+                reply.resolve(data: nil, error: failure.nsError)
             } catch {
                 reply.resolve(data: nil, error: DeviceIPCFailure.serviceUnavailable.nsError)
             }

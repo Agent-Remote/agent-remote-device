@@ -60,6 +60,37 @@ public actor NetworkBrokerDiscoveryCoordinator {
         return BrokerPendingSession(binding: connected.binding, expiresAt: connected.expiresAt)
     }
 
+    public func sessionCandidates(now: Date = Date()) async throws -> [BrokerSessionCandidate] {
+        let client = try makeClient(now: now)
+        return try await client.sessionCandidates(now: now)
+    }
+
+    public func claim(
+        _ request: BrokerClaimRequest,
+        now: Date = Date()
+    ) async throws -> BrokerPendingSession {
+        try request.validate()
+        let client = try makeClient(now: now)
+        if let session = activeSession ?? pendingSession {
+            // Server-side rebind is authoritative, but local relay cleanup must finish
+            // before the new claim is allowed to create another approval generation.
+            activeSession = nil
+            pendingSession = nil
+            _ = try await client.stop(session, now: now)
+        }
+        let claimed = try await client.claim(toolSessionID: request.toolSessionID, now: now)
+        let credential = try credentialLoader.loadCredential(now: now)
+        guard claimed.deviceID.uuidString.lowercased() == credential.deviceID
+        else {
+            throw NetworkBrokerControlPlaneFailure.bindingMismatch
+        }
+        pendingSession = nil
+        guard let pending = try await nextPendingSession(now: now) else {
+            throw NetworkBrokerControlPlaneFailure.invalidResponse
+        }
+        return pending
+    }
+
     public func clearPendingSession(binding: DeviceSessionBinding) throws {
         guard let pendingSession, pendingSession.binding == binding else {
             throw NetworkBrokerControlPlaneFailure.bindingMismatch

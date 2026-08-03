@@ -208,6 +208,76 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
         return envelope.data.items.sorted { $0.createdAt < $1.createdAt }
     }
 
+    public func sessionCandidates(now: Date = Date()) async throws -> [BrokerSessionCandidate] {
+        let request = try makeRequest(path: "/api/v1/device-sessions/candidates")
+        let data = try await send(request)
+        let object = try strictObject(data)
+        guard exactKeys(object, ["data", "request_id"]),
+              boundedRequestID(object["request_id"]),
+              let payload = object["data"] as? [String: Any],
+              exactKeys(payload, ["items"]),
+              let items = payload["items"] as? [[String: Any]],
+              items.count <= maximumInboxItems
+        else {
+            throw NetworkBrokerControlPlaneFailure.invalidResponse
+        }
+        for item in items {
+            try validateCandidateObject(item)
+        }
+        let envelope = try decoder().decode(BrokerSessionCandidateListEnvelope.self, from: data)
+        guard envelope.data.items.count == items.count else {
+            throw NetworkBrokerControlPlaneFailure.invalidResponse
+        }
+        var identifiers = Set<UUID>()
+        for item in envelope.data.items {
+            try item.validate()
+            guard identifiers.insert(item.toolSessionID).inserted else {
+                throw NetworkBrokerControlPlaneFailure.invalidResponse
+            }
+        }
+        return envelope.data.items
+    }
+
+    public func claim(
+        _ candidate: BrokerSessionCandidate,
+        now: Date = Date()
+    ) async throws -> ControlPlaneDeviceSession {
+        try candidate.validate()
+        return try await claim(toolSessionID: candidate.toolSessionID, now: now)
+    }
+
+    public func claim(
+        toolSessionID: UUID,
+        now: Date = Date()
+    ) async throws -> ControlPlaneDeviceSession {
+        let claim = BrokerClaimRequest(toolSessionID: toolSessionID)
+        try claim.validate()
+        let body = try JSONEncoder().encode(claim)
+        let request = try makeRequest(
+            path: "/api/v1/device-sessions/claim",
+            method: "POST",
+            body: body
+        )
+        let data = try await send(request)
+        let object = try strictObject(data)
+        guard exactKeys(object, ["data", "request_id"]),
+              boundedRequestID(object["request_id"]),
+              let item = object["data"] as? [String: Any]
+        else {
+            throw NetworkBrokerControlPlaneFailure.invalidResponse
+        }
+        try validateSessionObject(item)
+        let session = try decoder().decode(DeviceSessionEnvelope.self, from: data).data
+        try validate(session, now: now)
+        guard session.deviceID.uuidString.lowercased() == credential.deviceID,
+              session.toolSessionID == toolSessionID,
+              !session.status.isTerminal
+        else {
+            throw NetworkBrokerControlPlaneFailure.bindingMismatch
+        }
+        return session
+    }
+
     public func markDeviceConnected(
         _ session: ControlPlaneDeviceSession,
         now: Date = Date()
@@ -613,6 +683,10 @@ private struct DeviceSessionListEnvelope: Codable {
     let data: DeviceSessionListData
 }
 
+private struct BrokerSessionCandidateListEnvelope: Codable {
+    let data: BrokerSessionCandidateList
+}
+
 private struct DeviceSessionListData: Codable {
     let items: [ControlPlaneDeviceSession]
 }
@@ -712,6 +786,50 @@ private func validateSessionObject(_ object: [String: Any]) throws {
         else {
             throw NetworkBrokerControlPlaneFailure.invalidResponse
         }
+    }
+}
+
+private func validateCandidateObject(_ object: [String: Any]) throws {
+    let expected = Set([
+        "tool_session_id", "tool_type", "tool_account_id", "workspace_id", "project_key",
+        "display_name", "status", "node_id", "runtime_backend", "current_device_id",
+        "current_device_name", "device_session_id", "controllable",
+    ])
+    guard exactKeys(object, expected),
+          let toolType = object["tool_type"] as? String,
+          toolType == "claude",
+          let projectKey = object["project_key"] as? String,
+          !projectKey.isEmpty,
+          projectKey.utf8.count <= 256,
+          let displayName = object["display_name"] as? String,
+          !displayName.isEmpty,
+          displayName.utf8.count <= 256,
+          let runtimeBackend = object["runtime_backend"] as? String,
+          !runtimeBackend.isEmpty,
+          runtimeBackend.utf8.count <= 64,
+          object["controllable"] as? Bool == true
+    else {
+        throw NetworkBrokerControlPlaneFailure.invalidResponse
+    }
+    for key in ["tool_session_id", "tool_account_id", "workspace_id", "node_id"] {
+        guard let value = object[key] as? String,
+              let identifier = UUID(uuidString: value),
+              identifier.uuidString.lowercased() == value
+        else {
+            throw NetworkBrokerControlPlaneFailure.invalidResponse
+        }
+    }
+    for key in ["current_device_id", "device_session_id"] {
+        guard object[key] is NSNull
+            || ((object[key] as? String).flatMap(UUID.init(uuidString:)) != nil)
+        else {
+            throw NetworkBrokerControlPlaneFailure.invalidResponse
+        }
+    }
+    if let deviceName = object["current_device_name"] as? String,
+       (deviceName.isEmpty || deviceName.utf8.count > 128)
+    {
+        throw NetworkBrokerControlPlaneFailure.invalidResponse
     }
 }
 

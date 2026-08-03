@@ -8,6 +8,8 @@ import UserNotifications
 
 public enum DeviceAppState: String, Sendable {
     case ready
+    case selectingSession = "selecting_session"
+    case claimingSession = "claiming_session"
     case permissionRequired = "permission_required"
     case awaitingApproval = "awaiting_approval"
     case activating
@@ -27,6 +29,7 @@ public enum DeviceAppFailure: Error, Equatable, Sendable {
 public final class DeviceAppModel: ObservableObject {
     @Published public private(set) var state: DeviceAppState = .ready
     @Published public private(set) var approvalPresentation: ApprovalPresentation?
+    @Published public private(set) var sessionCandidates: [BrokerSessionCandidate] = []
     @Published public var applicationSelections: Set<String> = []
     @Published public var clipboardSelections: Set<String> = []
     @Published public var controlLevelSelections: [String: ControlLevel] = [:]
@@ -45,6 +48,10 @@ public final class DeviceAppModel: ObservableObject {
     private var approvedBundleIdentifiers: Set<String> = []
 
     public var onApprove: ([LocalApproval]) async throws -> Void = { _ in
+        throw DeviceAppFailure.transportUnavailable
+    }
+    public var onRefreshSessionCandidates: () async throws -> [BrokerSessionCandidate] = { [] }
+    public var onClaimSession: (UUID) async throws -> Void = { _ in
         throw DeviceAppFailure.transportUnavailable
     }
     public var onDeny: ([LocalApproval]) async throws -> Void = { _ in
@@ -81,6 +88,7 @@ public final class DeviceAppModel: ObservableObject {
     }
 
     public func presentApproval(_ presentation: ApprovalPresentation) {
+        sessionCandidates = []
         permissions.refresh()
         let approvedIdentifiers = Set(
             presentation.applications.map { $0.application.bundleIdentifier }
@@ -98,6 +106,47 @@ public final class DeviceAppModel: ObservableObject {
         state = permissionsGranted() ? .awaitingApproval : .permissionRequired
     }
 
+    public func presentSessionCandidates(_ candidates: [BrokerSessionCandidate]) {
+        guard state != .active, state != .activating else { return }
+        sessionCandidates = candidates
+        failureMessage = nil
+        state = permissionsGranted() ? .selectingSession : .permissionRequired
+    }
+
+    public func refreshSessionCandidates() {
+        guard state == .ready || state == .selectingSession || state == .permissionRequired else {
+            return
+        }
+        Task {
+            do {
+                let candidates = try await onRefreshSessionCandidates()
+                presentSessionCandidates(candidates)
+            } catch {
+                failureMessage = String(describing: error)
+            }
+        }
+    }
+
+    public func claimSession(_ candidate: BrokerSessionCandidate) {
+        guard state == .selectingSession, candidate.controllable else { return }
+        guard permissionsGranted() else {
+            permissions.refresh()
+            state = .permissionRequired
+            return
+        }
+        state = .claimingSession
+        failureMessage = nil
+        Task {
+            do {
+                try await onClaimSession(candidate.toolSessionID)
+                state = .ready
+            } catch {
+                state = .selectingSession
+                failureMessage = String(describing: error)
+            }
+        }
+    }
+
     public func failIfInfrastructureUnavailable(_ available: Bool) {
         guard !available, state == .ready else { return }
         state = .failed
@@ -107,10 +156,17 @@ public final class DeviceAppModel: ObservableObject {
         )
     }
 
+    public func enforceCurrentPermissions() {
+        guard state == .active || state == .activating || state == .paused else { return }
+        permissions.refresh()
+        guard !permissionsGranted() else { return }
+        endSession()
+    }
+
     public func retryAfterPermissionChange() {
         permissions.refresh()
         guard approvalPresentation != nil else {
-            state = .ready
+            state = sessionCandidates.isEmpty ? .ready : .selectingSession
             return
         }
         state = permissionsGranted() ? .awaitingApproval : .permissionRequired
@@ -224,6 +280,41 @@ public final class DeviceAppModel: ObservableObject {
         Task {
             do {
                 try await onEndSession()
+            } catch {
+                state = .failed
+                failureMessage = String(describing: error)
+            }
+        }
+    }
+
+    public func switchSession() {
+        let canSwitch = state == .active
+            || state == .activating
+            || state == .paused
+            || state == .awaitingApproval
+            || (state == .permissionRequired && approvalPresentation != nil)
+        guard canSwitch else { return }
+        safetyMonitor?.stop()
+        safetyMonitor = nil
+        do {
+            try visibilityController.restoreApplications()
+        } catch {
+            state = .failed
+            failureMessage = String(describing: error)
+            return
+        }
+        approvalPresentation = nil
+        applicationSelections = []
+        clipboardSelections = []
+        controlLevelSelections = [:]
+        approvedBundleIdentifiers = []
+        lastUnsafeTransition = nil
+        state = .claimingSession
+        Task {
+            do {
+                try await onEndSession()
+                let candidates = try await onRefreshSessionCandidates()
+                presentSessionCandidates(candidates)
             } catch {
                 state = .failed
                 failureMessage = String(describing: error)

@@ -2,6 +2,8 @@
 "failure.title" = "设备控制已停止";
 "failure.closed" = "会话已按失败关闭策略停止。";
 "status.ready" = "已就绪";
+"status.selecting_session" = "选择 Claude 会话";
+"status.claiming_session" = "正在切换 Claude 会话";
 "status.permission_required" = "需要系统权限";
 "status.approval_required" = "需要批准";
 "status.activating" = "正在启动控制";
@@ -33,6 +35,15 @@
 "warning.system_settings" = "可以更改系统设置";
 "session.stop_action" = "停止当前操作";
 "session.end" = "结束会话";
+"session.switch" = "切换会话";
+"session.select_title" = "选择正在运行的 Claude 会话";
+"session.claiming_session" = "正在切换 Claude 会话";
+"session.refresh" = "刷新";
+"session.no_candidates" = "当前没有可控制的 Claude 会话";
+"session.current_device" = "当前由 %@ 控制";
+"session.claim" = "切换控制权";
+"session.rebind_title" = "切换设备控制权？";
+"session.rebind_message" = "该 Claude 会话已由其他设备控制。切换后旧设备的控制会结束，并需要在这台 Mac 上重新批准。";
 "stop.escape" = "已通过 Esc 停止";
 "stop.sleep" = "已在睡眠前停止";
 "stop.screen_locked" = "因屏幕锁定而停止";

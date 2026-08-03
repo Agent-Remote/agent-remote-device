@@ -101,6 +101,26 @@ private func sessionJSON(
     """
 }
 
+private func candidateJSON(currentDevice: String = "null") -> String {
+    """
+    {
+      "tool_session_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "tool_type":"claude",
+      "tool_account_id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      "workspace_id":"ffffffff-ffff-4fff-8fff-ffffffffffff",
+      "project_key":"Workspace",
+      "display_name":"Workspace",
+      "status":"running",
+      "node_id":"dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      "runtime_backend":"native",
+      "current_device_id":\(currentDevice),
+      "current_device_name":null,
+      "device_session_id":null,
+      "controllable":true
+    }
+    """
+}
+
 private func approval(for session: ControlPlaneDeviceSession) -> LocalApproval {
     LocalApproval(
         application: ApplicationIdentity(
@@ -150,6 +170,45 @@ private func relayMaterialJSON(
     #expect(requests.count == 1)
     #expect(requests[0].url?.absoluteString == "https://control.example.test/api/v1/device-sessions/device-inbox")
     #expect(requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer \(controlPlaneToken)")
+}
+
+@Test func candidatesAreStrictlyDecodedAndClaimUsesOnlyToolSessionID() async throws {
+    let candidatesBody = try #require(
+        "{\"data\":{\"items\":[\(candidateJSON())]},\"request_id\":null}"
+            .data(using: .utf8)
+    )
+    let pendingSession = sessionJSON(status: "pending_device")
+    let claimedBody = try #require(
+        "{\"data\":\(pendingSession),\"request_id\":null}".data(using: .utf8)
+    )
+    let transport = RecordingHTTPTransport(responses: [
+        (candidatesBody, 200),
+        (claimedBody, 200),
+    ])
+    let client = try NetworkBrokerControlPlaneClient(
+        credential: brokerCredential(),
+        transport: transport,
+        now: Date(timeIntervalSince1970: 4_000_000_000)
+    )
+    let candidates = try await client.sessionCandidates(
+        now: Date(timeIntervalSince1970: 4_000_000_000)
+    )
+    #expect(candidates.count == 1)
+    let claimed = try await client.claim(
+        toolSessionID: candidates[0].toolSessionID,
+        now: Date(timeIntervalSince1970: 4_000_000_000)
+    )
+    #expect(claimed.toolSessionID == candidates[0].toolSessionID)
+    let requests = await transport.recordedRequests()
+    #expect(requests[0].url?.path.hasSuffix("/device-sessions/candidates") == true)
+    #expect(requests[1].url?.path.hasSuffix("/device-sessions/claim") == true)
+    let claimBody = try #require(requests[1].httpBody)
+    let claimObject = try #require(
+        JSONSerialization.jsonObject(with: claimBody) as? [String: Any]
+    )
+    #expect(claimObject.count == 1)
+    #expect((claimObject["tool_session_id"] as? String)?.lowercased()
+        == "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 }
 
 @Test func markConnectedRequiresTheExactReturnedBindingAndStatus() async throws {
@@ -484,6 +543,72 @@ private func relayMaterialJSON(
     #expect(requests[0].url?.path.hasSuffix("/device-inbox") == true)
     #expect(requests[1].url?.path.hasSuffix("/abort") == true)
     #expect(requests[2].url?.path.hasSuffix("/device-connected") == true)
+}
+
+@Test func discoveryStopsLocalActiveBindingBeforeClaimingReplacement() async throws {
+    let pending = sessionJSON(status: "pending_device")
+    let connected = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let stopped = sessionJSON(
+        status: "stopped",
+        generation: 2,
+        stoppedAt: "\"2096-01-01T00:00:00Z\"",
+        stopReason: "\"session_end\""
+    )
+    let inbox = { (session: String) in
+        Data("{\"data\":{\"items\":[\(session)]},\"request_id\":null}".utf8)
+    }
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = RecordingHTTPTransport(responses: [
+        (inbox(pending), 200),
+        (response(connected), 200),
+        (response(active), 200),
+        (response(stopped), 200),
+        (response(pending), 200),
+        (inbox(pending), 200),
+        (response(connected), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let original = try #require(try await coordinator.nextPendingSession(now: now))
+    let approval = LocalApproval(
+        application: ApplicationIdentity(
+            bundleIdentifier: "com.apple.Safari",
+            signingIdentifier: "com.apple.Safari"
+        ),
+        controlLevel: .viewOnly,
+        clipboardAllowed: false,
+        generation: original.binding.generation
+    )
+    _ = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: original.binding,
+            approvals: [approval],
+            result: .allowed
+        ),
+        now: now
+    ))
+    _ = try await coordinator.claim(
+        BrokerClaimRequest(toolSessionID: original.binding.toolSessionID),
+        now: now
+    )
+
+    let requests = await transport.recordedRequests()
+    #expect(requests.map(\.url?.path).compactMap { $0 }.suffix(4) == [
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/stop",
+        "/api/v1/device-sessions/claim",
+        "/api/v1/device-sessions/device-inbox",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/device-connected",
+    ])
 }
 
 @Test func relayMaterialRequiresTheFixedPathAndCompleteOneTimeValues() async throws {

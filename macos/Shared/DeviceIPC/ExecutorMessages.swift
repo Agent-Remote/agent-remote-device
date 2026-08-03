@@ -73,6 +73,124 @@ public struct BrokerPendingSession: Codable, Equatable, Sendable {
     }
 }
 
+public enum BrokerRemoteSessionStatus: String, Codable, Sendable {
+    case running
+    case active
+    case detached
+}
+
+public struct BrokerSessionCandidate: Codable, Equatable, Sendable {
+    public let toolSessionID: UUID
+    public let toolType: String
+    public let toolAccountID: UUID
+    public let workspaceID: UUID
+    public let projectKey: String
+    public let displayName: String
+    public let status: BrokerRemoteSessionStatus
+    public let nodeID: UUID
+    public let runtimeBackend: String
+    public let currentDeviceID: UUID?
+    public let currentDeviceName: String?
+    public let deviceSessionID: UUID?
+    public let controllable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case toolSessionID = "tool_session_id"
+        case toolType = "tool_type"
+        case toolAccountID = "tool_account_id"
+        case workspaceID = "workspace_id"
+        case projectKey = "project_key"
+        case displayName = "display_name"
+        case status
+        case nodeID = "node_id"
+        case runtimeBackend = "runtime_backend"
+        case currentDeviceID = "current_device_id"
+        case currentDeviceName = "current_device_name"
+        case deviceSessionID = "device_session_id"
+        case controllable
+    }
+
+    public init(
+        toolSessionID: UUID,
+        toolType: String,
+        toolAccountID: UUID,
+        workspaceID: UUID,
+        projectKey: String,
+        displayName: String,
+        status: BrokerRemoteSessionStatus,
+        nodeID: UUID,
+        runtimeBackend: String,
+        currentDeviceID: UUID?,
+        currentDeviceName: String?,
+        deviceSessionID: UUID?,
+        controllable: Bool
+    ) {
+        self.toolSessionID = toolSessionID
+        self.toolType = toolType
+        self.toolAccountID = toolAccountID
+        self.workspaceID = workspaceID
+        self.projectKey = projectKey
+        self.displayName = displayName
+        self.status = status
+        self.nodeID = nodeID
+        self.runtimeBackend = runtimeBackend
+        self.currentDeviceID = currentDeviceID
+        self.currentDeviceName = currentDeviceName
+        self.deviceSessionID = deviceSessionID
+        self.controllable = controllable
+    }
+
+    public func validate() throws {
+        guard toolType == "claude",
+              !projectKey.isEmpty,
+              projectKey.utf8.count <= 256,
+              !displayName.isEmpty,
+              displayName.utf8.count <= 256,
+              !runtimeBackend.isEmpty,
+              runtimeBackend.utf8.count <= 64,
+              controllable
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+        if let currentDeviceName {
+            guard !currentDeviceName.isEmpty, currentDeviceName.utf8.count <= 128 else {
+                throw DeviceIPCFailure.invalidMessage
+            }
+        }
+    }
+}
+
+public struct BrokerSessionCandidateList: Codable, Equatable, Sendable {
+    public let items: [BrokerSessionCandidate]
+
+    public init(items: [BrokerSessionCandidate]) {
+        self.items = items
+    }
+
+    public func validate() throws {
+        guard items.count <= 32 else { throw DeviceIPCFailure.invalidMessage }
+        for item in items {
+            try item.validate()
+        }
+    }
+}
+
+public struct BrokerClaimRequest: Codable, Equatable, Sendable {
+    public let toolSessionID: UUID
+
+    enum CodingKeys: String, CodingKey {
+        case toolSessionID = "tool_session_id"
+    }
+
+    public init(toolSessionID: UUID) {
+        self.toolSessionID = toolSessionID
+    }
+
+    public func validate() throws {
+        guard toolSessionID != UUID() else { throw DeviceIPCFailure.invalidMessage }
+    }
+}
+
 public enum BrokerApprovalResult: String, Codable, Sendable {
     case allowed
     case denied

@@ -44,6 +44,12 @@ struct AgentRemoteDeviceApp: App {
         model.onApprove = { approvals in
             try await broker.approve(approvals)
         }
+        model.onRefreshSessionCandidates = {
+            try await broker.sessionCandidates()
+        }
+        model.onClaimSession = { toolSessionID in
+            try await broker.claimSession(toolSessionID: toolSessionID)
+        }
         model.onDeny = { approvals in
             try await broker.deny(approvals)
         }
@@ -65,19 +71,45 @@ struct AgentRemoteDeviceApp: App {
         var presentedBinding: DeviceSessionBinding?
         while !Task.isCancelled {
             do {
-                if let pending = try await broker.pollPendingSession() {
-                    if pending.binding != presentedBinding,
-                       model.state != .active,
-                       model.state != .activating
-                    {
-                        let presentation = try LocalApplicationDiscovery.approvalPresentation(
-                            generation: pending.binding.generation
-                        )
-                        model.presentApproval(presentation)
-                        presentedBinding = pending.binding
+                model.enforceCurrentPermissions()
+                if model.state == .selectingSession {
+                    let candidates = try await broker.sessionCandidates()
+                    model.presentSessionCandidates(candidates)
+                } else if model.state == .ready {
+                    if let pending = try await broker.pollPendingSession() {
+                        if pending.binding != presentedBinding,
+                           model.state != .active,
+                           model.state != .activating
+                        {
+                            let presentation = try LocalApplicationDiscovery.approvalPresentation(
+                                generation: pending.binding.generation
+                            )
+                            model.presentApproval(presentation)
+                            presentedBinding = pending.binding
+                        }
+                    } else {
+                        presentedBinding = nil
+                        let candidates = try await broker.sessionCandidates()
+                        model.presentSessionCandidates(candidates)
                     }
-                } else {
-                    presentedBinding = nil
+                } else if model.state == .stopped || model.state == .denied {
+                    let candidates = try await broker.sessionCandidates()
+                    model.presentSessionCandidates(candidates)
+                } else if model.state != .claimingSession && model.state != .permissionRequired {
+                    if let pending = try await broker.pollPendingSession() {
+                        if pending.binding != presentedBinding,
+                           model.state != .active,
+                           model.state != .activating
+                        {
+                            let presentation = try LocalApplicationDiscovery.approvalPresentation(
+                                generation: pending.binding.generation
+                            )
+                            model.presentApproval(presentation)
+                            presentedBinding = pending.binding
+                        }
+                    } else {
+                        presentedBinding = nil
+                    }
                 }
             } catch {
                 brokerLogger.error("Broker poll failed")

@@ -37,6 +37,16 @@ private let service = NetworkBrokerService(pendingSessionProvider: {
         throw DeviceIPCFailure.serviceUnavailable
     }
     return try await discovery.nextPendingSession()
+}, candidateProvider: {
+    guard let discovery else {
+        throw DeviceIPCFailure.serviceUnavailable
+    }
+    return try await discovery.sessionCandidates()
+}, claimProvider: { request in
+    guard let discovery else {
+        throw DeviceIPCFailure.serviceUnavailable
+    }
+    return try await discovery.claim(request)
 }, approvalProvider: { decision in
     guard let discovery else {
         throw DeviceIPCFailure.serviceUnavailable
