@@ -1,5 +1,16 @@
 # agent-remote-device
 
+<p align="center"><img src="assets/agent-remote-icon.svg" alt="Agent Remote icon" width="80" height="80"></p>
+
+<p align="center">
+  <a href="https://github.com/Agent-Remote/agent-remote-device/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Agent-Remote/agent-remote-device/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://codecov.io/gh/Agent-Remote/agent-remote-device"><img alt="Codecov" src="https://codecov.io/gh/Agent-Remote/agent-remote-device/graph/badge.svg"></a>
+  <a href="https://github.com/Agent-Remote/agent-remote-device/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/Agent-Remote/agent-remote-device?style=flat&logo=github"></a>
+  <img alt="Swift 6.0" src="https://img.shields.io/badge/Swift-6.0-F05138?logo=swift&logoColor=white">
+  <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white">
+  <a href="LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/github/license/Agent-Remote/agent-remote-device"></a>
+</p>
+
 Security-sensitive macOS device bridge and managed MCP proxy for agent-remote.
 
 This repository owns the versioned device protocol, the native macOS components,

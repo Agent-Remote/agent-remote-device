@@ -8,6 +8,8 @@
     <string>Agent Remote Device</string>
     <key>CFBundleExecutable</key>
     <string>AgentRemoteDevice</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>dev.agentremote.device</string>
     <key>CFBundleInfoDictionaryVersion</key>

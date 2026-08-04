@@ -35,6 +35,8 @@ install -m 0755 "$bin_path/agent-remote-device-dev" \
   "$app_bundle/Contents/MacOS/AgentRemoteDevice"
 install -m 0644 "$repo_root/macos/Packaging/App-Info.plist" \
   "$app_bundle/Contents/Info.plist"
+install -m 0644 "$repo_root/macos/Packaging/AppIcon.icns" \
+  "$app_bundle/Contents/Resources/AppIcon.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" \
   "$app_bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" \

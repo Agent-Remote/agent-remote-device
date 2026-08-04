@@ -147,7 +147,7 @@ for signature_check in \
   fi
 done
 
-for script in "$release_script" "$development_script"; do
+for script in "$release_script" "$development_script" "$community_release_script"; do
   if ! grep -Fq 'Contents/Resources/$locale.lproj/Localizable.strings' "$script"; then
     echo "localization catalog check is missing from $script" >&2
     exit 1
@@ -156,7 +156,21 @@ for script in "$release_script" "$development_script"; do
     echo "localization catalog installation is missing from $script" >&2
     exit 1
   fi
+  if ! grep -Fq 'macos/Packaging/AppIcon.icns' "$script"; then
+    echo "application icon installation is missing from $script" >&2
+    exit 1
+  fi
 done
+
+if ! grep -Fq '<key>CFBundleIconFile</key>' "$repo_root/macos/Packaging/App-Info.plist" || \
+  ! grep -Fq '<string>AppIcon</string>' "$repo_root/macos/Packaging/App-Info.plist"; then
+  echo "application icon is missing from App-Info.plist" >&2
+  exit 1
+fi
+if [[ ! -f "$repo_root/macos/Packaging/AppIcon.icns" ]]; then
+  echo "application icon asset is missing" >&2
+  exit 1
+fi
 
 for community_check in \
   'AgentRemoteSignerCertificateSHA1' \
