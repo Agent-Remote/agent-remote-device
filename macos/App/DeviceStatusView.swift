@@ -1,3 +1,4 @@
+import AppKit
 import DeviceAppCore
 import DeviceIPC
 import DeviceSecurity
@@ -23,6 +24,11 @@ struct DeviceStatusView: View {
 
             Divider()
 
+            if model.state == .selectingSession, let completionMessage = model.completionMessage {
+                Label(completionMessage, systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
+
             switch model.state {
             case .permissionRequired:
                 PermissionView(model: model)
@@ -31,21 +37,45 @@ struct DeviceStatusView: View {
             case .awaitingApproval:
                 if let presentation = model.approvalPresentation {
                     ApprovalView(model: model, presentation: presentation)
+                } else {
+                    RecoveryActionView(
+                        title: localizedAppString("failure.invalid_state"),
+                        message: localizedAppString("failure.invalid_state_message"),
+                        actionTitle: localizedAppString("session.return_to_list"),
+                        action: model.returnToSessionSelection
+                    )
                 }
             case .active, .activating, .paused:
                 SessionControlsView(model: model)
-            case .failed:
-                ContentUnavailableView(
-                    localizedAppString("failure.title"),
-                    systemImage: "exclamationmark.shield",
-                    description: Text(
-                        model.failureMessage ?? localizedAppString("failure.closed")
-                    )
+            case .pausing:
+                OperationProgressView(
+                    title: localizedAppString("status.pausing"),
+                    systemImage: "stop.fill"
                 )
-            default:
-                Spacer()
-                ContentUnavailableView(statusTitle, systemImage: statusSymbol)
-                Spacer()
+            case .endingSession:
+                OperationProgressView(
+                    title: localizedAppString("status.ending_session"),
+                    systemImage: "xmark.circle"
+                )
+            case .reconnecting:
+                OperationProgressView(
+                    title: localizedAppString("status.reconnecting"),
+                    systemImage: "network"
+                )
+            case .failed:
+                FailureRecoveryView(model: model)
+            case .denied, .stopped:
+                RecoveryActionView(
+                    title: statusTitle,
+                    message: model.completionMessage ?? localizedAppString("session.return_hint"),
+                    actionTitle: localizedAppString("session.return_to_list"),
+                    action: model.returnToSessionSelection
+                )
+            case .ready:
+                OperationProgressView(
+                    title: localizedAppString("status.loading_sessions"),
+                    systemImage: "desktopcomputer"
+                )
             }
         }
         .padding(24)
@@ -60,7 +90,10 @@ struct DeviceStatusView: View {
         case .awaitingApproval: localizedAppString("status.approval_required")
         case .activating: localizedAppString("status.activating")
         case .active: localizedAppString("status.active")
+        case .pausing: localizedAppString("status.pausing")
         case .paused: localizedAppString("status.paused")
+        case .endingSession: localizedAppString("status.ending_session")
+        case .reconnecting: localizedAppString("status.reconnecting")
         case .denied: localizedAppString("status.denied")
         case .stopped: localizedAppString("status.stopped")
         case .failed: localizedAppString("status.failed")
@@ -70,7 +103,10 @@ struct DeviceStatusView: View {
     private var statusSymbol: String {
         switch model.state {
         case .active, .activating: "cursorarrow.motionlines"
+        case .pausing: "stop.fill"
         case .selectingSession, .claimingSession: "list.bullet.rectangle"
+        case .endingSession: "xmark.circle"
+        case .reconnecting: "network"
         case .permissionRequired, .awaitingApproval: "hand.raised"
         case .failed: "exclamationmark.shield"
         case .paused, .denied, .stopped: "stop.circle"
@@ -84,6 +120,7 @@ struct DeviceStatusView: View {
         case .selectingSession, .claimingSession: .blue
         case .permissionRequired, .awaitingApproval: .orange
         case .failed: .red
+        case .pausing, .endingSession, .reconnecting: .blue
         default: .secondary
         }
     }
@@ -107,16 +144,28 @@ private struct SessionSelectionView: View {
                 } label: {
                     Label(localizedAppString("session.refresh"), systemImage: "arrow.clockwise")
                 }
-                .disabled(model.state == .claimingSession)
+                .disabled(model.state == .claimingSession || model.isRefreshingSessionCandidates)
             }
 
             if let failureMessage = model.failureMessage {
-                Label(failureMessage, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-                    .textSelection(.enabled)
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(failureMessage, systemImage: "exclamationmark.triangle")
+                    if let failureCode = model.failureCode {
+                        Text(failureCode)
+                            .font(.system(.caption, design: .monospaced))
+                            .padding(.leading, 24)
+                    }
+                }
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
             }
 
-            if model.sessionCandidates.isEmpty {
+            if model.isRefreshingSessionCandidates, model.sessionCandidates.isEmpty {
+                Spacer()
+                ProgressView(localizedAppString("session.loading"))
+                    .frame(maxWidth: .infinity)
+                Spacer()
+            } else if model.sessionCandidates.isEmpty {
                 ContentUnavailableView(
                     localizedAppString("session.no_candidates"),
                     systemImage: "desktopcomputer"
@@ -399,6 +448,7 @@ private struct ApprovalApplicationRow: View {
 
 private struct SessionControlsView: View {
     @ObservedObject var model: DeviceAppModel
+    @State private var pendingConfirmation: SessionControlConfirmation?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -409,7 +459,7 @@ private struct SessionControlsView: View {
             Spacer()
             HStack {
                 Button {
-                    model.switchSession()
+                    pendingConfirmation = .switchSession
                 } label: {
                     Label(
                         localizedAppString("session.switch"),
@@ -425,11 +475,56 @@ private struct SessionControlsView: View {
                 .disabled(model.state != .active && model.state != .activating)
                 Spacer()
                 Button(role: .destructive) {
-                    model.endSession()
+                    pendingConfirmation = .endControl
                 } label: {
-                    Label(localizedAppString("session.end"), systemImage: "xmark.circle")
+                    Label(localizedAppString("session.end_control"), systemImage: "xmark.circle")
                 }
             }
+        }
+        .confirmationDialog(
+            confirmationTitle,
+            isPresented: Binding(
+                get: { pendingConfirmation != nil },
+                set: { visible in
+                    if !visible { pendingConfirmation = nil }
+                }
+            )
+        ) {
+            switch pendingConfirmation {
+            case .switchSession:
+                Button(localizedAppString("session.switch_confirm"), role: .destructive) {
+                    model.switchSession()
+                    pendingConfirmation = nil
+                }
+            case .endControl:
+                Button(localizedAppString("session.end_confirm"), role: .destructive) {
+                    model.endSession()
+                    pendingConfirmation = nil
+                }
+            case nil:
+                EmptyView()
+            }
+            Button(localizedAppString("common.cancel"), role: .cancel) {
+                pendingConfirmation = nil
+            }
+        } message: {
+            Text(confirmationMessage)
+        }
+    }
+
+    private var confirmationTitle: String {
+        switch pendingConfirmation {
+        case .switchSession: localizedAppString("session.switch_confirm_title")
+        case .endControl: localizedAppString("session.end_confirm_title")
+        case nil: ""
+        }
+    }
+
+    private var confirmationMessage: String {
+        switch pendingConfirmation {
+        case .switchSession: localizedAppString("session.switch_confirm_message")
+        case .endControl: localizedAppString("session.end_confirm_message")
+        case nil: ""
         }
     }
 
@@ -441,6 +536,91 @@ private struct SessionControlsView: View {
         case .userSwitched: localizedAppString("stop.user_switched")
         case .networkDisconnected: localizedAppString("stop.network_disconnected")
         }
+    }
+}
+
+private enum SessionControlConfirmation {
+    case switchSession
+    case endControl
+}
+
+private struct OperationProgressView: View {
+    let title: String
+    let systemImage: String
+
+    var body: some View {
+        Spacer()
+        ContentUnavailableView {
+            Label(title, systemImage: systemImage)
+        } description: {
+            ProgressView()
+                .controlSize(.small)
+        }
+        Spacer()
+    }
+}
+
+private struct RecoveryActionView: View {
+    let title: String
+    let message: String
+    let actionTitle: String
+    let action: () -> Void
+
+    var body: some View {
+        Spacer()
+        ContentUnavailableView {
+            Label(title, systemImage: "checkmark.shield")
+        } description: {
+            Text(message)
+        } actions: {
+            Button(actionTitle, action: action)
+                .buttonStyle(.borderedProminent)
+        }
+        Spacer()
+    }
+}
+
+private struct FailureRecoveryView: View {
+    @ObservedObject var model: DeviceAppModel
+
+    var body: some View {
+        Spacer()
+        ContentUnavailableView {
+            Label(localizedAppString("failure.title"), systemImage: "exclamationmark.shield")
+        } description: {
+            VStack(spacing: 8) {
+                Text(model.failureMessage ?? localizedAppString("failure.closed"))
+                if let failureCode = model.failureCode {
+                    Text(failureCode)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .textSelection(.enabled)
+        } actions: {
+            switch model.failureRecovery {
+            case .reconnect:
+                Button(localizedAppString("failure.reconnect")) {
+                    model.retryAfterFailure()
+                }
+                .buttonStyle(.borderedProminent)
+            case .sessionSelection:
+                Button(localizedAppString("session.return_to_list")) {
+                    model.returnToSessionSelection()
+                }
+                .buttonStyle(.borderedProminent)
+            case .restartApplication:
+                Button(localizedAppString("failure.quit"), role: .destructive) {
+                    NSApplication.shared.terminate(nil)
+                }
+            case nil:
+                Button(localizedAppString("session.return_to_list")) {
+                    model.returnToSessionSelection()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        Spacer()
     }
 }
 

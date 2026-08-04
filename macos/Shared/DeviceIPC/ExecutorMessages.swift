@@ -342,6 +342,47 @@ public struct ExecutorImagePayload: Codable, Equatable, Sendable {
     }
 }
 
+public struct BrokerApplicationActivationRequest: Codable, Equatable, Sendable {
+    public let binding: DeviceSessionBinding
+    public let targetApplication: String
+    public let approvals: [LocalApproval]
+
+    enum CodingKeys: String, CodingKey {
+        case binding, approvals
+        case targetApplication = "target_application"
+    }
+
+    public init(
+        binding: DeviceSessionBinding,
+        targetApplication: String,
+        approvals: [LocalApproval]
+    ) {
+        self.binding = binding
+        self.targetApplication = targetApplication
+        self.approvals = approvals
+    }
+
+    public func validate() throws {
+        guard binding.hasActiveGeneration,
+              binding.platform == .macos,
+              !targetApplication.isEmpty,
+              targetApplication.count <= 255,
+              targetApplication == targetApplication.trimmingCharacters(
+                  in: .whitespacesAndNewlines
+              ),
+              !targetApplication.unicodeScalars.contains(
+                  where: CharacterSet.controlCharacters.contains
+              ),
+              !approvals.isEmpty,
+              approvals.count <= 32,
+              approvals.allSatisfy({ $0.generation == binding.generation }),
+              Set(approvals.map(\.application.stableDigest)).count == approvals.count
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+    }
+}
+
 public struct ExecutorActionResponse: Codable, Equatable, Sendable {
     public let requestID: UUID
     public let monotonicSequence: UInt64

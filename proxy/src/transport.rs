@@ -15,7 +15,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
     sync::Mutex,
-    time::timeout,
+    time::{sleep, timeout, Instant},
 };
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use uuid::Uuid;
@@ -37,6 +37,8 @@ const MAX_BRIDGE_CONTROL_BYTES: usize = 4096;
 const BRIDGE_PROTOCOL_VERSION: u8 = 1;
 const MAX_ACTION_RESPONSE_WAIT: Duration = Duration::from_secs(30);
 const LIFECYCLE_RESPONSE_WAIT: Duration = Duration::from_secs(15);
+const CONTEXT_READY_WAIT: Duration = Duration::from_secs(10);
+const CONTEXT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -58,8 +60,17 @@ impl ManagedContext {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let metadata = file.metadata()?;
+            .open(path)
+            .map_err(|source| TransportError::ContextIo {
+                operation: "open",
+                source,
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| TransportError::ContextIo {
+                operation: "metadata inspection",
+                source,
+            })?;
         if !metadata.file_type().is_file()
             || metadata.len() > MAX_CONTEXT_BYTES
             || metadata.mode() & 0o077 != 0
@@ -68,7 +79,12 @@ impl ManagedContext {
             return Err(TransportError::UnsafeContextFile);
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_CONTEXT_BYTES + 1).read_to_end(&mut bytes)?;
+        file.take(MAX_CONTEXT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| TransportError::ContextIo {
+                operation: "read",
+                source,
+            })?;
         if bytes.len() as u64 > MAX_CONTEXT_BYTES {
             return Err(TransportError::UnsafeContextFile);
         }
@@ -237,8 +253,8 @@ pub enum TransportError {
     Poisoned,
     #[error("device response does not match the request binding")]
     ResponseBinding,
-    #[error("device rejected the action")]
-    DeviceRejected,
+    #[error("device rejected the action: {0}")]
+    DeviceRejected(String),
     #[error("device frame exceeds the protocol limit")]
     FrameTooLarge,
     #[error("device session lease has expired")]
@@ -247,11 +263,31 @@ pub enum TransportError {
     OperationTimedOut,
     #[error("device transport counter is exhausted")]
     CounterExhausted,
-    #[error("managed context I/O failed")]
-    Io(#[from] std::io::Error),
-    #[error("managed context JSON is invalid")]
+    #[error("managed context {operation} failed: {source}")]
+    ContextIo {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("local device bridge connection failed: {0}")]
+    BridgeConnect(#[source] std::io::Error),
+    #[error("local device bridge handshake {operation} failed: {source}")]
+    BridgeHandshakeIo {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("nested TLS handshake failed: {0}")]
+    TlsHandshakeIo(#[source] std::io::Error),
+    #[error("encrypted device channel {operation} failed: {source}")]
+    ChannelIo {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("managed context JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("nested TLS setup or verification failed")]
+    #[error("nested TLS setup or verification failed: {0}")]
     NestedTls(#[from] NestedTlsError),
 }
 
@@ -265,6 +301,21 @@ impl UnixDeviceTransport {
                 connection: None,
             }),
         }
+    }
+
+    async fn ensure_connected(&self) -> Result<(), TransportError> {
+        let mut state = self.state.lock().await;
+        if state.poisoned {
+            return Err(TransportError::Poisoned);
+        }
+        if state.context.lease_until <= Utc::now() {
+            poison(&mut state);
+            return Err(TransportError::LeaseExpired);
+        }
+        if state.connection.is_none() {
+            state.connection = Some(establish_nested_tls(&self.socket_path, &state.context).await?);
+        }
+        Ok(())
     }
 
     async fn exchange(
@@ -357,9 +408,16 @@ impl ActivatedUnixDeviceTransport {
 
     /// Forwards one lifecycle event using the active generation binding.
     pub async fn notify_lifecycle(&self, event: LifecycleEvent) -> Result<(), TransportError> {
-        let context = ManagedContext::load(&self.managed_context_path)?;
+        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
         let transport = self.transport_for_context(context).await?;
         transport.notify_lifecycle(event).await
+    }
+
+    /// Establishes the generation-bound relay before the first MCP action arrives.
+    pub async fn ensure_connected(&self) -> Result<(), TransportError> {
+        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        let transport = self.transport_for_context(context).await?;
+        transport.ensure_connected().await
     }
 
     async fn transport_for_context(
@@ -368,16 +426,18 @@ impl ActivatedUnixDeviceTransport {
     ) -> Result<Arc<UnixDeviceTransport>, TransportError> {
         let mut active = self.active.lock().await;
         if let Some((current, transport)) = active.as_mut() {
-            if current.generation > context.generation {
-                return Err(TransportError::InvalidContext);
-            }
-            if current.generation == context.generation {
-                if !current.same_binding_and_generation(&context) {
-                    return Err(TransportError::ContextBinding);
+            if current.device_session_id == context.device_session_id {
+                if current.generation > context.generation {
+                    return Err(TransportError::InvalidContext);
                 }
-                transport.refresh_lease(&context).await?;
-                current.lease_until = context.lease_until;
-                return Ok(Arc::clone(transport));
+                if current.generation == context.generation {
+                    if !current.same_binding_and_generation(&context) {
+                        return Err(TransportError::ContextBinding);
+                    }
+                    transport.refresh_lease(&context).await?;
+                    current.lease_until = context.lease_until;
+                    return Ok(Arc::clone(transport));
+                }
             }
         }
         let transport = Arc::new(UnixDeviceTransport::new(
@@ -386,6 +446,27 @@ impl ActivatedUnixDeviceTransport {
         ));
         *active = Some((context, Arc::clone(&transport)));
         Ok(transport)
+    }
+}
+
+async fn load_managed_context(
+    path: &Path,
+    wait: Duration,
+) -> Result<ManagedContext, TransportError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match ManagedContext::load(path) {
+            Err(TransportError::ContextIo { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(TransportError::NotActivated);
+                }
+                sleep(CONTEXT_RETRY_INTERVAL.min(remaining)).await;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -404,27 +485,52 @@ async fn exchange_payload(
         .connection
         .as_mut()
         .ok_or(TransportError::InvalidContext)?;
-    stream.write_u32(payload.len() as u32).await?;
-    stream.write_all(payload).await?;
-    stream.flush().await?;
-    let response_length = stream.read_u32().await? as usize;
+    stream
+        .write_u32(payload.len() as u32)
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "write length",
+            source,
+        })?;
+    stream
+        .write_all(payload)
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "write payload",
+            source,
+        })?;
+    stream
+        .flush()
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "flush request",
+            source,
+        })?;
+    let response_length = stream
+        .read_u32()
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "read response length",
+            source,
+        })? as usize;
     if response_length == 0 || response_length > MAX_FRAME_BYTES {
         return Err(TransportError::FrameTooLarge);
     }
     let mut response = vec![0; response_length];
-    stream.read_exact(&mut response).await?;
+    stream
+        .read_exact(&mut response)
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "read response payload",
+            source,
+        })?;
     Ok(response)
 }
 
 #[async_trait]
 impl DeviceTransport for ActivatedUnixDeviceTransport {
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError> {
-        let context = match ManagedContext::load(&self.managed_context_path) {
-            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(TransportError::NotActivated);
-            }
-            result => result?,
-        };
+        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
         let transport = self.transport_for_context(context).await?;
         transport.execute(action).await
     }
@@ -494,12 +600,11 @@ impl DeviceTransport for UnixDeviceTransport {
             poison(&mut state);
             return Err(TransportError::ResponseBinding);
         }
+        if matches!(response.status, ResponseStatus::Failed) {
+            return Err(TransportError::DeviceRejected(response.message));
+        }
         state.context.next_sequence += 1;
         state.context.current_screenshot_generation = response.screenshot_generation;
-        if matches!(response.status, ResponseStatus::Failed) {
-            poison(&mut state);
-            return Err(TransportError::DeviceRejected);
-        }
         let screenshot = response.image.map(|image| Screenshot {
             base64_data: image.base64_data,
             mime_type: image.mime_type,
@@ -520,7 +625,9 @@ async fn establish_nested_tls(
     socket_path: &Path,
     context: &ManagedContext,
 ) -> Result<TlsStream<UnixStream>, TransportError> {
-    let mut stream = UnixStream::connect(socket_path).await?;
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(TransportError::BridgeConnect)?;
     let identity = GenerationIdentity::generate()?;
     write_bridge_control(
         &mut stream,
@@ -552,7 +659,10 @@ async fn establish_nested_tls(
     let server_name = rustls::pki_types::ServerName::try_from("agent-remote-device.invalid")
         .map_err(NestedTlsError::ServerName)?
         .to_owned();
-    let mut tls = connector.connect(server_name, stream).await?;
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(TransportError::TlsHandshakeIo)?;
     let exporter = exporter_binding(tls.get_ref().1, &material)?;
     let local_confirmation = confirmation_record(
         &exporter,
@@ -560,10 +670,25 @@ async fn establish_nested_tls(
         context.generation,
         context.device_session_id,
     );
-    tls.write_all(&local_confirmation).await?;
-    tls.flush().await?;
+    tls.write_all(&local_confirmation)
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "write TLS confirmation",
+            source,
+        })?;
+    tls.flush()
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "flush TLS confirmation",
+            source,
+        })?;
     let mut peer_confirmation = [0_u8; CONFIRMATION_RECORD_BYTES];
-    tls.read_exact(&mut peer_confirmation).await?;
+    tls.read_exact(&mut peer_confirmation)
+        .await
+        .map_err(|source| TransportError::ChannelIo {
+            operation: "read TLS confirmation",
+            source,
+        })?;
     verify_peer_confirmation(
         &peer_confirmation,
         &exporter,
@@ -582,21 +707,51 @@ async fn write_bridge_control<T: Serialize>(
     if payload.is_empty() || payload.len() > MAX_BRIDGE_CONTROL_BYTES {
         return Err(TransportError::FrameTooLarge);
     }
-    stream.write_u32(payload.len() as u32).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await?;
+    stream
+        .write_u32(payload.len() as u32)
+        .await
+        .map_err(|source| TransportError::BridgeHandshakeIo {
+            operation: "write length",
+            source,
+        })?;
+    stream
+        .write_all(&payload)
+        .await
+        .map_err(|source| TransportError::BridgeHandshakeIo {
+            operation: "write payload",
+            source,
+        })?;
+    stream
+        .flush()
+        .await
+        .map_err(|source| TransportError::BridgeHandshakeIo {
+            operation: "flush request",
+            source,
+        })?;
     Ok(())
 }
 
 async fn read_bridge_control<T: for<'de> Deserialize<'de>>(
     stream: &mut UnixStream,
 ) -> Result<T, TransportError> {
-    let length = stream.read_u32().await? as usize;
+    let length = stream
+        .read_u32()
+        .await
+        .map_err(|source| TransportError::BridgeHandshakeIo {
+            operation: "read response length",
+            source,
+        })? as usize;
     if length == 0 || length > MAX_BRIDGE_CONTROL_BYTES {
         return Err(TransportError::FrameTooLarge);
     }
     let mut payload = vec![0_u8; length];
-    stream.read_exact(&mut payload).await?;
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|source| TransportError::BridgeHandshakeIo {
+            operation: "read response payload",
+            source,
+        })?;
     Ok(serde_json::from_slice(&payload)?)
 }
 
@@ -644,15 +799,37 @@ mod tests {
     #[tokio::test]
     async fn activated_transport_remains_discoverable_before_context_exists() {
         let directory = tempdir().expect("temp directory");
-        let transport = ActivatedUnixDeviceTransport::new(
-            &directory.path().join("missing-context.json"),
-            &directory.path().join("missing-bridge.sock"),
-        );
+        let path = directory.path().join("missing-context.json");
 
         assert!(matches!(
-            transport.execute(Action::Screenshot).await,
+            load_managed_context(&path, Duration::ZERO).await,
             Err(TransportError::NotActivated)
         ));
+    }
+
+    #[tokio::test]
+    async fn activated_transport_waits_for_context_creation() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("context.json");
+        let context = test_context(1, Utc::now() + chrono::Duration::seconds(30));
+        let writer_path = path.clone();
+        let writer_context = context.clone();
+        let writer = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&writer_path)
+                .expect("create context");
+            serde_json::to_writer(&mut file, &writer_context).expect("write context");
+        });
+
+        let loaded = load_managed_context(&path, Duration::from_secs(1))
+            .await
+            .expect("context should become available");
+        assert_eq!(loaded, context);
+        writer.await.expect("context writer");
     }
 
     #[tokio::test]
@@ -704,6 +881,92 @@ mod tests {
             activated.transport_for_context(changed).await,
             Err(TransportError::ContextBinding)
         ));
+    }
+
+    #[tokio::test]
+    async fn activated_transport_replaces_a_rebound_device_session() {
+        let directory = tempdir().expect("temp directory");
+        let activated = ActivatedUnixDeviceTransport::new(
+            &directory.path().join("context.json"),
+            &directory.path().join("bridge.sock"),
+        );
+        let initial = test_context(7, Utc::now() + chrono::Duration::seconds(30));
+        let old_transport = activated
+            .transport_for_context(initial.clone())
+            .await
+            .expect("initial transport");
+        {
+            let mut state = old_transport.state.lock().await;
+            state.context.next_sequence = 8;
+            state.context.current_screenshot_generation = 4;
+        }
+
+        let rebound = ManagedContext {
+            device_id: Uuid::new_v4(),
+            device_session_id: Uuid::new_v4(),
+            generation: 1,
+            next_sequence: 1,
+            current_screenshot_generation: 0,
+            ..initial
+        };
+        let new_transport = activated
+            .transport_for_context(rebound.clone())
+            .await
+            .expect("rebound transport");
+
+        assert!(!Arc::ptr_eq(&old_transport, &new_transport));
+        let state = new_transport.state.lock().await;
+        assert_eq!(state.context, rebound);
+        assert_eq!(state.context.next_sequence, 1);
+        assert_eq!(state.context.current_screenshot_generation, 0);
+    }
+
+    #[test]
+    fn managed_context_io_reports_the_failed_operation() {
+        let directory = tempdir().expect("temp directory");
+        let error = ManagedContext::load(&directory.path().join("missing.json"))
+            .expect_err("missing context must fail");
+
+        assert!(matches!(
+            &error,
+            TransportError::ContextIo {
+                operation: "open",
+                ..
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.starts_with("managed context open failed: "));
+        assert!(message.contains("No such file") || message.contains("not found"));
+    }
+
+    #[test]
+    fn rejected_device_action_preserves_the_concrete_reason() {
+        let error = TransportError::DeviceRejected(
+            "screen_recording_permission_missing: grant access in System Settings".to_owned(),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "device rejected the action: screen_recording_permission_missing: grant access in System Settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_connection_error_is_not_reported_as_context_io() {
+        let directory = tempdir().expect("temp directory");
+        let transport = UnixDeviceTransport::new(
+            &directory.path().join("missing-bridge.sock"),
+            test_context(1, Utc::now() + chrono::Duration::seconds(30)),
+        );
+        let error = transport
+            .ensure_connected()
+            .await
+            .expect_err("missing bridge must fail");
+
+        assert!(matches!(&error, TransportError::BridgeConnect(_)));
+        assert!(error
+            .to_string()
+            .starts_with("local device bridge connection failed: "));
     }
 
     #[test]
@@ -893,6 +1156,10 @@ mod tests {
         });
 
         let transport = UnixDeviceTransport::new(&socket_path, context);
+        transport
+            .ensure_connected()
+            .await
+            .expect("nested TLS connection");
         let result = transport
             .execute(Action::Screenshot)
             .await

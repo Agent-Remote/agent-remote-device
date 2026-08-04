@@ -34,6 +34,13 @@ pub struct PointParameters {
     pub coordinate: Point,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenshotParameters {
+    /// Approved application display name or bundle identifier.
+    pub application: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypeParameters {
@@ -166,9 +173,25 @@ fn image_limits() -> Limits {
 
 #[tool_router(router = tool_router)]
 impl DeviceMcp {
-    #[tool(description = "Capture the currently approved macOS applications")]
-    async fn screenshot(&self) -> Result<CallToolResult, String> {
-        self.dispatch(Action::Screenshot).await
+    #[tool(
+        description = "Capture an approved macOS application, bringing the named application to the foreground when provided"
+    )]
+    async fn screenshot(
+        &self,
+        Parameters(params): Parameters<ScreenshotParameters>,
+    ) -> Result<CallToolResult, String> {
+        let action = match params.application {
+            Some(application) => Action::ScreenshotApplication { application },
+            None => Action::Screenshot,
+        };
+        self.dispatch(action).await
+    }
+
+    #[tool(
+        description = "Read bounded text from the Mac clipboard when explicitly approved for the current application session"
+    )]
+    async fn read_clipboard(&self) -> Result<CallToolResult, String> {
+        self.dispatch(Action::ReadClipboard).await
     }
 
     #[tool(description = "Click the approved application at image-relative coordinates")]
@@ -414,6 +437,7 @@ mod tests {
                 "left_mouse_up",
                 "middle_click",
                 "mouse_move",
+                "read_clipboard",
                 "right_click",
                 "screenshot",
                 "scroll",

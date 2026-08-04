@@ -86,6 +86,8 @@ public enum Platform: String, Codable, Sendable {
 
 public enum Action: Sendable, Equatable {
     case screenshot
+    case screenshotApplication(String)
+    case readClipboard
     case leftClick(Point)
     case type(String)
     case key(String)
@@ -104,6 +106,10 @@ public enum Action: Sendable, Equatable {
 
     public var hasValidParameters: Bool {
         switch self {
+        case let .screenshotApplication(application):
+            !application.isEmpty && application.count <= 255
+                && application == application.trimmingCharacters(in: .whitespacesAndNewlines)
+                && !application.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
         case let .type(text):
             !text.isEmpty && text.count <= 4_096
         case let .key(key):
@@ -133,7 +139,7 @@ public enum Action: Sendable, Equatable {
 
 extension Action: Codable {
     private enum CodingKeys: String, CodingKey {
-        case type, coordinate, text, key, start, end, region
+        case type, application, coordinate, text, key, start, end, region
         case deltaX = "delta_x"
         case deltaY = "delta_y"
         case durationMS = "duration_ms"
@@ -141,6 +147,8 @@ extension Action: Codable {
 
     private enum Kind: String, Codable {
         case screenshot
+        case screenshotApplication = "screenshot_application"
+        case readClipboard = "read_clipboard"
         case leftClick = "left_click"
         case type, key
         case mouseMove = "mouse_move"
@@ -161,6 +169,9 @@ extension Action: Codable {
         let kind = try container.decode(Kind.self, forKey: .type)
         switch kind {
         case .screenshot: self = .screenshot
+        case .screenshotApplication:
+            self = .screenshotApplication(try container.decode(String.self, forKey: .application))
+        case .readClipboard: self = .readClipboard
         case .leftClick: self = .leftClick(try container.decode(Point.self, forKey: .coordinate))
         case .type: self = .type(try container.decode(String.self, forKey: .text))
         case .key: self = .key(try container.decode(String.self, forKey: .key))
@@ -204,6 +215,11 @@ extension Action: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case .screenshot: try container.encode(Kind.screenshot, forKey: .type)
+        case let .screenshotApplication(application):
+            try container.encode(Kind.screenshotApplication, forKey: .type)
+            try container.encode(application, forKey: .application)
+        case .readClipboard:
+            try container.encode(Kind.readClipboard, forKey: .type)
         case let .leftClick(point):
             try container.encode(Kind.leftClick, forKey: .type)
             try container.encode(point, forKey: .coordinate)

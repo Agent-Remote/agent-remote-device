@@ -20,6 +20,7 @@ public actor NetworkBrokerDiscoveryCoordinator {
     }
 
     public func nextPendingSession(now: Date = Date()) async throws -> BrokerPendingSession? {
+        guard activeSession == nil else { return nil }
         let credential = try credentialLoader.loadCredential(now: now)
         let client = try NetworkBrokerControlPlaneClient(
             credential: credential,
@@ -27,6 +28,7 @@ public actor NetworkBrokerDiscoveryCoordinator {
             now: now
         )
         let inbox = try await client.deviceInbox(now: now)
+        guard activeSession == nil else { return nil }
         if let pendingSession,
            let refreshed = inbox.first(where: { $0.id == pendingSession.id })
         {

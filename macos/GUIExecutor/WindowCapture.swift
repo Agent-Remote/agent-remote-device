@@ -54,15 +54,66 @@ public struct CapturedWindow: @unchecked Sendable {
     }
 }
 
-public enum CaptureFailure: Error, Equatable {
+public enum CaptureFailure: Error, Equatable, Sendable {
     case screenRecordingPermissionMissing
     case approvedApplicationNotFrontmost
+    case requestedApplicationNotApprovedOrAmbiguous
+    case approvedApplicationNotRunning
+    case applicationActivationRejected
+    case applicationActivationTimedOut
     case signingIdentifierMismatch
     case approvedWindowMissing
     case displayMissing
     case invalidCaptureSize
     case encodingFailed
     case cropOutOfBounds
+
+    public var diagnosticCode: String {
+        switch self {
+        case .screenRecordingPermissionMissing: "screen_recording_permission_missing"
+        case .approvedApplicationNotFrontmost: "approved_application_not_frontmost"
+        case .requestedApplicationNotApprovedOrAmbiguous:
+            "requested_application_not_approved_or_ambiguous"
+        case .approvedApplicationNotRunning: "approved_application_not_running"
+        case .applicationActivationRejected: "approved_application_activation_rejected"
+        case .applicationActivationTimedOut: "approved_application_activation_timed_out"
+        case .signingIdentifierMismatch: "application_identity_mismatch"
+        case .approvedWindowMissing: "approved_window_not_visible"
+        case .displayMissing: "window_display_not_found"
+        case .invalidCaptureSize: "invalid_capture_size"
+        case .encodingFailed: "screenshot_png_encoding_failed"
+        case .cropOutOfBounds: "zoom_region_out_of_bounds"
+        }
+    }
+
+    public var userMessage: String {
+        switch self {
+        case .screenRecordingPermissionMissing:
+            "Mac screen recording permission is missing for Agent Remote Device."
+        case .approvedApplicationNotFrontmost:
+            "The approved application is not the frontmost Mac application."
+        case .requestedApplicationNotApprovedOrAmbiguous:
+            "The requested application does not uniquely match a running approved application."
+        case .approvedApplicationNotRunning:
+            "The approved application is not currently running on the Mac."
+        case .applicationActivationRejected:
+            "macOS rejected the request to bring the approved application to the foreground."
+        case .applicationActivationTimedOut:
+            "The approved application did not become frontmost within two seconds."
+        case .signingIdentifierMismatch:
+            "The frontmost application does not match the approved code identity."
+        case .approvedWindowMissing:
+            "No visible window was found for the approved application."
+        case .displayMissing:
+            "The approved window is not attached to an active display."
+        case .invalidCaptureSize:
+            "The approved window has an invalid screenshot size."
+        case .encodingFailed:
+            "The Mac screenshot could not be encoded as PNG."
+        case .cropOutOfBounds:
+            "The requested zoom region is outside the latest screenshot."
+        }
+    }
 }
 
 public struct WindowCapture: Sendable {
@@ -74,6 +125,7 @@ public struct WindowCapture: Sendable {
         self.excludedBundleIdentifier = excludedBundleIdentifier
     }
 
+    @MainActor
     public func capture(application: ApplicationIdentity) async throws -> CapturedWindow {
         guard CGPreflightScreenCaptureAccess() else {
             throw CaptureFailure.screenRecordingPermissionMissing
@@ -87,12 +139,13 @@ public struct WindowCapture: Sendable {
         guard Self.signingIdentifier(for: frontmost) == application.signingIdentifier else {
             throw CaptureFailure.signingIdentifierMismatch
         }
+        let frontmostProcessID = frontmost.processIdentifier
         let content = try await SCShareableContent.excludingDesktopWindows(
             true,
             onScreenWindowsOnly: true
         )
         guard let window = content.windows.first(where: {
-            $0.owningApplication?.processID == frontmost.processIdentifier
+            $0.owningApplication?.processID == frontmostProcessID
                 && $0.isOnScreen
                 && $0.frame.width > 1
                 && $0.frame.height > 1
@@ -105,9 +158,15 @@ public struct WindowCapture: Sendable {
         ) else {
             throw CaptureFailure.displayMissing
         }
+        let captureFrame = window.frame.intersection(display.frame)
+        guard !captureFrame.isNull, !captureFrame.isInfinite,
+              captureFrame.width > 0, captureFrame.height > 0
+        else {
+            throw CaptureFailure.displayMissing
+        }
         let size = Self.scaledSize(
-            sourceWidth: window.frame.width,
-            sourceHeight: window.frame.height,
+            sourceWidth: captureFrame.width,
+            sourceHeight: captureFrame.height,
             maximumWidth: profile.maximumWidth,
             maximumHeight: profile.maximumHeight
         )
@@ -121,7 +180,11 @@ public struct WindowCapture: Sendable {
         configuration.height = size.height
         configuration.showsCursor = true
         configuration.capturesAudio = false
-        let filter = SCContentFilter(desktopIndependentWindow: window)
+        configuration.sourceRect = Self.displayLocalRect(
+            captureFrame,
+            displayFrame: display.frame
+        )
+        let filter = SCContentFilter(display: display, including: [window])
         let image = try await SCScreenshotManager.captureImage(
             contentFilter: filter,
             configuration: configuration
@@ -133,11 +196,71 @@ public struct WindowCapture: Sendable {
             pixelHeight: UInt16(size.height),
             windowID: window.windowID,
             windowFrame: window.frame,
-            coordinateFrame: window.frame,
-            processID: frontmost.processIdentifier,
+            coordinateFrame: captureFrame,
+            processID: frontmostProcessID,
             application: application,
             displayFingerprint: Self.displayFingerprint(content.displays, selected: display)
         )
+    }
+
+    public func activate(
+        application: ApplicationIdentity,
+        processID requiredProcessID: pid_t? = nil
+    ) async throws {
+        guard application.bundleIdentifier != excludedBundleIdentifier else {
+            throw CaptureFailure.applicationActivationRejected
+        }
+        let processID = try await Self.requestActivation(
+            application: application,
+            requiredProcessID: requiredProcessID
+        )
+        for _ in 0 ..< 40 {
+            let isFrontmost = await MainActor.run {
+                NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
+            }
+            if isFrontmost { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw CaptureFailure.applicationActivationTimedOut
+    }
+
+    @MainActor
+    private static func requestActivation(
+        application: ApplicationIdentity,
+        requiredProcessID: pid_t?
+    ) async throws -> pid_t {
+        let running = NSRunningApplication.runningApplications(
+            withBundleIdentifier: application.bundleIdentifier
+        ).filter {
+            requiredProcessID == nil || $0.processIdentifier == requiredProcessID
+        }
+        guard !running.isEmpty else {
+            throw CaptureFailure.approvedApplicationNotRunning
+        }
+        guard let candidate = running.first(where: {
+            signingIdentifier(for: $0) == application.signingIdentifier
+        }) else {
+            throw CaptureFailure.signingIdentifierMismatch
+        }
+        guard let bundleURL = candidate.bundleURL else {
+            throw CaptureFailure.applicationActivationRejected
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        let activated: NSRunningApplication
+        do {
+            activated = try await NSWorkspace.shared.openApplication(
+                at: bundleURL,
+                configuration: configuration
+            )
+        } catch {
+            throw CaptureFailure.applicationActivationRejected
+        }
+        guard activated.processIdentifier == candidate.processIdentifier else {
+            throw CaptureFailure.applicationActivationRejected
+        }
+        return candidate.processIdentifier
     }
 
     public static func cropped(_ capture: CapturedWindow, to region: Region) throws -> CapturedWindow {
@@ -277,5 +400,14 @@ public struct WindowCapture: Sendable {
             from: displays.map { ($0.displayID, $0.frame) }
         )
         return displays.first { $0.displayID == selectedID }
+    }
+
+    static func displayLocalRect(_ frame: CGRect, displayFrame: CGRect) -> CGRect {
+        CGRect(
+            x: frame.minX - displayFrame.minX,
+            y: frame.minY - displayFrame.minY,
+            width: frame.width,
+            height: frame.height
+        )
     }
 }

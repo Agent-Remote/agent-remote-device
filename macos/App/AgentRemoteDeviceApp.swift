@@ -33,14 +33,44 @@ struct AgentRemoteDeviceApp: App {
 
     @MainActor
     private func monitorBroker() async {
-        let ready = await broker.connect()
-        if ready {
-            healthLogger.notice("Secure XPC chain ready")
-        } else {
-            healthLogger.error("Secure XPC chain unavailable")
+        configureModelHandlers()
+        var connectedPreviously = false
+        var presentedBinding: DeviceSessionBinding?
+        while !Task.isCancelled {
+            if model.state == .reconnecting {
+                try? await Task.sleep(for: .milliseconds(500))
+                continue
+            }
+            let ready = await broker.connect()
+            if !ready {
+                if connectedPreviously {
+                    healthLogger.error("Secure XPC chain disconnected")
+                } else {
+                    healthLogger.error("Secure XPC chain unavailable")
+                }
+                connectedPreviously = false
+                model.failIfInfrastructureUnavailable(false)
+                try? await Task.sleep(for: .seconds(2))
+                continue
+            }
+            if !connectedPreviously {
+                healthLogger.notice("Secure XPC chain ready")
+            }
+            connectedPreviously = true
+            model.recoverAfterInfrastructureReconnect()
+
+            do {
+                try await synchronizeBrokerState(presentedBinding: &presentedBinding)
+            } catch {
+                brokerLogger.error("Broker synchronization failed")
+                model.reportSessionDiscoveryFailure(error)
+            }
+            try? await Task.sleep(for: .seconds(2))
         }
-        model.failIfInfrastructureUnavailable(ready)
-        guard ready else { return }
+    }
+
+    @MainActor
+    private func configureModelHandlers() {
         model.onApprove = { approvals in
             try await broker.approve(approvals)
         }
@@ -64,57 +94,46 @@ struct AgentRemoteDeviceApp: App {
         model.onEndSession = {
             try await broker.endSession()
         }
+        model.onReconnect = {
+            await broker.connect()
+        }
         broker.setRuntimeEventHandler { kind in
             try await model.handleRuntimeEvent(kind)
         }
+    }
 
-        var presentedBinding: DeviceSessionBinding?
-        while !Task.isCancelled {
-            do {
-                model.enforceCurrentPermissions()
-                if model.state == .selectingSession {
-                    let candidates = try await broker.sessionCandidates()
-                    model.presentSessionCandidates(candidates)
-                } else if model.state == .ready {
-                    if let pending = try await broker.pollPendingSession() {
-                        if pending.binding != presentedBinding,
-                           model.state != .active,
-                           model.state != .activating
-                        {
-                            let presentation = try LocalApplicationDiscovery.approvalPresentation(
-                                generation: pending.binding.generation
-                            )
-                            model.presentApproval(presentation)
-                            presentedBinding = pending.binding
-                        }
-                    } else {
-                        presentedBinding = nil
-                        let candidates = try await broker.sessionCandidates()
-                        model.presentSessionCandidates(candidates)
-                    }
-                } else if model.state == .stopped || model.state == .denied {
-                    let candidates = try await broker.sessionCandidates()
-                    model.presentSessionCandidates(candidates)
-                } else if model.state != .claimingSession && model.state != .permissionRequired {
-                    if let pending = try await broker.pollPendingSession() {
-                        if pending.binding != presentedBinding,
-                           model.state != .active,
-                           model.state != .activating
-                        {
-                            let presentation = try LocalApplicationDiscovery.approvalPresentation(
-                                generation: pending.binding.generation
-                            )
-                            model.presentApproval(presentation)
-                            presentedBinding = pending.binding
-                        }
-                    } else {
-                        presentedBinding = nil
-                    }
+    @MainActor
+    private func synchronizeBrokerState(
+        presentedBinding: inout DeviceSessionBinding?
+    ) async throws {
+        model.enforceCurrentPermissions()
+        switch model.state {
+        case .selectingSession:
+            guard !model.isRefreshingSessionCandidates else { return }
+            let candidates = try await broker.sessionCandidates()
+            model.presentSessionCandidates(candidates)
+        case .ready, .paused, .stopped, .denied:
+            if let pending = try await broker.pollPendingSession() {
+                if pending.binding != presentedBinding {
+                    let presentation = try LocalApplicationDiscovery.approvalPresentation(
+                        generation: pending.binding.generation
+                    )
+                    model.presentApproval(presentation)
+                    presentedBinding = pending.binding
                 }
-            } catch {
-                brokerLogger.error("Broker poll failed")
+            } else {
+                presentedBinding = nil
+                let candidates = try await broker.sessionCandidates()
+                model.presentSessionCandidates(candidates)
             }
-            try? await Task.sleep(for: .seconds(2))
+        case .permissionRequired:
+            if model.approvalPresentation == nil, model.sessionCandidates.isEmpty {
+                let candidates = try await broker.sessionCandidates()
+                model.presentSessionCandidates(candidates)
+            }
+        case .claimingSession, .awaitingApproval, .activating, .active, .pausing,
+             .endingSession, .reconnecting, .failed:
+            break
         }
     }
 }

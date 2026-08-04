@@ -7,7 +7,7 @@ use std::{
 
 use agent_remote_device_proxy::{
     mcp::DeviceMcp,
-    transport::{ActivatedUnixDeviceTransport, LifecycleEvent},
+    transport::{ActivatedUnixDeviceTransport, LifecycleEvent, TransportError},
 };
 use clap::{Parser, ValueEnum};
 use rmcp::ServiceExt;
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    time::sleep,
 };
 
 const MAX_HOOK_INPUT_BYTES: u64 = 64 * 1024;
@@ -101,14 +102,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lifecycle_task = tokio::spawn(async move {
         serve_lifecycle(listener, lifecycle_transport).await;
     });
+    let warmup_transport = Arc::clone(&transport);
+    let warmup_task = tokio::spawn(async move {
+        warm_connection(warmup_transport).await;
+    });
     let server = DeviceMcp::new(transport)
         .serve(rmcp::transport::stdio())
         .await?;
     let result = server.waiting().await;
+    warmup_task.abort();
     lifecycle_task.abort();
     let _ = std::fs::remove_file(lifecycle_path);
     let _ = result?;
     Ok(())
+}
+
+async fn warm_connection(transport: Arc<ActivatedUnixDeviceTransport>) {
+    loop {
+        match transport.ensure_connected().await {
+            Ok(()) => return,
+            Err(TransportError::NotActivated | TransportError::BridgeConnect(_)) => {
+                sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 fn disable_core_dumps() -> std::io::Result<()> {

@@ -20,6 +20,13 @@ The authoritative machine-readable request schema is
 `protocol/schema/action-request-v1.schema.json`. Cross-language fixtures live in
 `protocol/test-vectors`.
 
+`read_clipboard` returns at most 64 KiB of plain text and never mutates the Mac
+clipboard. It requires a current screenshot bound to an approved application and
+that application's explicit per-session clipboard approval. A successful read
+consumes the action sequence but does not create an image or advance the
+screenshot generation. Missing, non-text, oversized, and unapproved clipboard
+content return concrete device errors without dropping the encrypted channel.
+
 The context binding is the tuple `(user_id, device_id, tool_session_id,
 device_session_id, node_id, platform, generation)`. Every tuple member must match
 the active generation. IDs are UUIDs and are never credentials. Generation uses

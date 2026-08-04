@@ -116,9 +116,11 @@ impl ActionValidator {
 
     fn validate_action(&self, action: &Action) -> Result<(), ValidationError> {
         let required = match action {
-            Action::Screenshot | Action::Zoom { .. } | Action::Wait { .. } => {
-                ControlLevel::ViewOnly
-            }
+            Action::Screenshot
+            | Action::ScreenshotApplication { .. }
+            | Action::ReadClipboard
+            | Action::Zoom { .. }
+            | Action::Wait { .. } => ControlLevel::ViewOnly,
             Action::LeftClick { .. }
             | Action::MouseMove { .. }
             | Action::Scroll { .. }

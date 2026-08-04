@@ -50,6 +50,49 @@ public actor GUIExecutorSessionController {
     public func performAction(_ data: Data) async throws -> Data {
         do {
             return try await performValidatedAction(data)
+        } catch let failure as CaptureFailure {
+            if isRecoverableScreenshotFailure(data) {
+                return try failureResponse(for: data, failure: failure)
+            }
+            await failCurrentSession()
+            throw failure
+        } catch let failure as ExecutionFailure {
+            switch failure {
+            case .applicationChanged, .windowChanged, .displayChanged:
+                requiresFreshScreenshot = true
+                return try failureResponse(
+                    for: data,
+                    code: "fresh_screenshot_required",
+                    message: failure.userMessage
+                )
+            case .accessibilityPermissionMissing, .eventCreationFailed, .unsupportedKey,
+                 .clipboardContentUnavailable, .clipboardContentTooLarge:
+                return try failureResponse(
+                    for: data,
+                    code: failure.diagnosticCode,
+                    message: failure.userMessage
+                )
+            case .actionRequiresCapture:
+                await failCurrentSession()
+                throw failure
+            }
+        } catch let failure as GuardFailure {
+            if failure == .staleScreenshot, latestCapture == nil {
+                return try failureResponse(
+                    for: data,
+                    code: "fresh_screenshot_required",
+                    message: "A successful fresh screenshot is required before this action."
+                )
+            }
+            if let diagnostic = recoverableGuardFailure(failure) {
+                return try failureResponse(
+                    for: data,
+                    code: diagnostic.code,
+                    message: diagnostic.message
+                )
+            }
+            await failCurrentSession()
+            throw failure
         } catch {
             await failCurrentSession()
             throw error
@@ -182,16 +225,23 @@ public actor GUIExecutorSessionController {
         let approvedApplications = configuration.approvals.map(\.application)
         let capture: CapturedWindow
 
-        if requiresFreshScreenshot, request.action != .screenshot {
+        if requiresFreshScreenshot, !isScreenshot(request.action) {
             throw GuardFailure.staleScreenshot
         }
 
         switch request.action {
-        case .screenshot:
+        case .screenshot, .screenshotApplication:
             try await guardState.authorizeScreenshot(
                 sequence: request.context.monotonicSequence
             )
-            capture = try await runtime.capture(approvedApplications: approvedApplications)
+            let targetApplication: String? = switch request.action {
+            case let .screenshotApplication(application): application
+            default: nil
+            }
+            capture = try await runtime.capture(
+                approvedApplications: approvedApplications,
+                targetApplication: targetApplication
+            )
             try await record(
                 capture: capture,
                 generation: nextGeneration,
@@ -213,6 +263,18 @@ public actor GUIExecutorSessionController {
                 sequence: request.context.monotonicSequence,
                 acceptSequence: true
             )
+        case .readClipboard:
+            guard let latestCapture else { throw GuardFailure.staleScreenshot }
+            let text = try await runtime.readClipboard(
+                sequence: request.context.monotonicSequence,
+                screenshotGeneration: currentGeneration,
+                capture: latestCapture
+            )
+            return try successWithoutImageResponse(
+                for: data,
+                screenshotGeneration: currentGeneration,
+                message: text
+            )
         default:
             guard let latestCapture else { throw GuardFailure.staleScreenshot }
             try await runtime.execute(
@@ -221,7 +283,19 @@ public actor GUIExecutorSessionController {
                 screenshotGeneration: currentGeneration,
                 capture: latestCapture
             )
-            capture = try await runtime.capture(approvedApplications: approvedApplications)
+            do {
+                capture = try await runtime.capture(
+                    approvedApplications: approvedApplications,
+                    targetApplication: nil
+                )
+            } catch let failure as CaptureFailure {
+                requiresFreshScreenshot = true
+                return try successWithoutImageResponse(
+                    for: data,
+                    screenshotGeneration: currentGeneration,
+                    message: "Action completed, but the follow-up screenshot failed (\(failure.diagnosticCode)): \(failure.userMessage)"
+                )
+            }
             try await record(
                 capture: capture,
                 generation: nextGeneration,
@@ -231,7 +305,7 @@ public actor GUIExecutorSessionController {
         }
 
         latestCapture = capture
-        if request.action == .screenshot {
+        if isScreenshot(request.action) {
             requiresFreshScreenshot = false
         }
         let response = ExecutorActionResponse(
@@ -275,6 +349,85 @@ public actor GUIExecutorSessionController {
         let (next, overflow) = value.addingReportingOverflow(1)
         guard !overflow else { throw DeviceIPCFailure.invalidMessage }
         return next
+    }
+
+    private func failureResponse(for data: Data, failure: CaptureFailure) throws -> Data {
+        try failureResponse(
+            for: data,
+            code: failure.diagnosticCode,
+            message: failure.userMessage
+        )
+    }
+
+    private func failureResponse(
+        for data: Data,
+        code: String,
+        message: String
+    ) throws -> Data {
+        let envelope = try DeviceIPCEnvelope.decode(data)
+        let request = try ActionRequest.decodeStrict(envelope.payload)
+        let response = ExecutorActionResponse(
+            requestID: request.requestID,
+            monotonicSequence: request.context.monotonicSequence,
+            screenshotGeneration: request.context.currentScreenshotGeneration,
+            status: .failed,
+            message: "\(code): \(message)",
+            image: nil
+        )
+        return try JSONEncoder().encode(response)
+    }
+
+    private func successWithoutImageResponse(
+        for data: Data,
+        screenshotGeneration: UInt64,
+        message: String
+    ) throws -> Data {
+        let envelope = try DeviceIPCEnvelope.decode(data)
+        let request = try ActionRequest.decodeStrict(envelope.payload)
+        let response = ExecutorActionResponse(
+            requestID: request.requestID,
+            monotonicSequence: request.context.monotonicSequence,
+            screenshotGeneration: screenshotGeneration,
+            status: .success,
+            message: message,
+            image: nil
+        )
+        return try JSONEncoder().encode(response)
+    }
+
+    private func recoverableGuardFailure(
+        _ failure: GuardFailure
+    ) -> (code: String, message: String)? {
+        switch failure {
+        case .controlLevelDenied:
+            ("control_level_denied", "This session was not approved for the requested control level.")
+        case .clipboardAccessDenied:
+            ("clipboard_access_denied", "Clipboard access was not approved for this application in the current session.")
+        case .coordinateOutOfBounds:
+            ("coordinate_out_of_bounds", "The requested coordinate is outside the latest screenshot.")
+        case .invalidParameters:
+            ("invalid_action_parameters", "The requested action parameters are invalid.")
+        case .displayChanged, .applicationChanged:
+            ("fresh_screenshot_required", "The approved UI changed after the latest screenshot. Take a fresh screenshot.")
+        default:
+            nil
+        }
+    }
+
+    private func isRecoverableScreenshotFailure(_ data: Data) -> Bool {
+        guard let envelope = try? DeviceIPCEnvelope.decode(data),
+              let request = try? ActionRequest.decodeStrict(envelope.payload)
+        else {
+            return false
+        }
+        return isScreenshot(request.action)
+    }
+
+    private func isScreenshot(_ action: Action) -> Bool {
+        switch action {
+        case .screenshot, .screenshotApplication: true
+        default: false
+        }
     }
 
     private func decodeRuntimeEvent(

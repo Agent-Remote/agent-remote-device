@@ -84,8 +84,10 @@ private func validActionKeys(_ action: [String: Any]) -> Bool {
     guard let kind = action["type"] as? String else { return false }
     let keys = Set(action.keys)
     switch kind {
-    case "screenshot", "left_mouse_down", "left_mouse_up":
+    case "screenshot", "read_clipboard", "left_mouse_down", "left_mouse_up":
         return keys == ["type"]
+    case "screenshot_application":
+        return keys == ["type", "application"]
     case "left_click", "mouse_move", "right_click", "middle_click", "double_click",
          "triple_click":
         return keys == ["type", "coordinate"]

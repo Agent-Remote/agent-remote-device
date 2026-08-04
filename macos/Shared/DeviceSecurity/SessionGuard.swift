@@ -62,6 +62,7 @@ public enum GuardFailure: Error, Equatable, Sendable {
     case approvalMissing
     case approvalFromPriorGeneration
     case controlLevelDenied
+    case clipboardAccessDenied
     case staleScreenshot
     case displayChanged
     case applicationChanged
@@ -166,6 +167,9 @@ public actor SessionGuard {
         guard screenshot.applicationDigest == digest else { throw GuardFailure.applicationChanged }
         guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
         guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
+        if action == .readClipboard, !approval.clipboardAllowed {
+            throw GuardFailure.clipboardAccessDenied
+        }
         guard approval.controlLevel >= requiredLevel(for: action) else {
             throw GuardFailure.controlLevelDenied
         }
@@ -221,7 +225,7 @@ public actor SessionGuard {
 
     private func requiredLevel(for action: Action) -> ControlLevel {
         switch action {
-        case .screenshot, .zoom, .wait:
+        case .screenshot, .screenshotApplication, .readClipboard, .zoom, .wait:
             .viewOnly
         case .type, .key, .holdKey:
             .fullControl

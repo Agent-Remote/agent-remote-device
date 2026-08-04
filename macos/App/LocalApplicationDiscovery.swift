@@ -1,5 +1,6 @@
 import AppKit
 import DeviceAppCore
+import DeviceIPC
 import DeviceSecurity
 import Foundation
 import Security
@@ -46,6 +47,49 @@ enum LocalApplicationDiscovery {
             applications: Array(applications.prefix(32)),
             hiddenApplicationCount: 0
         )
+    }
+
+    @MainActor
+    static func activate(
+        target: String,
+        approvals: [LocalApproval]
+    ) async throws {
+        let matches = approvals.compactMap { approval -> NSRunningApplication? in
+            let applications = NSRunningApplication.runningApplications(
+                withBundleIdentifier: approval.application.bundleIdentifier
+            )
+            return applications.first(where: { application in
+                signingIdentifier(for: application) == approval.application.signingIdentifier
+                    && (approval.application.bundleIdentifier.caseInsensitiveCompare(target)
+                        == .orderedSame
+                        || application.localizedName?.caseInsensitiveCompare(target)
+                        == .orderedSame)
+            })
+        }
+        guard matches.count == 1, let application = matches.first,
+              let bundleURL = application.bundleURL
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        let activated = try await NSWorkspace.shared.openApplication(
+            at: bundleURL,
+            configuration: configuration
+        )
+        guard activated.processIdentifier == application.processIdentifier else {
+            throw DeviceIPCFailure.serviceUnavailable
+        }
+        for _ in 0 ..< 80 {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == application.processIdentifier
+            {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw DeviceIPCFailure.serviceUnavailable
     }
 
     private static func isBoundedIdentifier(_ value: String) -> Bool {

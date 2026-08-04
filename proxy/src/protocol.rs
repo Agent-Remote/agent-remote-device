@@ -40,6 +40,10 @@ pub enum Platform {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Screenshot,
+    ScreenshotApplication {
+        application: String,
+    },
+    ReadClipboard,
     LeftClick {
         coordinate: Point,
     },
@@ -94,6 +98,12 @@ pub type Region = [u16; 4];
 impl Action {
     pub fn validate_parameters(&self) -> bool {
         match self {
+            Self::ScreenshotApplication { application } => {
+                !application.is_empty()
+                    && application.chars().count() <= 255
+                    && application.trim() == application
+                    && application.chars().all(|character| !character.is_control())
+            }
             Self::Type { text } => !text.is_empty() && text.chars().count() <= 4096,
             Self::Key { key } | Self::HoldKey { key, .. } if !valid_key(key) => false,
             Self::Scroll {

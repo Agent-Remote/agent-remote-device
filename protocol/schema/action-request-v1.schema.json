@@ -40,6 +40,7 @@
     "action": {
       "oneOf": [
         { "$ref": "#/$defs/noArgsScreenshot" },
+        { "$ref": "#/$defs/applicationScreenshot" },
         { "$ref": "#/$defs/pointAction" },
         { "$ref": "#/$defs/typeAction" },
         { "$ref": "#/$defs/keyAction" },
@@ -52,7 +53,11 @@
     },
     "noArgsScreenshot": {
       "type": "object", "additionalProperties": false, "required": ["type"],
-      "properties": { "type": { "enum": ["screenshot", "left_mouse_down", "left_mouse_up"] } }
+      "properties": { "type": { "enum": ["screenshot", "read_clipboard", "left_mouse_down", "left_mouse_up"] } }
+    },
+    "applicationScreenshot": {
+      "type": "object", "additionalProperties": false, "required": ["type", "application"],
+      "properties": { "type": { "const": "screenshot_application" }, "application": { "type": "string", "minLength": 1, "maxLength": 255 } }
     },
     "pointAction": {
       "type": "object", "additionalProperties": false, "required": ["type", "coordinate"],

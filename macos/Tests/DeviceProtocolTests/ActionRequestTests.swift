@@ -51,6 +51,8 @@ import Testing
     let point = Point(x: 120, y: 240)
     let actions: [Action] = [
         .screenshot,
+        .screenshotApplication("ChatGPT"),
+        .readClipboard,
         .leftClick(point),
         .type("hello"),
         .key("CMD+S"),

@@ -71,6 +71,18 @@ import UniformTypeIdentifiers
     ) == nil)
 }
 
+@Test func displayLocalCaptureRectAccountsForNonZeroDisplayOrigins() {
+    let display = CGRect(x: 1_920, y: -200, width: 1_920, height: 1_080)
+    let visibleWindow = CGRect(x: 2_020, y: -100, width: 800, height: 600)
+
+    #expect(WindowCapture.displayLocalRect(visibleWindow, displayFrame: display) == CGRect(
+        x: 100,
+        y: 100,
+        width: 800,
+        height: 600
+    ))
+}
+
 @Test func zoomCropProducesANewImageRelativeCoordinateFrame() throws {
     let application = ApplicationIdentity(
         bundleIdentifier: "dev.example.App",

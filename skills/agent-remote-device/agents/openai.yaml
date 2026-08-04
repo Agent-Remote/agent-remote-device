@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Remote Device"
+  short_description: "Operate approved remote Mac applications reliably"
+  default_prompt: "Use $agent-remote-device to inspect and operate an approved Mac application."

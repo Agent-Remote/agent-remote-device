@@ -14,6 +14,45 @@ public enum ExecutionFailure: Error, Equatable {
     case eventCreationFailed
     case unsupportedKey
     case actionRequiresCapture
+    case clipboardContentUnavailable
+    case clipboardContentTooLarge
+
+    public var diagnosticCode: String {
+        switch self {
+        case .accessibilityPermissionMissing: "accessibility_permission_missing"
+        case .applicationChanged: "approved_application_changed"
+        case .windowChanged: "approved_window_changed"
+        case .displayChanged: "display_layout_changed"
+        case .eventCreationFailed: "input_event_creation_failed"
+        case .unsupportedKey: "unsupported_key"
+        case .actionRequiresCapture: "invalid_capture_action_dispatch"
+        case .clipboardContentUnavailable: "clipboard_content_unavailable"
+        case .clipboardContentTooLarge: "clipboard_content_too_large"
+        }
+    }
+
+    public var userMessage: String {
+        switch self {
+        case .accessibilityPermissionMissing:
+            "Mac Accessibility permission is missing for Agent Remote Device."
+        case .applicationChanged:
+            "The approved application changed after the latest screenshot. Take a fresh screenshot."
+        case .windowChanged:
+            "The approved window moved, resized, or closed after the latest screenshot. Take a fresh screenshot."
+        case .displayChanged:
+            "The Mac display layout changed after the latest screenshot. Take a fresh screenshot."
+        case .eventCreationFailed:
+            "macOS could not create the requested input event."
+        case .unsupportedKey:
+            "The requested key or key combination is not supported."
+        case .actionRequiresCapture:
+            "The capture action was sent to the input-event executor."
+        case .clipboardContentUnavailable:
+            "The Mac clipboard does not currently contain text."
+        case .clipboardContentTooLarge:
+            "The Mac clipboard text exceeds the 64 KiB limit."
+        }
+    }
 }
 
 public enum CoordinateMapper {
@@ -68,7 +107,6 @@ public final class ActionExecutor {
             try await guardState.accept(sequence: sequence)
         } catch {
             releasePressedState()
-            await guardState.failClosed()
             throw error
         }
     }
@@ -90,7 +128,34 @@ public final class ActionExecutor {
             )
         } catch {
             releasePressedState()
-            await guardState.failClosed()
+            throw error
+        }
+    }
+
+    public func readClipboard(
+        sequence: UInt64,
+        screenshotGeneration: UInt64,
+        capture: CapturedWindow
+    ) async throws -> String {
+        do {
+            let displayFingerprint = try await verifyLiveContext(capture)
+            try await guardState.authorize(
+                action: .readClipboard,
+                sequence: sequence,
+                screenshotGeneration: screenshotGeneration,
+                displayFingerprint: displayFingerprint,
+                application: capture.application
+            )
+            guard let text = NSPasteboard.general.string(forType: .string) else {
+                throw ExecutionFailure.clipboardContentUnavailable
+            }
+            guard text.utf8.count <= 64 * 1_024 else {
+                throw ExecutionFailure.clipboardContentTooLarge
+            }
+            try await guardState.accept(sequence: sequence)
+            return text
+        } catch {
+            releasePressedState()
             throw error
         }
     }
@@ -136,7 +201,7 @@ public final class ActionExecutor {
 
     private func dispatch(_ action: Action, capture: CapturedWindow) async throws {
         switch action {
-        case .screenshot, .zoom:
+        case .screenshot, .screenshotApplication, .readClipboard, .zoom:
             throw ExecutionFailure.actionRequiresCapture
         case let .leftClick(point):
             try click(point, capture: capture, button: .left, count: 1)

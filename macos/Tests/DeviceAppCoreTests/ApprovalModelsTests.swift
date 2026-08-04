@@ -179,11 +179,11 @@ import Testing
 
     permissionsGranted = false
     model.enforceCurrentPermissions()
-    for _ in 0 ..< 100 where !events.values().contains("end") {
+    for _ in 0 ..< 100 where model.state != .permissionRequired {
         try await Task.sleep(for: .milliseconds(5))
     }
 
-    #expect(model.state == .stopped)
+    #expect(model.state == .permissionRequired)
     #expect(events.values().contains("restore"))
     #expect(events.values().contains("end"))
 }
@@ -441,7 +441,8 @@ import Testing
     #expect(model.state == .active)
     try model.handleRuntimeEvent(.sessionEnded)
 
-    #expect(model.state == .stopped)
+    #expect(model.state == .selectingSession)
+    #expect(model.completionMessage == "The remote device-control session ended.")
     #expect(events.values().filter { $0 == "hide" }.count == 2)
     #expect(events.values().filter { $0 == "restore" }.count == 2)
     #expect(events.values().filter { $0 == "monitor" }.count == 2)
@@ -478,10 +479,171 @@ import Testing
     await approvalGate.release()
     try await Task.sleep(for: .milliseconds(10))
 
-    #expect(model.state == .stopped)
+    #expect(model.state == .selectingSession)
     #expect(model.approvalPresentation == nil)
     #expect(events.values().contains("restore"))
     #expect(!events.values().contains("notify"))
+}
+
+@MainActor
+@Test func stoppingAnActiveActionWaitsForBindingSynchronization() async throws {
+    let events = EventRecorder()
+    let abortGate = ApprovalGate()
+    let model = try await activatedModel(visibilityController: RecordingVisibilityController(
+        events: events
+    ))
+    model.onAbort = { _ in
+        events.append("abort")
+        await abortGate.wait()
+    }
+
+    model.stopCurrentAction()
+    for _ in 0 ..< 100 where !events.values().contains("abort") {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.state == .pausing)
+
+    model.switchSession()
+    #expect(model.state == .pausing)
+
+    await abortGate.release()
+    for _ in 0 ..< 100 where model.state != .paused {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.state == .paused)
+}
+
+@MainActor
+@Test func endingControlReturnsToSessionListWithoutTerminalScreen() async throws {
+    let events = EventRecorder()
+    let endGate = ApprovalGate()
+    let model = try await activatedModel(visibilityController: RecordingVisibilityController(
+        events: events
+    ))
+    model.onEndSession = {
+        events.append("end")
+        await endGate.wait()
+    }
+    model.onRefreshSessionCandidates = { [] }
+
+    model.endSession()
+    #expect(model.state == .endingSession)
+    await endGate.release()
+    for _ in 0 ..< 100 where model.state != .selectingSession {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    #expect(model.state == .selectingSession)
+    #expect(model.completionMessage == "Device control ended.")
+    #expect(events.values().contains("end"))
+}
+
+@MainActor
+@Test func endingFailureProvidesSessionListRecovery() async throws {
+    let model = try await activatedModel(visibilityController: RecordingVisibilityController(
+        events: EventRecorder()
+    ))
+    model.onEndSession = { throw DeviceAppFailure.transportUnavailable }
+    model.onRefreshSessionCandidates = { [] }
+
+    model.endSession()
+    for _ in 0 ..< 100 where model.state != .failed {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.failureRecovery == .sessionSelection)
+    #expect(model.failureCode == "device_operation_failed")
+
+    model.returnToSessionSelection()
+    for _ in 0 ..< 100 where model.isRefreshingSessionCandidates {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.state == .selectingSession)
+}
+
+@MainActor
+@Test func infrastructureFailureCanReconnectAndReturnToSessions() async throws {
+    let model = DeviceAppModel(permissionsGranted: { true })
+    model.onReconnect = { true }
+    model.onRefreshSessionCandidates = { [] }
+
+    model.failIfInfrastructureUnavailable(false)
+    #expect(model.state == .failed)
+    #expect(model.failureRecovery == .reconnect)
+    #expect(model.failureCode == "xpc_services_unavailable")
+
+    model.retryAfterFailure()
+    for _ in 0 ..< 100 where model.state != .selectingSession {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.state == .selectingSession)
+    #expect(model.failureMessage == nil)
+}
+
+@MainActor
+@Test func denyingApprovalReturnsToSessionList() async throws {
+    let model = DeviceAppModel(permissionsGranted: { true })
+    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
+    model.presentApproval(try ApprovalPresentation(
+        generation: 1,
+        applications: [browser],
+        hiddenApplicationCount: 0
+    ))
+    model.onDeny = { _ in }
+    model.onRefreshSessionCandidates = { [] }
+
+    model.deny()
+    for _ in 0 ..< 100 where model.state != .selectingSession {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    #expect(model.state == .selectingSession)
+    #expect(model.completionMessage == "The device-control request was denied.")
+}
+
+@MainActor
+@Test func staleCandidateRefreshCannotOverwriteNewerResults() async throws {
+    let firstGate = ApprovalGate()
+    let calls = EventRecorder()
+    let stale = sessionCandidate(displayName: "Stale")
+    let current = sessionCandidate(displayName: "Current")
+    let model = DeviceAppModel(permissionsGranted: { true })
+    model.onRefreshSessionCandidates = {
+        calls.append("refresh")
+        if calls.values().count == 1 {
+            await firstGate.wait()
+            return [stale]
+        }
+        return [current]
+    }
+
+    model.refreshSessionCandidates()
+    for _ in 0 ..< 100 where calls.values().isEmpty {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    model.refreshSessionCandidates()
+    for _ in 0 ..< 100 where model.sessionCandidates != [current] {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    await firstGate.release()
+    try await Task.sleep(for: .milliseconds(20))
+
+    #expect(model.sessionCandidates == [current])
+    #expect(model.state == .selectingSession)
+}
+
+@MainActor
+@Test func sessionDiscoveryFailureRemainsRecoverableInSessionList() async throws {
+    let model = DeviceAppModel(permissionsGranted: { true })
+    model.onRefreshSessionCandidates = { throw DeviceAppFailure.transportUnavailable }
+
+    model.refreshSessionCandidates()
+    for _ in 0 ..< 100 where model.isRefreshingSessionCandidates {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    #expect(model.state == .selectingSession)
+    #expect(model.failureMessage != nil)
+    #expect(model.failureCode == "device_operation_failed")
 }
 
 @MainActor
@@ -628,5 +790,23 @@ private func candidate(
         requestedControlLevel: requested,
         classification: ApplicationPolicy.classify(bundleIdentifier: bundleIdentifier),
         clipboardRequested: clipboardRequested
+    )
+}
+
+private func sessionCandidate(displayName: String) -> BrokerSessionCandidate {
+    BrokerSessionCandidate(
+        toolSessionID: UUID(),
+        toolType: "claude",
+        toolAccountID: UUID(),
+        workspaceID: UUID(),
+        projectKey: displayName,
+        displayName: displayName,
+        status: .running,
+        nodeID: UUID(),
+        runtimeBackend: "native",
+        currentDeviceID: nil,
+        currentDeviceName: nil,
+        deviceSessionID: nil,
+        controllable: true
     )
 }

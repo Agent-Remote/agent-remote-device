@@ -1,4 +1,5 @@
 import DeviceIPC
+import DeviceProtocol
 import Foundation
 
 public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @unchecked Sendable {
@@ -36,6 +37,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     private var renewalTask: Task<Void, Never>?
     private var rotationTask: Task<Void, Never>?
     private var relayBinding: DeviceSessionBinding?
+    private var relayTargetApplication: String?
     private var pendingActivation: (binding: DeviceSessionBinding, identifier: UUID)?
     private var approvalUI: ApprovalUIXPCProtocol?
     private var turnPaused = false
@@ -268,53 +270,60 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                     payload: executorPayload
                 ).encoded() as NSData
                 let executorResponse = Data(referencing: executorRequest)
+                let executorContinuation = XPCVoidContinuation()
                 guard let executor = executorProxy(errorHandler: { [weak self] error in
                     self?.clearPendingActivation(activationIdentifier)
-                    reply.resolve(data: nil, error: error as NSError)
+                    executorContinuation.resolve(.failure(error))
                 }) else {
                     throw DeviceIPCFailure.serviceUnavailable
                 }
-                executor.updateSession(executorRequest) { error in
-                    guard error == nil else {
-                        self.clearPendingActivation(activationIdentifier)
-                        reply.resolve(data: nil, error: error)
-                        return
-                    }
-                    Task { [weak self] in
-                        guard let self else {
-                            reply.resolve(
-                                data: nil,
-                                error: DeviceIPCFailure.serviceUnavailable.nsError
-                            )
-                            return
-                        }
-                        do {
-                            guard self.isPendingActivation(
-                                activationIdentifier,
-                                binding: configuration.binding
-                            ) else {
-                                throw DeviceIPCFailure.invalidMessage
-                            }
-                            let relay = try await relayProvider(configuration)
-                            guard self.startRelay(
-                                relay,
-                                configuration: configuration,
-                                activationIdentifier: activationIdentifier
-                            ) else {
-                                relay.cancel()
-                                throw DeviceIPCFailure.invalidMessage
-                            }
-                            reply.resolve(data: executorResponse as NSData, error: nil)
-                        } catch {
-                            if self.clearPendingActivation(activationIdentifier) {
-                                await self.failExecutorAfterRelaySetup(configuration.binding)
-                            }
-                            reply.resolve(
-                                data: nil,
-                                error: DeviceIPCFailure.serviceUnavailable.nsError
-                            )
+                do {
+                    try await executorContinuation.wait(timeout: xpcReplyTimeout) { callback in
+                        executor.updateSession(executorRequest) { error in
+                            callback(error == nil
+                                ? .success(())
+                                : .failure(DeviceIPCFailure.invalidMessage))
                         }
                     }
+                } catch let failure as DeviceIPCFailure {
+                    clearPendingActivation(activationIdentifier)
+                    await sendAbort(binding: configuration.binding, reason: .disconnect)
+                    reply.resolve(data: nil, error: failure.nsError)
+                    return
+                } catch {
+                    clearPendingActivation(activationIdentifier)
+                    await sendAbort(binding: configuration.binding, reason: .disconnect)
+                    reply.resolve(
+                        data: nil,
+                        error: DeviceIPCFailure.serviceUnavailable.nsError
+                    )
+                    return
+                }
+                do {
+                    guard isPendingActivation(
+                        activationIdentifier,
+                        binding: configuration.binding
+                    ) else {
+                        throw DeviceIPCFailure.invalidMessage
+                    }
+                    let relay = try await relayProvider(configuration)
+                    guard startRelay(
+                        relay,
+                        configuration: configuration,
+                        activationIdentifier: activationIdentifier
+                    ) else {
+                        relay.cancel()
+                        throw DeviceIPCFailure.invalidMessage
+                    }
+                    reply.resolve(data: executorResponse as NSData, error: nil)
+                } catch {
+                    if clearPendingActivation(activationIdentifier) {
+                        await failExecutorAfterRelaySetup(configuration.binding)
+                    }
+                    reply.resolve(
+                        data: nil,
+                        error: DeviceIPCFailure.serviceUnavailable.nsError
+                    )
                 }
             } catch let failure as DeviceIPCFailure {
                 if let activationIdentifier {
@@ -421,6 +430,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.pendingActivation = nil
         self.relay = relay
         relayBinding = configuration.binding
+        relayTargetApplication = nil
         turnPaused = false
         lock.unlock()
         let lockAcquirer = RelayLockAcquirer(provider: lockProvider)
@@ -431,7 +441,20 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                     actionHandler: { [weak self] request in
                         guard let self else { throw DeviceIPCFailure.serviceUnavailable }
                         try await resumeTurnIfNeeded(configuration.binding)
+                        let selection = try applicationSelection(
+                            for: request,
+                            configuration: configuration
+                        )
+                        if let target = selection.target {
+                            try? await activateApprovalUIApplication(
+                                target,
+                                configuration: configuration
+                            )
+                        }
                         let response = try await performExecutorAction(request)
+                        if selection.isScreenshot, let target = selection.target {
+                            setRelayTargetApplication(target, binding: configuration.binding)
+                        }
                         try await lockAcquirer.acquire(configuration.binding)
                         return response
                     },
@@ -571,6 +594,64 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                 }
                 callback(.success(Data(referencing: response)))
             }
+        }
+    }
+
+    private func applicationSelection(
+        for data: Data,
+        configuration: ExecutorSessionConfiguration
+    ) throws -> (target: String?, isScreenshot: Bool) {
+        let envelope = try DeviceIPCEnvelope.decode(data)
+        let request = try ActionRequest.decodeStrict(envelope.payload)
+        switch request.action {
+        case let .screenshotApplication(application):
+            return (application, true)
+        case .screenshot:
+            let target = configuration.approvals.count == 1
+                ? configuration.approvals.first?.application.bundleIdentifier
+                : nil
+            return (target, true)
+        default:
+            return (
+                lock.withLock {
+                    relayBinding == configuration.binding ? relayTargetApplication : nil
+                },
+                false
+            )
+        }
+    }
+
+    private func activateApprovalUIApplication(
+        _ target: String,
+        configuration: ExecutorSessionConfiguration
+    ) async throws {
+        let activation = BrokerApplicationActivationRequest(
+            binding: configuration.binding,
+            targetApplication: target,
+            approvals: configuration.approvals
+        )
+        try activation.validate()
+        let payload = try JSONEncoder().encode(activation)
+        let request = try DeviceIPCEnvelope(requestID: UUID(), payload: payload).encoded()
+        let continuation = XPCVoidContinuation()
+        let approvalUI = lock.withLock { self.approvalUI }
+        guard let approvalUI else { throw DeviceIPCFailure.serviceUnavailable }
+        try await continuation.wait(timeout: xpcReplyTimeout) { callback in
+            approvalUI.activateApplication(request as NSData) { error in
+                callback(error == nil
+                    ? .success(())
+                    : .failure(DeviceIPCFailure.serviceUnavailable))
+            }
+        }
+    }
+
+    private func setRelayTargetApplication(
+        _ target: String,
+        binding: DeviceSessionBinding
+    ) {
+        lock.withLock {
+            guard relayBinding == binding else { return }
+            relayTargetApplication = target
         }
     }
 
@@ -798,6 +879,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.renewalTask = nil
         self.rotationTask = nil
         relayBinding = nil
+        relayTargetApplication = nil
         pendingActivation = nil
         turnPaused = false
         lock.unlock()
@@ -827,6 +909,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.renewalTask = nil
         self.rotationTask = nil
         relayBinding = nil
+        relayTargetApplication = nil
         pendingActivation = nil
         turnPaused = false
         lock.unlock()
@@ -850,6 +933,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.renewalTask = nil
         self.rotationTask = nil
         relayBinding = nil
+        relayTargetApplication = nil
         turnPaused = false
         lock.unlock()
         renewalTask?.cancel()
@@ -882,6 +966,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.renewalTask = nil
         self.rotationTask = nil
         relayBinding = nil
+        relayTargetApplication = nil
         turnPaused = false
         lock.unlock()
         renewalTask?.cancel()
@@ -928,6 +1013,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.renewalTask = nil
         self.rotationTask = nil
         relayBinding = nil
+        relayTargetApplication = nil
         pendingActivation = nil
         turnPaused = false
         lock.unlock()

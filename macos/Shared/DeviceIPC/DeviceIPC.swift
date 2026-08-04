@@ -130,6 +130,7 @@ private func hasIdenticalJSONStructure(_ lhs: Any, _ rhs: Any) -> Bool {
 
 @objc public protocol ApprovalUIXPCProtocol {
     func handleRuntimeEvent(_ request: NSData, reply: @escaping (NSError?) -> Void)
+    func activateApplication(_ request: NSData, reply: @escaping (NSError?) -> Void)
 }
 
 @objc public protocol GUIExecutorXPCProtocol {

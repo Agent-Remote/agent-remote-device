@@ -1,11 +1,68 @@
+import DeviceAppCore
 import DeviceIPC
 import DeviceSecurity
 import Foundation
 
-enum DeviceBrokerClientFailure: Error {
-    case unavailable
+enum DeviceBrokerClientFailure: Error, Equatable, LocalizedError, DeviceAppErrorCodeProviding {
+    case connectionUnavailable
+    case serviceUnavailable
+    case incompatibleVersion
+    case invalidMessage
+    case peerRejected
     case invalidResponse
     case bindingMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .connectionUnavailable:
+            localizedBrokerString(
+                "error.xpc_connection_unavailable",
+                defaultValue: "The secure device service is disconnected."
+            )
+        case .serviceUnavailable:
+            localizedBrokerString(
+                "error.network_broker_unavailable",
+                defaultValue: "The device broker is temporarily unavailable."
+            )
+        case .incompatibleVersion:
+            localizedBrokerString(
+                "error.protocol_version_mismatch",
+                defaultValue: "Device components use incompatible protocol versions."
+            )
+        case .invalidMessage:
+            localizedBrokerString(
+                "error.invalid_broker_response",
+                defaultValue: "The device broker returned an invalid response."
+            )
+        case .peerRejected:
+            localizedBrokerString(
+                "error.xpc_peer_rejected",
+                defaultValue: "A secure device component could not be authenticated."
+            )
+        case .invalidResponse:
+            localizedBrokerString(
+                "error.invalid_response",
+                defaultValue: "The device service returned an incomplete response."
+            )
+        case .bindingMismatch:
+            localizedBrokerString(
+                "error.session_binding_changed",
+                defaultValue: "The device session changed. Refresh the session list."
+            )
+        }
+    }
+
+    var deviceErrorCode: String {
+        switch self {
+        case .connectionUnavailable: "xpc_connection_interrupted"
+        case .serviceUnavailable: "network_broker_unavailable"
+        case .incompatibleVersion: "protocol_version_mismatch"
+        case .invalidMessage: "invalid_broker_response"
+        case .peerRejected: "xpc_peer_rejected"
+        case .invalidResponse: "incomplete_broker_response"
+        case .bindingMismatch: "session_binding_changed"
+        }
+    }
 }
 
 final class DeviceBrokerClient: @unchecked Sendable {
@@ -22,6 +79,9 @@ final class DeviceBrokerClient: @unchecked Sendable {
         eventReceiver = ApprovalUIEventReceiver()
         eventReceiver.handler = { [weak self] event in
             try await self?.receiveRuntimeEvent(event)
+        }
+        eventReceiver.activationHandler = { [weak self] request in
+            try await self?.receiveApplicationActivation(request)
         }
     }
 
@@ -64,7 +124,7 @@ final class DeviceBrokerClient: @unchecked Sendable {
             (continuation: CheckedContinuation<Data?, Error>) in
             broker.pollPendingSession { data, error in
                 if error != nil {
-                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    continuation.resume(throwing: brokerFailure(error))
                 } else {
                     continuation.resume(returning: data.map { Data(referencing: $0) })
                 }
@@ -87,7 +147,7 @@ final class DeviceBrokerClient: @unchecked Sendable {
             (continuation: CheckedContinuation<Data, Error>) in
             broker.listSessionCandidates { data, error in
                 guard error == nil, let data else {
-                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    continuation.resume(throwing: brokerFailure(error))
                     return
                 }
                 continuation.resume(returning: Data(referencing: data))
@@ -114,7 +174,7 @@ final class DeviceBrokerClient: @unchecked Sendable {
             (continuation: CheckedContinuation<Data, Error>) in
             broker.claimSession(envelope) { data, error in
                 guard error == nil, let data else {
-                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    continuation.resume(throwing: brokerFailure(error))
                     return
                 }
                 continuation.resume(returning: Data(referencing: data))
@@ -158,7 +218,7 @@ final class DeviceBrokerClient: @unchecked Sendable {
             (continuation: CheckedContinuation<Data?, Error>) in
             broker.approveSession(envelope) { data, error in
                 guard error == nil else {
-                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    continuation.resume(throwing: brokerFailure(error))
                     return
                 }
                 continuation.resume(returning: data.map { Data(referencing: $0) })
@@ -202,15 +262,19 @@ final class DeviceBrokerClient: @unchecked Sendable {
                 if error == nil {
                     continuation.resume(returning: ())
                 } else {
-                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    continuation.resume(throwing: brokerFailure(error))
                 }
             }
         }
         setActiveBinding(nil)
+        _ = try await pollPendingSession()
     }
 
     func endSession() async throws {
-        let binding = try currentActiveBinding()
+        guard let binding = currentSessionBinding() else {
+            setPendingSession(nil)
+            return
+        }
         let request = BrokerEndRequest(binding: binding)
         try request.validate()
         let data = try DeviceIPCEnvelope(
@@ -224,11 +288,12 @@ final class DeviceBrokerClient: @unchecked Sendable {
                 if error == nil {
                     continuation.resume(returning: ())
                 } else {
-                    continuation.resume(throwing: DeviceBrokerClientFailure.unavailable)
+                    continuation.resume(throwing: brokerFailure(error))
                 }
             }
         }
         setActiveBinding(nil)
+        setPendingSession(nil)
     }
 
     private func configureBroker(
@@ -306,7 +371,7 @@ final class DeviceBrokerClient: @unchecked Sendable {
         lock.lock()
         let broker = broker
         lock.unlock()
-        guard let broker else { throw DeviceBrokerClientFailure.unavailable }
+        guard let broker else { throw DeviceBrokerClientFailure.connectionUnavailable }
         return broker
     }
 
@@ -332,6 +397,10 @@ final class DeviceBrokerClient: @unchecked Sendable {
         return binding
     }
 
+    private func currentSessionBinding() -> DeviceSessionBinding? {
+        lock.withLock { activeBinding ?? pendingSession?.binding }
+    }
+
     private func setActiveBinding(_ binding: DeviceSessionBinding?) {
         lock.lock()
         activeBinding = binding
@@ -349,10 +418,47 @@ final class DeviceBrokerClient: @unchecked Sendable {
             setActiveBinding(nil)
         }
     }
+
+    private func receiveApplicationActivation(
+        _ request: BrokerApplicationActivationRequest
+    ) async throws {
+        try request.validate()
+        guard lock.withLock({ activeBinding }) == request.binding else {
+            throw DeviceBrokerClientFailure.bindingMismatch
+        }
+        try await LocalApplicationDiscovery.activate(
+            target: request.targetApplication,
+            approvals: request.approvals
+        )
+    }
+}
+
+private func brokerFailure(_ error: NSError?) -> DeviceBrokerClientFailure {
+    guard let error else { return .serviceUnavailable }
+    guard error.domain == "dev.agentremote.device.ipc",
+          let failure = DeviceIPCFailure(rawValue: error.code)
+    else {
+        return .connectionUnavailable
+    }
+    switch failure {
+    case .incompatibleVersion:
+        return .incompatibleVersion
+    case .invalidMessage, .messageTooLarge:
+        return .invalidMessage
+    case .peerRejected:
+        return .peerRejected
+    case .serviceUnavailable:
+        return .serviceUnavailable
+    }
+}
+
+private func localizedBrokerString(_ key: String, defaultValue: String) -> String {
+    NSLocalizedString(key, bundle: .main, value: defaultValue, comment: "")
 }
 
 private final class ApprovalUIEventReceiver: NSObject, ApprovalUIXPCProtocol, @unchecked Sendable {
     var handler: (@Sendable (BrokerRuntimeEvent) async throws -> Void)?
+    var activationHandler: (@Sendable (BrokerApplicationActivationRequest) async throws -> Void)?
 
     func handleRuntimeEvent(_ request: NSData, reply: @escaping (NSError?) -> Void) {
         let reply = OneShotEventReply(reply)
@@ -367,6 +473,26 @@ private final class ApprovalUIEventReceiver: NSObject, ApprovalUIXPCProtocol, @u
                 )
                 guard let handler else { throw DeviceIPCFailure.serviceUnavailable }
                 try await handler(event)
+                reply.resolve(nil)
+            } catch {
+                reply.resolve(DeviceIPCFailure.invalidMessage.nsError)
+            }
+        }
+    }
+
+    func activateApplication(_ request: NSData, reply: @escaping (NSError?) -> Void) {
+        let reply = OneShotEventReply(reply)
+        let request = Data(referencing: request)
+        let handler = activationHandler
+        Task {
+            do {
+                let envelope = try DeviceIPCEnvelope.decode(request)
+                let activation = try DeviceIPCDecoder.decode(
+                    BrokerApplicationActivationRequest.self,
+                    from: envelope.payload
+                )
+                guard let handler else { throw DeviceIPCFailure.serviceUnavailable }
+                try await handler(activation)
                 reply.resolve(nil)
             } catch {
                 reply.resolve(DeviceIPCFailure.invalidMessage.nsError)

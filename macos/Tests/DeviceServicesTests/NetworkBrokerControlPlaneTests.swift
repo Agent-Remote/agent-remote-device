@@ -519,6 +519,60 @@ private func relayMaterialJSON(
     #expect(await transport.recordedRequests().count == 3)
 }
 
+@Test func discoveryDoesNotPollWhileLocalBindingIsActive() async throws {
+    let pending = sessionJSON(status: "pending_device")
+    let connected = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-31T00:00:00Z\""
+    )
+    let rotated = sessionJSON(status: "pending_device", generation: 2)
+    let rotatedConnected = sessionJSON(status: "pending_user_approval", generation: 2)
+    let inbox = { (session: String) in
+        Data("{\"data\":{\"items\":[\(session)]},\"request_id\":null}".utf8)
+    }
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = RecordingHTTPTransport(responses: [
+        (inbox(pending), 200),
+        (response(connected), 200),
+        (response(active), 200),
+        (inbox(active), 200),
+        (response(rotated), 200),
+        (response(rotatedConnected), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let original = try #require(try await coordinator.nextPendingSession(now: now))
+    let localApproval = LocalApproval(
+        application: ApplicationIdentity(
+            bundleIdentifier: "com.apple.Safari",
+            signingIdentifier: "com.apple.Safari"
+        ),
+        controlLevel: .viewOnly,
+        clipboardAllowed: false,
+        generation: original.binding.generation
+    )
+    _ = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: original.binding,
+            approvals: [localApproval],
+            result: .allowed
+        ),
+        now: now
+    ))
+
+    let polled = try await coordinator.nextPendingSession(now: now)
+
+    #expect(polled == nil)
+    #expect(await transport.recordedRequests().count == 3)
+}
+
 @Test func discoveryRotatesAnActiveGenerationAfterBrokerRestart() async throws {
     let active = sessionJSON(
         status: "active",
