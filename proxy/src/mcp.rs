@@ -1340,6 +1340,44 @@ mod tests {
         assert_eq!(names, ["act", "input_text", "observe", "read_clipboard"]);
     }
 
+    #[test]
+    fn compact_act_schema_accepts_each_exact_action_shape() {
+        let valid = [
+            serde_json::json!({"type": "press", "element_index": 1}),
+            serde_json::json!({"type": "set_value", "element_index": 1, "value": "value"}),
+            serde_json::json!({"type": "select_text", "element_index": 1, "text": "text", "prefix": "pre", "suffix": "post", "selection_type": "cursor_after"}),
+            serde_json::json!({"type": "scroll_element", "element_index": 1, "direction": "down", "pages": 2}),
+            serde_json::json!({"type": "secondary_action", "element_index": 1, "action_name": "show_menu"}),
+            serde_json::json!({"type": "left_click", "coordinate": [10, 20]}),
+            serde_json::json!({"type": "right_click", "coordinate": [10, 20]}),
+            serde_json::json!({"type": "middle_click", "coordinate": [10, 20]}),
+            serde_json::json!({"type": "double_click", "coordinate": [10, 20]}),
+            serde_json::json!({"type": "triple_click", "coordinate": [10, 20]}),
+            serde_json::json!({"type": "mouse_move", "coordinate": [10, 20]}),
+            serde_json::json!({"type": "left_click_drag", "start": [10, 20], "end": [30, 40], "duration_ms": 250}),
+            serde_json::json!({"type": "left_mouse_down"}),
+            serde_json::json!({"type": "left_mouse_up"}),
+            serde_json::json!({"type": "type", "text": "hello"}),
+            serde_json::json!({"type": "key", "key": "RETURN"}),
+            serde_json::json!({"type": "hold_key", "key": "SHIFT", "duration_ms": 250}),
+            serde_json::json!({"type": "scroll", "delta_x": 0, "delta_y": 400, "coordinate": [10, 20]}),
+            serde_json::json!({"type": "wait", "duration_ms": 250}),
+        ];
+
+        for value in valid {
+            let params: ActParameters = serde_json::from_value(value.clone()).expect("act shape");
+            assert!(params.validate_shape(), "expected valid act shape: {value}");
+        }
+
+        let invalid: ActParameters = serde_json::from_value(serde_json::json!({
+            "type": "press",
+            "element_index": 1,
+            "coordinate": [10, 20]
+        }))
+        .expect("known fields");
+        assert!(!invalid.validate_shape());
+    }
+
     #[tokio::test]
     async fn dispatch_records_only_aggregate_optimization_metrics() {
         let server = DeviceMcp::token_efficient(Arc::new(SuccessTransport));
