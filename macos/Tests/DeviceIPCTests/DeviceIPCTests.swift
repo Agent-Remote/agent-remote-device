@@ -29,6 +29,38 @@ import DeviceSecurity
     }
 }
 
+@Test func sessionBindingMatchesV1AndV2RequestContextsExactly() {
+    let value = binding(generation: 7)
+    let v1 = RequestContext(
+        userID: value.userID,
+        deviceID: value.deviceID,
+        toolSessionID: value.toolSessionID,
+        deviceSessionID: value.deviceSessionID,
+        nodeID: value.nodeID,
+        platform: value.platform,
+        generation: value.generation,
+        monotonicSequence: 1,
+        currentScreenshotGeneration: 0
+    )
+    let v2 = RequestContextV2(
+        userID: value.userID,
+        deviceID: value.deviceID,
+        toolSessionID: value.toolSessionID,
+        deviceSessionID: value.deviceSessionID,
+        nodeID: value.nodeID,
+        platform: value.platform,
+        generation: value.generation,
+        monotonicSequence: 1,
+        currentStateGeneration: 0,
+        currentScreenshotGeneration: 0,
+        baseStateID: nil
+    )
+
+    #expect(value.matches(v1))
+    #expect(value.matches(v2))
+    #expect(!binding(generation: 8).matches(v2))
+}
+
 @Test func ipcDecoderRejectsDuplicateAndUnknownFieldsAtEveryLevel() throws {
     let requestID = UUID()
     let encoded = try DeviceIPCEnvelope(

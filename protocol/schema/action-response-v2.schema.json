@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-remote.dev/schemas/action-response-v2.schema.json",
+  "title": "Agent Remote Device Action Response v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "monotonic_sequence",
+    "state_generation",
+    "screenshot_generation",
+    "status",
+    "message",
+    "settle"
+  ],
+  "properties": {
+    "request_id": {"$ref": "#/$defs/uuid"},
+    "monotonic_sequence": {"type": "integer", "minimum": 1},
+    "state_generation": {"type": "integer", "minimum": 0},
+    "screenshot_generation": {"type": "integer", "minimum": 0},
+    "state_id": {"$ref": "#/$defs/uuid"},
+    "application_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "window_id": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+    "display_fingerprint": {"type": "string", "minLength": 1, "maxLength": 256},
+    "base_state_id": {"$ref": "#/$defs/uuid"},
+    "status": {"enum": ["success", "failed"]},
+    "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "observation": {"$ref": "#/$defs/observation"},
+    "settle": {"$ref": "#/$defs/settle"},
+    "image": {"$ref": "#/$defs/image"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "success"}}},
+      "then": {
+        "required": ["state_id", "application_digest", "window_id", "display_fingerprint"]
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "failed"}}},
+      "then": {
+        "not": {
+          "anyOf": [
+            {"required": ["state_id"]},
+            {"required": ["application_digest"]},
+            {"required": ["window_id"]},
+            {"required": ["display_fingerprint"]},
+            {"required": ["base_state_id"]},
+            {"required": ["observation"]},
+            {"required": ["image"]}
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "nullable_text": {
+      "oneOf": [
+        {"type": "string", "maxLength": 160},
+        {"type": "null"}
+      ]
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "depth",
+        "role",
+        "settable",
+        "actions"
+      ],
+      "properties": {
+        "index": {"type": "integer", "minimum": 0, "maximum": 799},
+        "parent_index": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0, "maximum": 799},
+            {"type": "null"}
+          ]
+        },
+        "depth": {"type": "integer", "minimum": 0, "maximum": 20},
+        "role": {"type": "string", "minLength": 1, "maxLength": 80},
+        "title": {"$ref": "#/$defs/nullable_text"},
+        "label": {"$ref": "#/$defs/nullable_text"},
+        "value": {"$ref": "#/$defs/nullable_text"},
+        "placeholder": {"$ref": "#/$defs/nullable_text"},
+        "url": {"$ref": "#/$defs/nullable_text"},
+        "frame": {
+          "oneOf": [
+            {
+              "type": "array",
+              "prefixItems": [
+                {"type": "integer", "minimum": -2147483648, "maximum": 2147483647},
+                {"type": "integer", "minimum": -2147483648, "maximum": 2147483647},
+                {"type": "integer", "minimum": 0, "maximum": 2147483647},
+                {"type": "integer", "minimum": 0, "maximum": 2147483647}
+              ],
+              "items": false,
+              "minItems": 4,
+              "maxItems": 4
+            },
+            {"type": "null"}
+          ]
+        },
+        "settable": {"type": "boolean"},
+        "actions": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {"type": "string", "minLength": 1, "maxLength": 128},
+          "uniqueItems": true
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "reset", "truncated", "nodes", "removed"],
+      "properties": {
+        "kind": {"enum": ["full", "diff"]},
+        "reset": {"type": "boolean"},
+        "truncated": {"type": "boolean"},
+        "nodes": {
+          "type": "array",
+          "maxItems": 800,
+          "items": {"$ref": "#/$defs/node"}
+        },
+        "removed": {
+          "type": "array",
+          "maxItems": 800,
+          "items": {"type": "integer", "minimum": 0, "maximum": 799},
+          "uniqueItems": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "full"}}},
+          "then": {"properties": {"removed": {"maxItems": 0}}}
+        }
+      ]
+    },
+    "settle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "elapsed_ms"],
+      "properties": {
+        "status": {"enum": ["settled", "timeout", "not_requested"]},
+        "elapsed_ms": {"type": "integer", "minimum": 0, "maximum": 5000}
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base64_data", "mime_type", "pixel_width", "pixel_height", "profile"],
+      "properties": {
+        "base64_data": {"type": "string", "minLength": 1, "maxLength": 16777216},
+        "mime_type": {"enum": ["image/png", "image/jpeg"]},
+        "pixel_width": {"type": "integer", "minimum": 1, "maximum": 4096},
+        "pixel_height": {"type": "integer", "minimum": 1, "maximum": 4096},
+        "profile": {"enum": ["compact", "standard", "region"]}
+      }
+    }
+  }
+}

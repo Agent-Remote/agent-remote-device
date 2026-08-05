@@ -227,11 +227,25 @@ private func strictFramedRequest(
     }
     if let request = object["request"] as? [String: Any] {
         let requestData = try JSONSerialization.data(withJSONObject: request, options: [.sortedKeys])
-        let decoded = try ActionRequest.decodeStrict(
-            requestData,
-            requiresLowercaseIdentifiers: true
-        )
-        return .action(requestData, decoded.requestID)
+        guard let version = request["version"] as? NSNumber else {
+            throw NetworkBrokerNestedTLSRelayFailure.invalidFrame
+        }
+        switch version.uint8Value {
+        case protocolVersion:
+            let decoded = try ActionRequest.decodeStrict(
+                requestData,
+                requiresLowercaseIdentifiers: true
+            )
+            return .action(requestData, decoded.requestID)
+        case protocolVersionV2:
+            let decoded = try ActionRequestV2.decodeStrict(
+                requestData,
+                requiresLowercaseIdentifiers: true
+            )
+            return .action(requestData, decoded.requestID)
+        default:
+            throw NetworkBrokerNestedTLSRelayFailure.invalidFrame
+        }
     }
     guard let lifecycle = object["lifecycle"] as? [String: Any],
           Set(lifecycle.keys) == ["version", "request_id", "context", "event"],

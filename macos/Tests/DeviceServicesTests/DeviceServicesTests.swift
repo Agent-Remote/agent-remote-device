@@ -6,6 +6,129 @@ import Foundation
 import GUIExecutor
 import Testing
 
+@Test func executorNegotiatesV2StateAndScreenshotGenerationsIndependently() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let firstData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .screenshot),
+        action: .observe(application: nil)
+    ))
+    let first = try JSONDecoder().decode(ActionResponseV2.self, from: firstData)
+    #expect(first.status == .success)
+    #expect(first.stateGeneration == 1)
+    #expect(first.screenshotGeneration == 1)
+    #expect(first.stateID != nil)
+    #expect(first.observation == nil)
+    #expect(first.image?.profile == .compact)
+
+    let staleData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 0,
+        screenshotGeneration: 1,
+        observation: ObservationPolicy(mode: .none, settle: .none, settleTimeoutMilliseconds: 0, imageProfile: .none),
+        action: .observe(application: nil)
+    ))
+    let stale = try JSONDecoder().decode(ActionResponseV2.self, from: staleData)
+    #expect(stale.status == .failed)
+    #expect(stale.message.hasPrefix("stale_state:"))
+    #expect(await controller.currentState() == .active)
+}
+
+@Test func executorRunsStateBoundV2ElementActionAndRejectsItsReuse() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .clickOnly,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let target = ElementTarget(
+        stateID: try #require(observed.stateID),
+        stateGeneration: observed.stateGeneration,
+        applicationDigest: try #require(observed.applicationDigest),
+        windowID: try #require(observed.windowID),
+        displayFingerprint: try #require(observed.displayFingerprint),
+        elementIndex: 0
+    )
+
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .press(target)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+    #expect(action.status == .success)
+    #expect(action.stateGeneration == 2)
+    #expect(await recorder.elementActions == [.press(target)])
+    #expect(await recorder.accessibilityClearCount == 0)
+
+    let staleData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        stateGeneration: 2,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .press(target)
+    ))
+    let stale = try JSONDecoder().decode(ActionResponseV2.self, from: staleData)
+    #expect(stale.status == .failed)
+    #expect(stale.message.hasPrefix("fresh_observation_required:"))
+    #expect(await recorder.elementActions == [.press(target)])
+}
+
 @Test func executorSessionControllerActivatesStopsAndEndsOneBoundSession() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -1234,10 +1357,58 @@ private func actionRequest(
     )
 }
 
+private func actionEnvelopeV2(
+    configuration: ExecutorSessionConfiguration,
+    requestID: UUID,
+    sequence: UInt64,
+    stateGeneration: UInt64,
+    screenshotGeneration: UInt64,
+    observation: ObservationPolicy,
+    action: ActionV2
+) throws -> Data {
+    let binding = configuration.binding
+    let request = ActionRequestV2(
+        requestID: requestID,
+        context: RequestContextV2(
+            userID: binding.userID,
+            deviceID: binding.deviceID,
+            toolSessionID: binding.toolSessionID,
+            deviceSessionID: binding.deviceSessionID,
+            nodeID: binding.nodeID,
+            platform: binding.platform,
+            generation: binding.generation,
+            monotonicSequence: sequence,
+            currentStateGeneration: stateGeneration,
+            currentScreenshotGeneration: screenshotGeneration,
+            baseStateID: nil
+        ),
+        leaseUntil: configuration.leaseUntil,
+        observation: observation,
+        action: action
+    )
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    var object = try #require(
+        JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+    )
+    var context = try #require(object["context"] as? [String: Any])
+    context["base_state_id"] = NSNull()
+    object["context"] = context
+    var observationObject = try #require(object["observation"] as? [String: Any])
+    observationObject["region"] = NSNull()
+    object["observation"] = observationObject
+    return try DeviceIPCEnvelope(
+        requestID: requestID,
+        payload: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    ).encoded()
+}
+
 private actor RuntimeRecorder {
     private(set) var actions: [Action] = []
+    private(set) var elementActions: [ActionV2] = []
     private(set) var captureCount = 0
     private(set) var releaseCount = 0
+    private(set) var accessibilityClearCount = 0
 
     func captured() {
         captureCount += 1
@@ -1247,8 +1418,16 @@ private actor RuntimeRecorder {
         actions.append(action)
     }
 
+    func executedElement(_ action: ActionV2) {
+        elementActions.append(action)
+    }
+
     func released() {
         releaseCount += 1
+    }
+
+    func clearedAccessibility() {
+        accessibilityClearCount += 1
     }
 }
 
@@ -1518,6 +1697,77 @@ private actor RuntimeStub: GUIActionRuntime {
         )
         try await guardState.accept(sequence: sequence)
         await recorder.executed(action)
+    }
+
+    func observeAccessibility(
+        context: WindowContext,
+        stateGeneration: UInt64,
+        baseStateID: UUID?,
+        policy _: ObservationPolicy
+    ) async throws -> AccessibilitySnapshotResult {
+        let state = AccessibilityStateContext(
+            stateID: UUID(),
+            stateGeneration: stateGeneration,
+            applicationDigest: context.application.stableDigest,
+            windowID: context.windowID,
+            displayFingerprint: context.displayFingerprint
+        )
+        return AccessibilitySnapshotResult(
+            context: state,
+            observation: AccessibilityObservation(
+                kind: baseStateID == nil ? .full : .diff,
+                reset: false,
+                truncated: false,
+                nodes: [AccessibilityNode(
+                    index: 0,
+                    parentIndex: nil,
+                    depth: 0,
+                    role: "AXButton",
+                    title: "Continue",
+                    label: nil,
+                    value: nil,
+                    placeholder: nil,
+                    url: nil,
+                    frame: [0, 0, 20, 20],
+                    settable: false,
+                    actions: ["AXPress"]
+                )],
+                removed: []
+            )
+        )
+    }
+
+    func executeElement(
+        action: ActionV2,
+        target: ElementTarget,
+        sequence: UInt64,
+        context: WindowContext
+    ) async throws {
+        try await guardState.authorizeElement(
+            action: action,
+            sequence: sequence,
+            target: target,
+            displayFingerprint: context.displayFingerprint,
+            windowID: context.windowID,
+            application: context.application
+        )
+        try await guardState.accept(sequence: sequence)
+        await recorder.executedElement(action)
+    }
+
+    func settle(
+        context _: WindowContext,
+        policy: ObservationPolicy,
+        deadline _: Date
+    ) async throws -> SettleResult {
+        SettleResult(
+            status: policy.settle == .none ? .notRequested : .settled,
+            elapsedMilliseconds: 0
+        )
+    }
+
+    func clearAccessibilityState() async {
+        await recorder.clearedAccessibility()
     }
 
     func authorizeCaptureAction(

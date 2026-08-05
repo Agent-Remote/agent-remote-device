@@ -111,6 +111,34 @@ public final class ActionExecutor {
         }
     }
 
+    public func executeElement(
+        action: ActionV2,
+        target: ElementTarget,
+        sequence: UInt64,
+        context: WindowContext,
+        accessibility: AccessibilityRuntime
+    ) async throws {
+        do {
+            guard AXIsProcessTrusted() else {
+                throw ExecutionFailure.accessibilityPermissionMissing
+            }
+            let displayFingerprint = try await verifyLiveContext(context)
+            try await guardState.authorizeElement(
+                action: action,
+                sequence: sequence,
+                target: target,
+                displayFingerprint: displayFingerprint,
+                windowID: context.windowID,
+                application: context.application
+            )
+            try accessibility.perform(action, target: target)
+            try await guardState.accept(sequence: sequence)
+        } catch {
+            releasePressedState()
+            throw error
+        }
+    }
+
     public func authorizeCaptureAction(
         action: Action,
         sequence: UInt64,
@@ -160,6 +188,34 @@ public final class ActionExecutor {
         }
     }
 
+    public func readClipboardV2(
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        context: WindowContext
+    ) async throws -> String {
+        do {
+            let displayFingerprint = try await verifyLiveContext(context)
+            try await guardState.authorizeClipboardV2(
+                sequence: sequence,
+                stateGeneration: stateGeneration,
+                displayFingerprint: displayFingerprint,
+                windowID: context.windowID,
+                application: context.application
+            )
+            guard let text = NSPasteboard.general.string(forType: .string) else {
+                throw ExecutionFailure.clipboardContentUnavailable
+            }
+            guard text.utf8.count <= 64 * 1_024 else {
+                throw ExecutionFailure.clipboardContentTooLarge
+            }
+            try await guardState.accept(sequence: sequence)
+            return text
+        } catch {
+            releasePressedState()
+            throw error
+        }
+    }
+
     public func releasePressedState() {
         if leftMouseIsDown {
             postMouse(type: .leftMouseUp, point: CGEvent(source: nil)?.location ?? .zero, button: .left)
@@ -172,9 +228,13 @@ public final class ActionExecutor {
     }
 
     private func verifyLiveContext(_ capture: CapturedWindow) async throws -> String {
+        try await verifyLiveContext(capture.windowContext)
+    }
+
+    private func verifyLiveContext(_ context: WindowContext) async throws -> String {
         guard let frontmost = NSWorkspace.shared.frontmostApplication,
-              frontmost.processIdentifier == capture.processID,
-              frontmost.bundleIdentifier == capture.application.bundleIdentifier
+              frontmost.processIdentifier == context.processID,
+              frontmost.bundleIdentifier == context.application.bundleIdentifier
         else {
             throw ExecutionFailure.applicationChanged
         }
@@ -182,9 +242,9 @@ public final class ActionExecutor {
             true,
             onScreenWindowsOnly: true
         )
-        guard let window = content.windows.first(where: { $0.windowID == capture.windowID }),
-              window.owningApplication?.processID == capture.processID,
-              window.frame.equalTo(capture.windowFrame)
+        guard let window = content.windows.first(where: { $0.windowID == context.windowID }),
+              window.owningApplication?.processID == context.processID,
+              window.frame.equalTo(context.windowFrame)
         else {
             throw ExecutionFailure.windowChanged
         }
@@ -195,7 +255,7 @@ public final class ActionExecutor {
             throw ExecutionFailure.displayChanged
         }
         let fingerprint = WindowCapture.displayFingerprint(content.displays, selected: display)
-        guard fingerprint == capture.displayFingerprint else { throw ExecutionFailure.displayChanged }
+        guard fingerprint == context.displayFingerprint else { throw ExecutionFailure.displayChanged }
         return fingerprint
     }
 

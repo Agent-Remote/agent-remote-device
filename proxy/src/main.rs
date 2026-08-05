@@ -45,6 +45,10 @@ struct Args {
     bridge_socket: Option<PathBuf>,
     #[arg(long)]
     lifecycle_socket: PathBuf,
+    #[arg(long, default_value_t = false)]
+    compact_tools: bool,
+    #[arg(long)]
+    optimization_metrics: Option<PathBuf>,
     #[arg(long, value_enum)]
     notify: Option<NotifyEvent>,
 }
@@ -78,7 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_core_dumps()?;
     let args = Args::parse();
     if let Some(event) = args.notify {
-        if args.managed_context.is_some() || args.bridge_socket.is_some() {
+        if args.managed_context.is_some()
+            || args.bridge_socket.is_some()
+            || args.compact_tools
+            || args.optimization_metrics.is_some()
+        {
             return Err("notify mode does not accept transport paths".into());
         }
         validate_hook_input(event)?;
@@ -106,9 +114,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warmup_task = tokio::spawn(async move {
         warm_connection(warmup_transport).await;
     });
-    let server = DeviceMcp::new(transport)
-        .serve(rmcp::transport::stdio())
-        .await?;
+    let device_mcp = DeviceMcp::configured(
+        transport,
+        args.compact_tools,
+        args.optimization_metrics.as_deref(),
+    )?;
+    let server = device_mcp.serve(rmcp::transport::stdio()).await?;
     let result = server.waiting().await;
     warmup_task.abort();
     lifecycle_task.abort();

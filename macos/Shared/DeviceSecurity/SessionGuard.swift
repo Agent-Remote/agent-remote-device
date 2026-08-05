@@ -64,8 +64,10 @@ public enum GuardFailure: Error, Equatable, Sendable {
     case controlLevelDenied
     case clipboardAccessDenied
     case staleScreenshot
+    case staleState
     case displayChanged
     case applicationChanged
+    case windowChanged
     case coordinateOutOfBounds
     case invalidParameters
 }
@@ -75,6 +77,7 @@ public actor SessionGuard {
     public private(set) var generation: UInt64
     public private(set) var nextSequence: UInt64
     public private(set) var currentScreenshot: ScreenshotContext?
+    public private(set) var currentState: AccessibilityStateContext?
 
     private var leaseUntil: Date?
     private var approvals: [String: LocalApproval] = [:]
@@ -133,6 +136,17 @@ public actor SessionGuard {
         currentScreenshot = context
     }
 
+    public func recordState(_ context: AccessibilityStateContext) throws {
+        try requireActive(now: Date())
+        guard context.stateGeneration > (currentState?.stateGeneration ?? 0) else {
+            throw GuardFailure.staleState
+        }
+        guard let approval = approvals[context.applicationDigest], approval.generation == generation else {
+            throw GuardFailure.approvalMissing
+        }
+        currentState = context
+    }
+
     public func authorizeScreenshot(sequence: UInt64, now: Date = Date()) throws {
         try requireActive(now: now)
         guard sequence == nextSequence else { throw GuardFailure.sequenceMismatch }
@@ -178,6 +192,68 @@ public actor SessionGuard {
         }
     }
 
+    public func authorizeElement(
+        action: ActionV2,
+        sequence: UInt64,
+        target: ElementTarget,
+        displayFingerprint: String,
+        windowID: UInt32,
+        application: ApplicationIdentity,
+        now: Date = Date()
+    ) throws {
+        try requireActive(now: now)
+        guard sequence == nextSequence else { throw GuardFailure.sequenceMismatch }
+        guard nextSequence < UInt64.max else {
+            failClosed()
+            throw GuardFailure.counterExhausted
+        }
+        guard action.hasValidParameters, target.hasValidParameters else {
+            throw GuardFailure.invalidParameters
+        }
+        guard let state = currentState, state.matches(target) else {
+            throw GuardFailure.staleState
+        }
+        guard state.displayFingerprint == displayFingerprint else {
+            throw GuardFailure.displayChanged
+        }
+        guard state.windowID == windowID else { throw GuardFailure.windowChanged }
+        let digest = application.stableDigest
+        guard state.applicationDigest == digest else { throw GuardFailure.applicationChanged }
+        guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
+        guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
+        guard approval.controlLevel >= requiredLevel(for: action) else {
+            throw GuardFailure.controlLevelDenied
+        }
+    }
+
+    public func authorizeClipboardV2(
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        displayFingerprint: String,
+        windowID: UInt32,
+        application: ApplicationIdentity,
+        now: Date = Date()
+    ) throws {
+        try requireActive(now: now)
+        guard sequence == nextSequence else { throw GuardFailure.sequenceMismatch }
+        guard nextSequence < UInt64.max else {
+            failClosed()
+            throw GuardFailure.counterExhausted
+        }
+        guard let state = currentState, state.stateGeneration == stateGeneration else {
+            throw GuardFailure.staleState
+        }
+        guard state.displayFingerprint == displayFingerprint else {
+            throw GuardFailure.displayChanged
+        }
+        guard state.windowID == windowID else { throw GuardFailure.windowChanged }
+        let digest = application.stableDigest
+        guard state.applicationDigest == digest else { throw GuardFailure.applicationChanged }
+        guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
+        guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
+        guard approval.clipboardAllowed else { throw GuardFailure.clipboardAccessDenied }
+    }
+
     public func accept(sequence: UInt64) throws {
         guard sequence == nextSequence else { throw GuardFailure.sequenceMismatch }
         let (next, overflow) = nextSequence.addingReportingOverflow(1)
@@ -202,6 +278,7 @@ public actor SessionGuard {
         generation = value
         approvals.removeAll(keepingCapacity: false)
         currentScreenshot = nil
+        currentState = nil
         leaseUntil = nil
         state = .pendingDevice
     }
@@ -209,6 +286,7 @@ public actor SessionGuard {
     public func failClosed() {
         approvals.removeAll(keepingCapacity: false)
         currentScreenshot = nil
+        currentState = nil
         leaseUntil = nil
         state = .failed
     }
@@ -219,6 +297,7 @@ public actor SessionGuard {
             state = .expired
             self.leaseUntil = nil
             currentScreenshot = nil
+            currentState = nil
             throw GuardFailure.leaseExpired
         }
     }
@@ -231,6 +310,19 @@ public actor SessionGuard {
             .fullControl
         default:
             .clickOnly
+        }
+    }
+
+    private func requiredLevel(for action: ActionV2) -> ControlLevel {
+        switch action {
+        case .observe, .readClipboard:
+            .viewOnly
+        case let .coordinate(action):
+            requiredLevel(for: action)
+        case .press, .scrollElement, .secondaryAction:
+            .clickOnly
+        case .setValue, .selectText:
+            .fullControl
         }
     }
 

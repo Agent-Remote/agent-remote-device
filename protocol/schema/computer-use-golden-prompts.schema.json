@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-remote.dev/schemas/computer-use-golden-prompts.schema.json",
+  "title": "Computer Use golden prompt corpus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "cases"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "cases": {
+      "type": "array",
+      "minItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "category",
+          "prompt",
+          "expected_skill_activation",
+          "preferred_surface",
+          "first_observation_mode",
+          "expects_image",
+          "confirmation_checkpoint"
+        ],
+        "allOf": [
+          {
+            "if": {"properties": {"expected_skill_activation": {"const": true}}},
+            "then": {
+              "properties": {
+                "preferred_surface": {"const": "device_v2"},
+                "first_observation_mode": {"enum": ["auto", "ax_full", "screenshot"]}
+              }
+            },
+            "else": {
+              "properties": {
+                "first_observation_mode": {"type": "null"},
+                "expects_image": {"const": false}
+              }
+            }
+          }
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "category": {"enum": ["direct", "indirect", "browser", "alternative", "negative"]},
+          "prompt": {"type": "string", "minLength": 1},
+          "expected_skill_activation": {"type": "boolean"},
+          "preferred_surface": {"enum": ["device_v2", "connector", "cli", "none"]},
+          "first_observation_mode": {
+            "oneOf": [
+              {"type": "null"},
+              {"enum": ["auto", "ax_full", "screenshot"]}
+            ]
+          },
+          "expects_image": {"type": "boolean"},
+          "confirmation_checkpoint": {
+            "enum": ["none", "before_submit", "before_purchase", "before_delete", "user_handoff"]
+          }
+        }
+      }
+    }
+  }
+}

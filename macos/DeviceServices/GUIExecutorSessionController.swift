@@ -11,6 +11,7 @@ public actor GUIExecutorSessionController {
     private var guardState: SessionGuard?
     private var runtime: (any GUIActionRuntime)?
     private var latestCapture: CapturedWindow?
+    private var latestWindowContext: WindowContext?
     private var turnPaused = false
     private var requiresFreshScreenshot = false
     private let runtimeFactory: RuntimeFactory
@@ -43,11 +44,15 @@ public actor GUIExecutorSessionController {
         self.guardState = guardState
         self.runtime = runtime
         latestCapture = nil
+        latestWindowContext = nil
         turnPaused = false
         requiresFreshScreenshot = false
     }
 
     public func performAction(_ data: Data) async throws -> Data {
+        if try requestVersion(in: data) == protocolVersionV2 {
+            return try await performActionV2(data)
+        }
         do {
             return try await performValidatedAction(data)
         } catch let failure as CaptureFailure {
@@ -110,6 +115,7 @@ public actor GUIExecutorSessionController {
               let guardState,
               renewed.binding == configuration.binding,
               renewed.approvals == configuration.approvals,
+              renewed.capabilities == configuration.capabilities,
               renewed.leaseUntil >= configuration.leaseUntil
         else {
             throw DeviceIPCFailure.invalidMessage
@@ -139,6 +145,8 @@ public actor GUIExecutorSessionController {
         }
         await runtime.releasePressedState()
         latestCapture = nil
+        latestWindowContext = nil
+        await runtime.clearAccessibilityState()
         turnPaused = true
     }
 
@@ -169,6 +177,7 @@ public actor GUIExecutorSessionController {
         guardState = nil
         runtime = nil
         latestCapture = nil
+        latestWindowContext = nil
         turnPaused = false
         requiresFreshScreenshot = false
     }
@@ -186,11 +195,13 @@ public actor GUIExecutorSessionController {
     private func failCurrentSession() async {
         if let runtime {
             await runtime.releasePressedState()
+            await runtime.clearAccessibilityState()
         }
         if let guardState {
             await guardState.failClosed()
         }
         latestCapture = nil
+        latestWindowContext = nil
         turnPaused = false
         requiresFreshScreenshot = false
     }
@@ -305,6 +316,7 @@ public actor GUIExecutorSessionController {
         }
 
         latestCapture = capture
+        latestWindowContext = capture.windowContext
         if isScreenshot(request.action) {
             requiresFreshScreenshot = false
         }
@@ -342,6 +354,345 @@ public actor GUIExecutorSessionController {
         ))
         if acceptSequence {
             try await guardState.accept(sequence: sequence)
+        }
+    }
+
+    private func performActionV2(_ data: Data) async throws -> Data {
+        let envelope = try DeviceIPCEnvelope.decode(data)
+        let request: ActionRequestV2
+        do {
+            request = try ActionRequestV2.decodeStrict(envelope.payload)
+        } catch {
+            throw DeviceIPCFailure.invalidMessage
+        }
+        guard envelope.requestID == request.requestID,
+              let configuration,
+              configuration.supportsProtocolV2,
+              let guardState,
+              let runtime,
+              !turnPaused,
+              bindingMatches(configuration.binding, request.context),
+              request.leaseUntil > Date(),
+              request.leaseUntil <= configuration.leaseUntil,
+              request.observation.hasValidParameters,
+              request.action.hasValidParameters
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+
+        let currentStateGeneration = await guardState.currentState?.stateGeneration ?? 0
+        let currentScreenshotGeneration = await guardState.currentScreenshot?.generation ?? 0
+        guard request.context.currentStateGeneration == currentStateGeneration,
+              request.context.currentScreenshotGeneration == currentScreenshotGeneration
+        else {
+            return try failureResponseV2(
+                request: request,
+                code: "stale_state",
+                message: "The request does not reference the current GUI state. Observe again."
+            )
+        }
+        let nextStateGeneration = try incremented(currentStateGeneration)
+        let approvedApplications = configuration.approvals.map(\.application)
+        let targetApplication: String? = switch request.action {
+        case let .observe(application): application
+        default: nil
+        }
+
+        let windowContext: WindowContext
+        do {
+            if case .observe = request.action {
+                windowContext = try await runtime.windowContext(
+                    approvedApplications: approvedApplications,
+                    targetApplication: targetApplication
+                )
+            } else if let latestWindowContext {
+                windowContext = latestWindowContext
+            } else {
+                return try failureResponseV2(
+                    request: request,
+                    code: "fresh_observation_required",
+                    message: "A successful observation is required before this action."
+                )
+            }
+        } catch let failure as CaptureFailure {
+            return try failureResponseV2(
+                request: request,
+                code: failure.diagnosticCode,
+                message: failure.userMessage
+            )
+        }
+        if let prior = latestWindowContext, prior != windowContext {
+            latestCapture = nil
+            await runtime.clearAccessibilityState()
+        }
+
+        var message = "Action completed."
+        do {
+            switch request.action {
+            case .observe:
+                try await guardState.authorizeScreenshot(
+                    sequence: request.context.monotonicSequence
+                )
+            case let .coordinate(action):
+                guard let latestCapture else {
+                    return try failureResponseV2(
+                        request: request,
+                        code: "fresh_screenshot_required",
+                        message: "A model-visible screenshot is required for coordinate actions."
+                    )
+                }
+                try await runtime.execute(
+                    action: action,
+                    sequence: request.context.monotonicSequence,
+                    screenshotGeneration: currentScreenshotGeneration,
+                    capture: latestCapture
+                )
+            case let .press(target),
+                 let .setValue(target, _),
+                 let .selectText(target, _, _, _, _),
+                 let .scrollElement(target, _, _),
+                 let .secondaryAction(target, _):
+                try await runtime.executeElement(
+                    action: request.action,
+                    target: target,
+                    sequence: request.context.monotonicSequence,
+                    context: windowContext
+                )
+            case .readClipboard:
+                message = try await runtime.readClipboardV2(
+                    sequence: request.context.monotonicSequence,
+                    stateGeneration: currentStateGeneration,
+                    context: windowContext
+                )
+            }
+        } catch let failure as AccessibilityFailure {
+            return try failureResponseV2(
+                request: request,
+                code: failure.diagnosticCode,
+                message: String(describing: failure)
+            )
+        } catch let failure as ExecutionFailure {
+            return try failureResponseV2(
+                request: request,
+                code: failure.diagnosticCode,
+                message: failure.userMessage
+            )
+        } catch let failure as GuardFailure {
+            if let diagnostic = recoverableGuardFailureV2(failure) {
+                return try failureResponseV2(
+                    request: request,
+                    code: diagnostic.code,
+                    message: diagnostic.message
+                )
+            }
+            await failCurrentSession()
+            throw failure
+        }
+
+        let isObservationOnly: Bool = if case .observe = request.action { true } else { false }
+        let settle: SettleResult
+        if isObservationOnly {
+            settle = SettleResult(status: .notRequested, elapsedMilliseconds: 0)
+        } else {
+            let requestedDeadline = Date().addingTimeInterval(
+                Double(request.observation.settleTimeoutMilliseconds) / 1_000
+            )
+            let deadline = min(requestedDeadline, request.leaseUntil)
+            do {
+                settle = try await runtime.settle(
+                    context: windowContext,
+                    policy: request.observation,
+                    deadline: deadline
+                )
+            } catch {
+                settle = SettleResult(status: .timeout, elapsedMilliseconds: 0)
+                message += " Adaptive settle was unavailable."
+            }
+        }
+
+        var observation: AccessibilityObservation?
+        var stateContext: AccessibilityStateContext?
+        let wantsAX = switch request.observation.mode {
+        case .axDiff, .axFull, .both, .auto: true
+        case .none, .screenshot: false
+        }
+        if wantsAX {
+            let baseStateID = request.observation.mode == .axFull
+                ? nil
+                : request.context.baseStateID
+            do {
+                let result = try await runtime.observeAccessibility(
+                    context: windowContext,
+                    stateGeneration: nextStateGeneration,
+                    baseStateID: baseStateID,
+                    policy: request.observation
+                )
+                observation = result.observation
+                stateContext = result.context
+            } catch let failure as AccessibilityFailure {
+                if request.observation.mode != .auto {
+                    if isObservationOnly {
+                        return try failureResponseV2(
+                            request: request,
+                            code: failure.diagnosticCode,
+                            message: String(describing: failure)
+                        )
+                    }
+                    message += " AX observation failed after the action (\(failure.diagnosticCode))."
+                }
+            }
+        }
+
+        let needsAutoFallback = request.observation.mode == .auto && observation == nil
+        let wantsImage = request.observation.mode == .screenshot
+            || request.observation.mode == .both
+            || needsAutoFallback
+        var image: ImagePayloadV2?
+        var screenshotGeneration = currentScreenshotGeneration
+        if wantsImage {
+            do {
+                let profile = request.observation.imageProfile == .none
+                    ? ImageProfile.compact
+                    : request.observation.imageProfile
+                let capture = try await runtime.captureV2(
+                    approvedApplications: approvedApplications,
+                    targetApplication: nil,
+                    profile: profile,
+                    region: request.observation.region
+                )
+                screenshotGeneration = try incremented(currentScreenshotGeneration)
+                try await guardState.recordScreenshot(ScreenshotContext(
+                    generation: screenshotGeneration,
+                    displayFingerprint: capture.displayFingerprint,
+                    applicationDigest: capture.application.stableDigest,
+                    pixelWidth: capture.pixelWidth,
+                    pixelHeight: capture.pixelHeight
+                ))
+                latestCapture = capture
+                latestWindowContext = capture.windowContext
+                image = ImagePayloadV2(
+                    base64Data: capture.pngData.base64EncodedString(),
+                    mimeType: "image/png",
+                    pixelWidth: capture.pixelWidth,
+                    pixelHeight: capture.pixelHeight,
+                    profile: profile
+                )
+            } catch let failure as CaptureFailure {
+                if isObservationOnly {
+                    return try failureResponseV2(
+                        request: request,
+                        code: failure.diagnosticCode,
+                        message: failure.userMessage
+                    )
+                }
+                message += " Follow-up image failed (\(failure.diagnosticCode))."
+            }
+        }
+
+        if stateContext == nil {
+            stateContext = AccessibilityStateContext(
+                stateID: UUID(),
+                stateGeneration: nextStateGeneration,
+                applicationDigest: windowContext.application.stableDigest,
+                windowID: windowContext.windowID,
+                displayFingerprint: windowContext.displayFingerprint
+            )
+        }
+        guard let stateContext else { throw DeviceIPCFailure.invalidMessage }
+        try await guardState.recordState(stateContext)
+        latestWindowContext = windowContext
+        if isObservationOnly {
+            try await guardState.accept(sequence: request.context.monotonicSequence)
+        }
+
+        let response = ActionResponseV2(
+            requestID: request.requestID,
+            monotonicSequence: request.context.monotonicSequence,
+            stateGeneration: nextStateGeneration,
+            screenshotGeneration: screenshotGeneration,
+            stateID: stateContext.stateID,
+            applicationDigest: stateContext.applicationDigest,
+            windowID: stateContext.windowID,
+            displayFingerprint: stateContext.displayFingerprint,
+            baseStateID: observation?.kind == .diff ? request.context.baseStateID : nil,
+            status: .success,
+            message: message,
+            observation: observation,
+            settle: settle,
+            image: image
+        )
+        let encoded = try JSONEncoder().encode(response)
+        guard encoded.count <= DeviceIPCVersion.maximumMessageBytes else {
+            throw DeviceIPCFailure.messageTooLarge
+        }
+        return encoded
+    }
+
+    private func requestVersion(in data: Data) throws -> UInt8 {
+        let envelope = try DeviceIPCEnvelope.decode(data)
+        guard let object = try JSONSerialization.jsonObject(with: envelope.payload) as? [String: Any],
+              let number = object["version"] as? NSNumber
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+        return number.uint8Value
+    }
+
+    private func bindingMatches(
+        _ binding: DeviceSessionBinding,
+        _ context: RequestContextV2
+    ) -> Bool {
+        binding.userID == context.userID
+            && binding.deviceID == context.deviceID
+            && binding.toolSessionID == context.toolSessionID
+            && binding.deviceSessionID == context.deviceSessionID
+            && binding.nodeID == context.nodeID
+            && binding.platform == context.platform
+            && binding.generation == context.generation
+    }
+
+    private func failureResponseV2(
+        request: ActionRequestV2,
+        code: String,
+        message: String
+    ) throws -> Data {
+        let response = ActionResponseV2(
+            requestID: request.requestID,
+            monotonicSequence: request.context.monotonicSequence,
+            stateGeneration: request.context.currentStateGeneration,
+            screenshotGeneration: request.context.currentScreenshotGeneration,
+            stateID: nil,
+            applicationDigest: nil,
+            windowID: nil,
+            displayFingerprint: nil,
+            baseStateID: nil,
+            status: .failed,
+            message: "\(code): \(message)",
+            observation: nil,
+            settle: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
+            image: nil
+        )
+        return try JSONEncoder().encode(response)
+    }
+
+    private func recoverableGuardFailureV2(
+        _ failure: GuardFailure
+    ) -> (code: String, message: String)? {
+        switch failure {
+        case .controlLevelDenied:
+            ("control_level_denied", "This session was not approved for the requested control level.")
+        case .clipboardAccessDenied:
+            ("clipboard_access_denied", "Clipboard access was not approved for this application in the current session.")
+        case .coordinateOutOfBounds:
+            ("coordinate_out_of_bounds", "The coordinate is outside the model-visible screenshot.")
+        case .invalidParameters:
+            ("invalid_action_parameters", "The requested action parameters are invalid.")
+        case .staleScreenshot:
+            ("fresh_screenshot_required", "Take a new screenshot before using coordinates.")
+        case .staleState, .displayChanged, .applicationChanged, .windowChanged:
+            ("fresh_observation_required", "The approved UI changed. Observe it again.")
+        default:
+            nil
         }
     }
 

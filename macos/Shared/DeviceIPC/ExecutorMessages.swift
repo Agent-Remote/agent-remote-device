@@ -47,6 +47,16 @@ public struct DeviceSessionBinding: Codable, Equatable, Sendable {
             && platform == context.platform
             && generation == context.generation
     }
+
+    public func matches(_ context: RequestContextV2) -> Bool {
+        userID == context.userID
+            && deviceID == context.deviceID
+            && toolSessionID == context.toolSessionID
+            && deviceSessionID == context.deviceSessionID
+            && nodeID == context.nodeID
+            && platform == context.platform
+            && generation == context.generation
+    }
 }
 
 public struct BrokerPendingSession: Codable, Equatable, Sendable {
@@ -286,21 +296,28 @@ public struct ExecutorSessionConfiguration: Codable, Equatable, Sendable {
     public let binding: DeviceSessionBinding
     public let leaseUntil: Date
     public let approvals: [LocalApproval]
+    public let capabilities: Set<String>
 
     enum CodingKeys: String, CodingKey {
         case binding
         case leaseUntil = "lease_until"
-        case approvals
+        case approvals, capabilities
     }
 
     public init(
         binding: DeviceSessionBinding,
         leaseUntil: Date,
-        approvals: [LocalApproval]
+        approvals: [LocalApproval],
+        capabilities: Set<String> = [
+            capabilityObservationModeV2,
+            capabilityAXStateV2,
+            capabilityAdaptiveSettleV2,
+        ]
     ) {
         self.binding = binding
         self.leaseUntil = leaseUntil
         self.approvals = approvals
+        self.capabilities = capabilities
     }
 
     public func validate(now: Date = Date()) throws {
@@ -309,11 +326,22 @@ public struct ExecutorSessionConfiguration: Codable, Equatable, Sendable {
               !approvals.isEmpty,
               approvals.count <= 32,
               approvals.allSatisfy({ $0.generation == binding.generation }),
-              Set(approvals.map(\.application.stableDigest)).count == approvals.count
+              Set(approvals.map(\.application.stableDigest)).count == approvals.count,
+              capabilities.isSubset(of: Self.knownCapabilities)
         else {
             throw DeviceIPCFailure.invalidMessage
         }
     }
+
+    public var supportsProtocolV2: Bool {
+        Self.knownCapabilities.isSubset(of: capabilities)
+    }
+
+    private static let knownCapabilities: Set<String> = [
+        capabilityObservationModeV2,
+        capabilityAXStateV2,
+        capabilityAdaptiveSettleV2,
+    ]
 }
 
 private extension DeviceSessionBinding {

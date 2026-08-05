@@ -1,0 +1,39 @@
+{
+  "request_id": "10000000-0000-4000-8000-000000000010",
+  "monotonic_sequence": 8,
+  "state_generation": 4,
+  "screenshot_generation": 2,
+  "state_id": "10000000-0000-4000-8000-000000000011",
+  "application_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "window_id": 7,
+  "display_fingerprint": "display-layout-v1",
+  "base_state_id": "10000000-0000-4000-8000-000000000012",
+  "status": "success",
+  "message": "Action completed.",
+  "observation": {
+    "kind": "diff",
+    "reset": false,
+    "truncated": false,
+    "nodes": [
+      {
+        "index": 1,
+        "parent_index": 0,
+        "depth": 1,
+        "role": "AXButton",
+        "title": "Continue",
+        "label": null,
+        "value": null,
+        "placeholder": null,
+        "url": null,
+        "frame": [12, 24, 100, 32],
+        "settable": false,
+        "actions": ["AXPress"]
+      }
+    ],
+    "removed": []
+  },
+  "settle": {
+    "status": "settled",
+    "elapsed_ms": 240
+  }
+}

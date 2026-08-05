@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::OpenOptions,
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -30,6 +31,12 @@ use crate::{
         Action, ActionRequest, Platform, RequestContext, MAX_ACTIVE_DEVICE_SESSION_GENERATION,
         MAX_FRAME_BYTES,
     },
+    protocol_v2::{
+        AccessibilityObservation, ActionRequestV2, ActionResponseV2, ActionV2, ImageProfile,
+        ObservationMode, ObservationPolicy, RequestContextV2, ResponseStatusV2, SettleResult,
+        CAPABILITY_ADAPTIVE_SETTLE_V2, CAPABILITY_AX_STATE_V2, CAPABILITY_OBSERVATION_MODE_V2,
+        PROTOCOL_VERSION_V2,
+    },
 };
 
 const MAX_CONTEXT_BYTES: u64 = 16 * 1024;
@@ -52,6 +59,10 @@ pub struct ManagedContext {
     pub generation: u64,
     pub next_sequence: u64,
     pub current_screenshot_generation: u64,
+    #[serde(default)]
+    pub current_state_generation: u64,
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
     pub lease_until: DateTime<Utc>,
 }
 
@@ -107,6 +118,7 @@ impl ManagedContext {
             && self.node_id == other.node_id
             && self.platform == other.platform
             && self.generation == other.generation
+            && self.capabilities == other.capabilities
     }
 }
 
@@ -117,6 +129,30 @@ pub struct DeviceResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceResultV2 {
+    pub message: String,
+    pub state_generation: u64,
+    pub screenshot_generation: u64,
+    pub state_id: Uuid,
+    pub application_digest: String,
+    pub window_id: u32,
+    pub display_fingerprint: String,
+    pub base_state_id: Option<Uuid>,
+    pub observation: Option<AccessibilityObservation>,
+    pub settle: SettleResult,
+    pub screenshot: Option<ScreenshotV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenshotV2 {
+    pub base64_data: String,
+    pub mime_type: String,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+    pub profile: ImageProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screenshot {
     pub base64_data: String,
     pub mime_type: String,
@@ -124,7 +160,19 @@ pub struct Screenshot {
 
 #[async_trait]
 pub trait DeviceTransport: Send + Sync + 'static {
+    async fn supports_v2(&self) -> Result<bool, TransportError> {
+        Ok(false)
+    }
+
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError>;
+
+    async fn execute_v2(
+        &self,
+        _action: ActionV2,
+        _observation: ObservationPolicy,
+    ) -> Result<DeviceResultV2, TransportError> {
+        Err(TransportError::CapabilityUnavailable)
+    }
 }
 
 #[derive(Debug)]
@@ -143,6 +191,9 @@ pub struct ActivatedUnixDeviceTransport {
 #[derive(Debug)]
 struct TransportState {
     context: ManagedContext,
+    state_id: Option<Uuid>,
+    model_ax_base_state_id: Option<Uuid>,
+    model_ax_base_context: Option<(String, u32, String)>,
     poisoned: bool,
     connection: Option<TlsStream<UnixStream>>,
 }
@@ -200,6 +251,11 @@ struct FramedRequest<'a> {
     request: &'a ActionRequest,
 }
 
+#[derive(Debug, Serialize)]
+struct FramedRequestV2<'a> {
+    request: &'a ActionRequestV2,
+}
+
 /// Trusted Claude lifecycle events forwarded over the authenticated device channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +301,8 @@ pub enum TransportError {
     UnsafeContextFile,
     #[error("managed device control is not active")]
     NotActivated,
+    #[error("the active device session does not support token-efficient observations")]
+    CapabilityUnavailable,
     #[error("managed context is invalid")]
     InvalidContext,
     #[error("managed context binding changed within a generation")]
@@ -296,6 +354,9 @@ impl UnixDeviceTransport {
         Self {
             socket_path: Arc::from(socket_path),
             state: Mutex::new(TransportState {
+                state_id: None,
+                model_ax_base_state_id: None,
+                model_ax_base_context: None,
                 context,
                 poisoned: false,
                 connection: None,
@@ -324,6 +385,16 @@ impl UnixDeviceTransport {
         request: &ActionRequest,
     ) -> Result<ActionResponse, TransportError> {
         let payload = serde_json::to_vec(&FramedRequest { request })?;
+        let response_bytes = exchange_payload(&self.socket_path, state, &payload).await?;
+        Ok(serde_json::from_slice(&response_bytes)?)
+    }
+
+    async fn exchange_v2(
+        &self,
+        state: &mut TransportState,
+        request: &ActionRequestV2,
+    ) -> Result<ActionResponseV2, TransportError> {
+        let payload = serde_json::to_vec(&FramedRequestV2 { request })?;
         let response_bytes = exchange_payload(&self.socket_path, state, &payload).await?;
         Ok(serde_json::from_slice(&response_bytes)?)
     }
@@ -529,15 +600,35 @@ async fn exchange_payload(
 
 #[async_trait]
 impl DeviceTransport for ActivatedUnixDeviceTransport {
+    async fn supports_v2(&self) -> Result<bool, TransportError> {
+        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        Ok(supports_v2(&context.capabilities))
+    }
+
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError> {
         let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
         let transport = self.transport_for_context(context).await?;
         transport.execute(action).await
     }
+
+    async fn execute_v2(
+        &self,
+        action: ActionV2,
+        observation: ObservationPolicy,
+    ) -> Result<DeviceResultV2, TransportError> {
+        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        let transport = self.transport_for_context(context).await?;
+        transport.execute_v2(action, observation).await
+    }
 }
 
 #[async_trait]
 impl DeviceTransport for UnixDeviceTransport {
+    async fn supports_v2(&self) -> Result<bool, TransportError> {
+        let state = self.state.lock().await;
+        Ok(!state.poisoned && supports_v2(&state.context.capabilities))
+    }
+
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError> {
         let mut state = self.state.lock().await;
         if state.poisoned {
@@ -614,6 +705,197 @@ impl DeviceTransport for UnixDeviceTransport {
             screenshot,
         })
     }
+
+    async fn execute_v2(
+        &self,
+        action: ActionV2,
+        observation: ObservationPolicy,
+    ) -> Result<DeviceResultV2, TransportError> {
+        if !action.validate_parameters() || !observation.validate() {
+            return Err(TransportError::InvalidContext);
+        }
+        let mut state = self.state.lock().await;
+        if state.poisoned {
+            return Err(TransportError::Poisoned);
+        }
+        if !supports_v2(&state.context.capabilities) {
+            return Err(TransportError::CapabilityUnavailable);
+        }
+        if state.context.lease_until <= Utc::now() {
+            poison(&mut state);
+            return Err(TransportError::LeaseExpired);
+        }
+        if state.context.next_sequence == u64::MAX
+            || state.context.current_state_generation == u64::MAX
+            || state.context.current_screenshot_generation == u64::MAX
+        {
+            poison(&mut state);
+            return Err(TransportError::CounterExhausted);
+        }
+        let request = ActionRequestV2 {
+            version: PROTOCOL_VERSION_V2,
+            request_id: Uuid::new_v4(),
+            context: RequestContextV2 {
+                user_id: state.context.user_id,
+                device_id: state.context.device_id,
+                tool_session_id: state.context.tool_session_id,
+                device_session_id: state.context.device_session_id,
+                node_id: state.context.node_id,
+                platform: state.context.platform,
+                generation: state.context.generation,
+                monotonic_sequence: state.context.next_sequence,
+                current_state_generation: state.context.current_state_generation,
+                current_screenshot_generation: state.context.current_screenshot_generation,
+                base_state_id: if matches!(observation.mode, ObservationMode::AxFull) {
+                    None
+                } else {
+                    state.model_ax_base_state_id
+                },
+            },
+            lease_until: state.context.lease_until,
+            observation,
+            action,
+        };
+        let remaining_lease = match (state.context.lease_until - Utc::now()).to_std() {
+            Ok(remaining) => remaining,
+            Err(_) => {
+                poison(&mut state);
+                return Err(TransportError::LeaseExpired);
+            }
+        };
+        let response = match timeout(
+            remaining_lease.min(MAX_ACTION_RESPONSE_WAIT),
+            self.exchange_v2(&mut state, &request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                poison(&mut state);
+                return Err(error);
+            }
+            Err(_) => {
+                poison(&mut state);
+                return Err(TransportError::OperationTimedOut);
+            }
+        };
+        if response.request_id != request.request_id
+            || response.monotonic_sequence != request.context.monotonic_sequence
+            || !response.validate_payload(&request.observation)
+        {
+            poison(&mut state);
+            return Err(TransportError::ResponseBinding);
+        }
+        if matches!(response.status, ResponseStatusV2::Failed) {
+            if response.state_generation != request.context.current_state_generation
+                || response.screenshot_generation != request.context.current_screenshot_generation
+                || response.state_id.is_some()
+                || response.application_digest.is_some()
+                || response.window_id.is_some()
+                || response.display_fingerprint.is_some()
+                || response.observation.is_some()
+                || response.image.is_some()
+            {
+                poison(&mut state);
+                return Err(TransportError::ResponseBinding);
+            }
+            return Err(TransportError::DeviceRejected(response.message));
+        }
+        let expected_state_generation = request
+            .context
+            .current_state_generation
+            .checked_add(1)
+            .ok_or(TransportError::CounterExhausted)?;
+        let Some(state_id) = response.state_id else {
+            poison(&mut state);
+            return Err(TransportError::ResponseBinding);
+        };
+        let (Some(application_digest), Some(window_id), Some(display_fingerprint)) = (
+            response.application_digest.clone(),
+            response.window_id,
+            response.display_fingerprint.clone(),
+        ) else {
+            poison(&mut state);
+            return Err(TransportError::ResponseBinding);
+        };
+        if application_digest.len() != 64
+            || !application_digest
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+            || display_fingerprint.is_empty()
+            || display_fingerprint.len() > 256
+        {
+            poison(&mut state);
+            return Err(TransportError::ResponseBinding);
+        }
+        let expected_screenshot_generation = if response.image.is_some() {
+            request
+                .context
+                .current_screenshot_generation
+                .checked_add(1)
+                .ok_or(TransportError::CounterExhausted)?
+        } else {
+            request.context.current_screenshot_generation
+        };
+        if response.state_generation != expected_state_generation
+            || response.screenshot_generation != expected_screenshot_generation
+            || (response.observation.is_some()
+                && response.base_state_id != request.context.base_state_id
+                && !response
+                    .observation
+                    .as_ref()
+                    .is_some_and(|value| value.reset))
+        {
+            poison(&mut state);
+            return Err(TransportError::ResponseBinding);
+        }
+        state.context.next_sequence += 1;
+        state.context.current_state_generation = response.state_generation;
+        state.context.current_screenshot_generation = response.screenshot_generation;
+        state.state_id = Some(state_id);
+        let response_context = (
+            application_digest.clone(),
+            window_id,
+            display_fingerprint.clone(),
+        );
+        if response.observation.is_some() {
+            state.model_ax_base_state_id = Some(state_id);
+            state.model_ax_base_context = Some(response_context);
+        } else if state.model_ax_base_context.as_ref() != Some(&response_context) {
+            state.model_ax_base_state_id = None;
+            state.model_ax_base_context = None;
+        }
+        let screenshot = response.image.map(|image| ScreenshotV2 {
+            base64_data: image.base64_data,
+            mime_type: image.mime_type,
+            pixel_width: image.pixel_width,
+            pixel_height: image.pixel_height,
+            profile: image.profile,
+        });
+        Ok(DeviceResultV2 {
+            message: response.message,
+            state_generation: response.state_generation,
+            screenshot_generation: response.screenshot_generation,
+            state_id,
+            application_digest,
+            window_id,
+            display_fingerprint,
+            base_state_id: response.base_state_id,
+            observation: response.observation,
+            settle: response.settle,
+            screenshot,
+        })
+    }
+}
+
+fn supports_v2(capabilities: &BTreeSet<String>) -> bool {
+    [
+        CAPABILITY_OBSERVATION_MODE_V2,
+        CAPABILITY_AX_STATE_V2,
+        CAPABILITY_ADAPTIVE_SETTLE_V2,
+    ]
+    .iter()
+    .all(|capability| capabilities.contains(*capability))
 }
 
 fn poison(state: &mut TransportState) {
@@ -1176,6 +1458,279 @@ mod tests {
         server.await.expect("bridge server");
     }
 
+    #[tokio::test]
+    async fn v2_nested_tls_binds_capabilities_state_and_failure_counters() {
+        let directory = tempdir().expect("temp directory");
+        let socket_path = directory.path().join("bridge.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind bridge");
+        let mut context = test_context(5, Utc::now() + chrono::Duration::seconds(60));
+        context.capabilities = [
+            CAPABILITY_ADAPTIVE_SETTLE_V2.to_owned(),
+            CAPABILITY_AX_STATE_V2.to_owned(),
+            CAPABILITY_OBSERVATION_MODE_V2.to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let server_context = context.clone();
+        let state_id = Uuid::new_v4();
+        let state_id_after_none = Uuid::new_v4();
+        let state_id_after_full = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept proxy");
+            let hello: BridgeHello = read_bridge_control(&mut stream)
+                .await
+                .expect("bridge hello");
+            assert_eq!(hello.generation, server_context.generation);
+            let identity = GenerationIdentity::generate().expect("device identity");
+            let exporter_context = hex::encode([0x6b_u8; 32]);
+            write_bridge_control(
+                &mut stream,
+                &BridgeMaterial {
+                    protocol_version: BRIDGE_PROTOCOL_VERSION,
+                    generation: server_context.generation,
+                    peer_spki_sha256: identity.spki_sha256_hex(),
+                    exporter_context: exporter_context.clone(),
+                },
+            )
+            .await
+            .expect("bridge material");
+            let material = GenerationMaterial::from_hex(
+                server_context.generation,
+                &hello.spki_sha256,
+                &exporter_context,
+            )
+            .expect("generation material");
+            let acceptor = TlsAcceptor::from(Arc::new(
+                server_config(&identity, &material).expect("server config"),
+            ));
+            let mut tls = acceptor.accept(stream).await.expect("nested TLS handshake");
+            let exporter =
+                server_exporter_binding(tls.get_ref().1, &material).expect("server exporter");
+            let confirmation = confirmation_record(
+                &exporter,
+                NestedTlsRole::Device,
+                server_context.generation,
+                server_context.device_session_id,
+            );
+            tls.write_all(&confirmation)
+                .await
+                .expect("device confirmation");
+            tls.flush().await.expect("flush confirmation");
+            let mut peer_confirmation = [0_u8; CONFIRMATION_RECORD_BYTES];
+            tls.read_exact(&mut peer_confirmation)
+                .await
+                .expect("proxy confirmation");
+            verify_peer_confirmation(
+                &peer_confirmation,
+                &exporter,
+                NestedTlsRole::Device,
+                server_context.generation,
+                server_context.device_session_id,
+            )
+            .expect("verify proxy confirmation");
+
+            let first = read_framed_json(&mut tls).await;
+            let first = &first["request"];
+            assert_eq!(first["version"], PROTOCOL_VERSION_V2);
+            assert_eq!(first["context"]["monotonic_sequence"], 1);
+            assert_eq!(first["context"]["current_state_generation"], 0);
+            assert_eq!(first["context"]["current_screenshot_generation"], 0);
+            assert_eq!(first["context"]["base_state_id"], serde_json::Value::Null);
+            assert_eq!(first["observation"]["mode"], "auto");
+            assert_eq!(first["action"]["type"], "observe");
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": first["request_id"],
+                    "monotonic_sequence": 1,
+                    "state_generation": 1,
+                    "screenshot_generation": 0,
+                    "state_id": state_id,
+                    "application_digest": "a".repeat(64),
+                    "window_id": 7,
+                    "display_fingerprint": "display-layout",
+                    "base_state_id": null,
+                    "status": "success",
+                    "message": "Action completed.",
+                    "observation": {
+                        "kind": "full",
+                        "reset": false,
+                        "truncated": false,
+                        "nodes": [],
+                        "removed": []
+                    },
+                    "settle": {"status": "not_requested", "elapsed_ms": 0},
+                    "image": null
+                }),
+            )
+            .await;
+
+            let second = read_framed_json(&mut tls).await;
+            let second = &second["request"];
+            assert_eq!(second["context"]["monotonic_sequence"], 2);
+            assert_eq!(second["context"]["current_state_generation"], 1);
+            assert_eq!(second["context"]["base_state_id"], state_id.to_string());
+            assert_eq!(second["observation"]["mode"], "none");
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": second["request_id"],
+                    "monotonic_sequence": 2,
+                    "state_generation": 2,
+                    "screenshot_generation": 0,
+                    "state_id": state_id_after_none,
+                    "application_digest": "a".repeat(64),
+                    "window_id": 7,
+                    "display_fingerprint": "display-layout",
+                    "status": "success",
+                    "message": "Action completed.",
+                    "settle": {"status": "not_requested", "elapsed_ms": 0}
+                }),
+            )
+            .await;
+
+            let third = read_framed_json(&mut tls).await;
+            let third = &third["request"];
+            assert_eq!(third["context"]["monotonic_sequence"], 3);
+            assert_eq!(third["context"]["current_state_generation"], 2);
+            assert_eq!(third["context"]["base_state_id"], state_id.to_string());
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": third["request_id"],
+                    "monotonic_sequence": 3,
+                    "state_generation": 2,
+                    "screenshot_generation": 0,
+                    "status": "failed",
+                    "message": "stale_element_target: observe again",
+                    "settle": {"status": "not_requested", "elapsed_ms": 0}
+                }),
+            )
+            .await;
+
+            let fourth = read_framed_json(&mut tls).await;
+            let fourth = &fourth["request"];
+            assert_eq!(fourth["context"]["monotonic_sequence"], 3);
+            assert_eq!(fourth["context"]["current_state_generation"], 2);
+            assert_eq!(fourth["context"]["base_state_id"], serde_json::Value::Null);
+            assert_eq!(fourth["observation"]["mode"], "ax_full");
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": fourth["request_id"],
+                    "monotonic_sequence": 3,
+                    "state_generation": 3,
+                    "screenshot_generation": 0,
+                    "state_id": state_id_after_full,
+                    "application_digest": "a".repeat(64),
+                    "window_id": 7,
+                    "display_fingerprint": "display-layout",
+                    "base_state_id": null,
+                    "status": "success",
+                    "message": "Action completed.",
+                    "observation": {
+                        "kind": "full",
+                        "reset": true,
+                        "truncated": false,
+                        "nodes": [],
+                        "removed": []
+                    },
+                    "settle": {"status": "not_requested", "elapsed_ms": 0},
+                    "image": null
+                }),
+            )
+            .await;
+        });
+
+        let transport = UnixDeviceTransport::new(&socket_path, context);
+        let first = transport
+            .execute_v2(
+                ActionV2::Observe { application: None },
+                ObservationPolicy::default(),
+            )
+            .await
+            .expect("v2 observation");
+        assert_eq!(first.state_id, state_id);
+        assert_eq!(first.state_generation, 1);
+        assert_eq!(first.screenshot_generation, 0);
+
+        let after_none = transport
+            .execute_v2(
+                ActionV2::Observe { application: None },
+                ObservationPolicy {
+                    mode: ObservationMode::None,
+                    settle: crate::protocol_v2::SettleMode::None,
+                    settle_timeout_ms: 0,
+                    image_profile: ImageProfile::None,
+                    ..ObservationPolicy::default()
+                },
+            )
+            .await
+            .expect("none observation");
+        assert_eq!(after_none.state_id, state_id_after_none);
+        assert!(after_none.observation.is_none());
+
+        let error = transport
+            .execute_v2(
+                ActionV2::Observe { application: None },
+                ObservationPolicy::default(),
+            )
+            .await
+            .expect_err("device failure must remain a rejected operation");
+        assert!(matches!(error, TransportError::DeviceRejected(_)));
+        let state = transport.state.lock().await;
+        assert!(!state.poisoned);
+        assert_eq!(state.context.next_sequence, 3);
+        assert_eq!(state.context.current_state_generation, 2);
+        assert_eq!(state.context.current_screenshot_generation, 0);
+        assert_eq!(state.model_ax_base_state_id, Some(state_id));
+        drop(state);
+
+        let after_full = transport
+            .execute_v2(
+                ActionV2::Observe { application: None },
+                ObservationPolicy {
+                    mode: ObservationMode::AxFull,
+                    settle: crate::protocol_v2::SettleMode::None,
+                    settle_timeout_ms: 0,
+                    image_profile: ImageProfile::None,
+                    ..ObservationPolicy::default()
+                },
+            )
+            .await
+            .expect("explicit full observation");
+        assert_eq!(after_full.state_id, state_id_after_full);
+        assert_eq!(after_full.state_generation, 3);
+        let state = transport.state.lock().await;
+        assert_eq!(state.context.next_sequence, 4);
+        assert_eq!(state.model_ax_base_state_id, Some(state_id_after_full));
+        drop(state);
+        server.await.expect("bridge server");
+    }
+
+    async fn read_framed_json(
+        stream: &mut tokio_rustls::server::TlsStream<UnixStream>,
+    ) -> serde_json::Value {
+        let length = stream.read_u32().await.expect("frame length") as usize;
+        assert!((1..=MAX_FRAME_BYTES).contains(&length));
+        let mut bytes = vec![0_u8; length];
+        stream.read_exact(&mut bytes).await.expect("frame bytes");
+        serde_json::from_slice(&bytes).expect("frame JSON")
+    }
+
+    async fn write_framed_json(
+        stream: &mut tokio_rustls::server::TlsStream<UnixStream>,
+        value: &serde_json::Value,
+    ) {
+        let bytes = serde_json::to_vec(value).expect("response JSON");
+        stream
+            .write_u32(bytes.len() as u32)
+            .await
+            .expect("response length");
+        stream.write_all(&bytes).await.expect("response bytes");
+        stream.flush().await.expect("flush response");
+    }
+
     fn test_context(generation: u64, lease_until: DateTime<Utc>) -> ManagedContext {
         ManagedContext {
             user_id: Uuid::new_v4(),
@@ -1187,6 +1742,8 @@ mod tests {
             generation,
             next_sequence: 1,
             current_screenshot_generation: 0,
+            current_state_generation: 0,
+            capabilities: BTreeSet::new(),
             lease_until,
         }
     }

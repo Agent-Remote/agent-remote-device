@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-remote.dev/schemas/action-request-v2.schema.json",
+  "title": "Agent Remote Device Action Request v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "request_id", "context", "lease_until", "observation", "action"],
+  "properties": {
+    "version": {"const": 2},
+    "request_id": {"$ref": "#/$defs/uuid"},
+    "context": {"$ref": "#/$defs/context"},
+    "lease_until": {"type": "string", "format": "date-time"},
+    "observation": {"$ref": "#/$defs/observation"},
+    "action": {"$ref": "#/$defs/action"}
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "point": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {"type": "integer", "minimum": 0, "maximum": 65535}
+    },
+    "region": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {"type": "integer", "minimum": 0, "maximum": 65535},
+        {"type": "integer", "minimum": 0, "maximum": 65535},
+        {"type": "integer", "minimum": 1, "maximum": 65535},
+        {"type": "integer", "minimum": 1, "maximum": 65535}
+      ],
+      "items": false
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "user_id", "device_id", "tool_session_id", "device_session_id", "node_id",
+        "platform", "generation", "monotonic_sequence", "current_state_generation",
+        "current_screenshot_generation", "base_state_id"
+      ],
+      "properties": {
+        "user_id": {"$ref": "#/$defs/uuid"},
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "tool_session_id": {"$ref": "#/$defs/uuid"},
+        "device_session_id": {"$ref": "#/$defs/uuid"},
+        "node_id": {"$ref": "#/$defs/uuid"},
+        "platform": {"const": "macos"},
+        "generation": {"type": "integer", "minimum": 1, "maximum": 9223372036854775806},
+        "monotonic_sequence": {"type": "integer", "minimum": 1},
+        "current_state_generation": {"type": "integer", "minimum": 0},
+        "current_screenshot_generation": {"type": "integer", "minimum": 0},
+        "base_state_id": {
+          "oneOf": [{"$ref": "#/$defs/uuid"}, {"type": "null"}]
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "max_nodes", "max_depth", "max_text_per_node",
+        "max_total_text_bytes", "max_visible_rows_per_container", "settle",
+        "settle_timeout_ms", "image_profile", "region"
+      ],
+      "properties": {
+        "mode": {"enum": ["none", "ax_diff", "ax_full", "screenshot", "both", "auto"]},
+        "max_nodes": {"type": "integer", "minimum": 1, "maximum": 800},
+        "max_depth": {"type": "integer", "minimum": 1, "maximum": 20},
+        "max_text_per_node": {"type": "integer", "minimum": 1, "maximum": 160},
+        "max_total_text_bytes": {"type": "integer", "minimum": 1, "maximum": 16384},
+        "max_visible_rows_per_container": {"type": "integer", "minimum": 1, "maximum": 20},
+        "settle": {"enum": ["none", "auto", "fixed"]},
+        "settle_timeout_ms": {"type": "integer", "minimum": 0, "maximum": 5000},
+        "image_profile": {"enum": ["none", "compact", "standard", "region"]},
+        "region": {
+          "oneOf": [{"$ref": "#/$defs/region"}, {"type": "null"}]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"settle": {"const": "none"}}},
+          "then": {"properties": {"settle_timeout_ms": {"const": 0}}},
+          "else": {"properties": {"settle_timeout_ms": {"minimum": 1}}}
+        },
+        {
+          "if": {"properties": {"image_profile": {"const": "region"}}},
+          "then": {"properties": {"region": {"$ref": "#/$defs/region"}}},
+          "else": {"properties": {"region": {"type": "null"}}}
+        }
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_id", "state_generation", "application_digest", "window_id",
+        "display_fingerprint", "element_index"
+      ],
+      "properties": {
+        "state_id": {"$ref": "#/$defs/uuid"},
+        "state_generation": {"type": "integer", "minimum": 1},
+        "application_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "window_id": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "display_fingerprint": {"type": "string", "minLength": 1, "maxLength": 256},
+        "element_index": {"type": "integer", "minimum": 0, "maximum": 4294967294}
+      }
+    },
+    "coordinate_action": {
+      "oneOf": [
+        {"$ref": "#/$defs/left_click"},
+        {"$ref": "#/$defs/type_text"},
+        {"$ref": "#/$defs/key"},
+        {"$ref": "#/$defs/mouse_move"},
+        {"$ref": "#/$defs/scroll"},
+        {"$ref": "#/$defs/drag"},
+        {"$ref": "#/$defs/right_click"},
+        {"$ref": "#/$defs/middle_click"},
+        {"$ref": "#/$defs/double_click"},
+        {"$ref": "#/$defs/triple_click"},
+        {"$ref": "#/$defs/left_mouse_down"},
+        {"$ref": "#/$defs/left_mouse_up"},
+        {"$ref": "#/$defs/hold_key"},
+        {"$ref": "#/$defs/wait"}
+      ]
+    },
+    "action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": {"const": "observe"},
+            "application": {"type": ["string", "null"], "minLength": 1, "maxLength": 255}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "action"],
+          "properties": {
+            "type": {"const": "coordinate"},
+            "action": {"$ref": "#/$defs/coordinate_action"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "target"],
+          "properties": {"type": {"const": "press"}, "target": {"$ref": "#/$defs/target"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "target", "value"],
+          "properties": {
+            "type": {"const": "set_value"},
+            "target": {"$ref": "#/$defs/target"},
+            "value": {"type": "string", "minLength": 1, "maxLength": 4096}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "target", "text", "selection_type"],
+          "properties": {
+            "type": {"const": "select_text"},
+            "target": {"$ref": "#/$defs/target"},
+            "text": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "prefix": {"type": ["string", "null"], "maxLength": 256},
+            "suffix": {"type": ["string", "null"], "maxLength": 256},
+            "selection_type": {"enum": ["text", "cursor_before", "cursor_after"]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "target", "direction", "pages"],
+          "properties": {
+            "type": {"const": "scroll_element"},
+            "target": {"$ref": "#/$defs/target"},
+            "direction": {"enum": ["up", "down", "left", "right"]},
+            "pages": {"type": "integer", "minimum": 1, "maximum": 10}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "target", "action_name"],
+          "properties": {
+            "type": {"const": "secondary_action"},
+            "target": {"$ref": "#/$defs/target"},
+            "action_name": {"type": "string", "minLength": 1, "maxLength": 128}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {"type": {"const": "read_clipboard"}}
+        }
+      ]
+    },
+    "left_click": {"allOf": [{"$ref": "#/$defs/click_shape"}, {"properties": {"type": {"const": "left_click"}}}]},
+    "right_click": {"allOf": [{"$ref": "#/$defs/click_shape"}, {"properties": {"type": {"const": "right_click"}}}]},
+    "middle_click": {"allOf": [{"$ref": "#/$defs/click_shape"}, {"properties": {"type": {"const": "middle_click"}}}]},
+    "double_click": {"allOf": [{"$ref": "#/$defs/click_shape"}, {"properties": {"type": {"const": "double_click"}}}]},
+    "triple_click": {"allOf": [{"$ref": "#/$defs/click_shape"}, {"properties": {"type": {"const": "triple_click"}}}]},
+    "mouse_move": {"allOf": [{"$ref": "#/$defs/click_shape"}, {"properties": {"type": {"const": "mouse_move"}}}]},
+    "click_shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "coordinate"],
+      "properties": {
+        "type": {"enum": ["left_click", "right_click", "middle_click", "double_click", "triple_click", "mouse_move"]},
+        "coordinate": {"$ref": "#/$defs/point"}
+      }
+    },
+    "type_text": {
+      "type": "object", "additionalProperties": false, "required": ["type", "text"],
+      "properties": {"type": {"const": "type"}, "text": {"type": "string", "minLength": 1, "maxLength": 4096}}
+    },
+    "key": {
+      "type": "object", "additionalProperties": false, "required": ["type", "key"],
+      "properties": {"type": {"const": "key"}, "key": {"type": "string", "minLength": 1, "maxLength": 64}}
+    },
+    "scroll": {
+      "type": "object", "additionalProperties": false, "required": ["type", "delta_x", "delta_y"],
+      "properties": {
+        "type": {"const": "scroll"},
+        "delta_x": {"type": "integer", "minimum": -10000, "maximum": 10000},
+        "delta_y": {"type": "integer", "minimum": -10000, "maximum": 10000},
+        "coordinate": {"$ref": "#/$defs/point"}
+      }
+    },
+    "drag": {
+      "type": "object", "additionalProperties": false, "required": ["type", "start", "end"],
+      "properties": {
+        "type": {"const": "left_click_drag"},
+        "start": {"$ref": "#/$defs/point"},
+        "end": {"$ref": "#/$defs/point"},
+        "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000}
+      }
+    },
+    "left_mouse_down": {
+      "type": "object", "additionalProperties": false, "required": ["type"],
+      "properties": {"type": {"const": "left_mouse_down"}}
+    },
+    "left_mouse_up": {
+      "type": "object", "additionalProperties": false, "required": ["type"],
+      "properties": {"type": {"const": "left_mouse_up"}}
+    },
+    "hold_key": {
+      "type": "object", "additionalProperties": false, "required": ["type", "key", "duration_ms"],
+      "properties": {
+        "type": {"const": "hold_key"},
+        "key": {"type": "string", "minLength": 1, "maxLength": 64},
+        "duration_ms": {"type": "integer", "minimum": 50, "maximum": 5000}
+      }
+    },
+    "wait": {
+      "type": "object", "additionalProperties": false, "required": ["type", "duration_ms"],
+      "properties": {
+        "type": {"const": "wait"},
+        "duration_ms": {"type": "integer", "minimum": 50, "maximum": 10000}
+      }
+    }
+  }
+}

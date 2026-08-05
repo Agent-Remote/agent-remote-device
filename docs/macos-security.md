@@ -57,3 +57,82 @@ Unsigned Swift Package builds exercise protocol and state-machine code only. A
 signed installation on a dedicated test Mac is required to verify Sandbox, XPC,
 ScreenCaptureKit, Accessibility, global Esc handling, window exclusion, and TCC
 restart behavior.
+
+## Accessibility observation boundary
+
+The capability-gated v2 path is implemented. Accessibility snapshots belong
+exclusively to the GUI Executor, which owns the TCC Accessibility permission and
+has no arbitrary network client. The Broker may relay only the bounded encrypted
+response; it does not inspect, cache, log, diff, or index AX content. Production
+enablement still requires the signed-installation and release evidence gates in
+this document.
+
+The snapshot renderer applies hard node, depth, per-node text, total text, and
+visible-row budgets before XPC serialization. It emits only normalized fields
+needed for UI decisions. Secure text values, password contents, invisible
+sensitive values, and unbounded browser WebArea descendants are redacted or
+elided. Browser WebArea/list traversal prefers visible children and merges
+`AXChildren`, `AXRows`, `AXContents`, and best-effort `AXVisibleChildren` without
+duplicates; semantically empty single-child wrappers are elided. Snapshot text,
+URLs, window titles, element values, frames, and reversible
+content hashes are prohibited from logs, audit records, crash metadata, and
+performance telemetry.
+
+Full/diff state is scoped to one complete device binding, active generation,
+approved application digest, selected window ID, display fingerprint, and state
+generation. A turn pause, generation rotation, application/window/display change,
+lost diff base, or Executor restart clears the AX cache and all element mappings.
+The next observation returns a bounded full state with an explicit reset marker.
+
+## State-bound element execution
+
+An element index is not a stable identifier. The Executor accepts it only with a
+device-generated current `state_id` and `state_generation`, then resolves it in the
+current in-memory snapshot. Before an AX action, it repeats the same live
+application, process, window, display, lease, sequence, approval, and control-level
+checks used for coordinate actions and verifies that the element exposes the exact
+requested action.
+
+Stale or foreign handles, missing elements, role/action changes, and ambiguous
+targets fail closed. The Executor never searches for a same-named replacement,
+reuses an index from another window, or silently falls back to coordinates.
+`set_value` and selection require full-control approval. Secure/password fields and
+credentials that require user hand-off cannot be populated through AX.
+
+Coordinate fallback remains bound to the last image actually returned to the
+model, not merely the most recent internal context observation. State generation
+and screenshot generation are therefore separate counters in v2.
+
+## Settle and image boundary
+
+The Executor separates lightweight live-context observation from pixel capture and
+encoding. AX-only and `none` observation modes still verify application, window,
+display, lease, sequence, and approval state, but do not create an image. Pixel
+capture occurs only for explicit screenshot, both-mode, visual fallback, or region
+inspection responses.
+
+Adaptive settling is bounded by the remaining lease and action deadline. It may
+sample AX busy/loading state and bounded normalized tree hashes, but it cannot read
+browser profiles, cookies, DOM debugging endpoints, local files, or another
+application. Two stable samples after a debounce interval are required for
+`settled`; timeout returns the newest safe state with an explicit timeout status.
+
+Compact, standard, and region image profiles preserve the exact returned pixel
+dimensions and coordinate frame in the screenshot context. Compression never
+weakens image signature, dimension, pixel-count, decode-allocation, or application
+identity checks.
+
+## Privacy-preserving performance telemetry
+
+Permitted metrics are action type, observation mode, node count, diff/image/frame
+byte counts, stage durations, settle status, error code, retry count, and fallback
+kind. AX text, URLs, titles, images, values, inputs, coordinates, clipboard data,
+and reversible content hashes are forbidden. Metrics must be bounded and attached
+only to the existing session/device audit identifiers already allowed by the data
+retention policy.
+
+The proxy implementation emits this fixed schema to an owner-only JSONL file,
+stops writing at 16 MiB, rejects symlink or unsafe existing targets, and disables
+the sink after any write failure. It never makes action success depend on metrics
+availability. Benchmark collection and comparison are documented in
+`docs/optimization-benchmark.md`.

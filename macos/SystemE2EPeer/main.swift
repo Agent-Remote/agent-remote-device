@@ -169,19 +169,37 @@ private enum SystemE2EPeer {
             try await relay.run(
                 actionHandler: { data in
                     let envelope = try DeviceIPCEnvelope.decode(data)
-                    let request = try ActionRequest.decodeStrict(
+                    let request = try ActionRequestV2.decodeStrict(
                         envelope.payload,
                         requiresLowercaseIdentifiers: true
                     )
-                    guard binding.matches(request.context), request.action == .screenshot else {
+                    guard binding.matches(request.context),
+                          request.action == .observe(application: nil),
+                          request.context.currentStateGeneration == 0,
+                          request.context.currentScreenshotGeneration == 0
+                    else {
                         throw SystemE2EFailure.bindingMismatch
                     }
-                    let response = ExecutorActionResponse(
+                    let response = ActionResponseV2(
                         requestID: request.requestID,
                         monotonicSequence: request.context.monotonicSequence,
-                        screenshotGeneration: request.context.currentScreenshotGeneration + 1,
+                        stateGeneration: request.context.currentStateGeneration + 1,
+                        screenshotGeneration: request.context.currentScreenshotGeneration,
+                        stateID: UUID(uuidString: "20000000-0000-4000-8000-000000000001"),
+                        applicationDigest: String(repeating: "a", count: 64),
+                        windowID: 1,
+                        displayFingerprint: "system-e2e-display",
+                        baseStateID: nil,
                         status: .success,
-                        message: "system-e2e-ok",
+                        message: "system-e2e-v2-ok",
+                        observation: AccessibilityObservation(
+                            kind: .full,
+                            reset: true,
+                            truncated: false,
+                            nodes: [],
+                            removed: []
+                        ),
+                        settle: SettleResult(status: .settled, elapsedMilliseconds: 1),
                         image: nil
                     )
                     let encoded = try JSONEncoder().encode(response)

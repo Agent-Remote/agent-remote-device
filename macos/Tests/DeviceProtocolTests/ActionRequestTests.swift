@@ -10,6 +10,43 @@ import Testing
     #expect(request.context.monotonicSequence == 7)
 }
 
+@Test func decodesCrossLanguageV2VectorAndRejectsUnknownFields() throws {
+    let url = try #require(Bundle.module.url(
+        forResource: "action-request-v2-valid",
+        withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let data = try Data(contentsOf: url)
+    let request = try ActionRequestV2.decodeStrict(data)
+    #expect(request.version == protocolVersionV2)
+    #expect(request.context.monotonicSequence == 8)
+    #expect(request.observation.hasValidParameters)
+    #expect(request.action.hasValidParameters)
+
+    var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    var observation = try #require(object["observation"] as? [String: Any])
+    observation["unbounded"] = true
+    object["observation"] = observation
+    #expect(throws: ActionRequestDecodingFailure.invalidStructure) {
+        try ActionRequestV2.decodeStrict(JSONSerialization.data(withJSONObject: object))
+    }
+}
+
+@Test func decodesCrossLanguageV2ResponseVector() throws {
+    let url = try #require(Bundle.module.url(
+        forResource: "action-response-v2-valid",
+        withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let response = try JSONDecoder().decode(ActionResponseV2.self, from: Data(contentsOf: url))
+
+    #expect(response.status == .success)
+    #expect(response.monotonicSequence == 8)
+    #expect(response.stateGeneration == 4)
+    #expect(response.observation?.kind == .diff)
+    #expect(response.observation?.nodes.first?.title == "Continue")
+}
+
 @Test func strictRequestDecoderRejectsUnknownFieldsAndNoncanonicalIdentifiers() throws {
     let url = try #require(Bundle.module.url(
         forResource: "action-request-valid",

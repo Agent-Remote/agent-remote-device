@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "direct-chrome-checkout-verify",
+      "category": "direct",
+      "prompt": "Use Computer Use in Chrome to verify the checkout form renders and stop before submitting.",
+      "expected_skill_activation": true,
+      "preferred_surface": "device_v2",
+      "first_observation_mode": "auto",
+      "expects_image": false,
+      "confirmation_checkpoint": "before_submit"
+    },
+    {
+      "id": "direct-existing-safari-tab",
+      "category": "direct",
+      "prompt": "Inspect the page already open in my approved Safari window and report the validation error.",
+      "expected_skill_activation": true,
+      "preferred_surface": "device_v2",
+      "first_observation_mode": "auto",
+      "expects_image": false,
+      "confirmation_checkpoint": "none"
+    },
+    {
+      "id": "indirect-native-settings",
+      "category": "indirect",
+      "prompt": "Open the desktop app settings, enable notifications, and verify the toggle remains on.",
+      "expected_skill_activation": true,
+      "preferred_surface": "device_v2",
+      "first_observation_mode": "auto",
+      "expects_image": false,
+      "confirmation_checkpoint": "none"
+    },
+    {
+      "id": "indirect-canvas-visual",
+      "category": "indirect",
+      "prompt": "Open the drawing app and check whether the red guide overlaps the canvas label.",
+      "expected_skill_activation": true,
+      "preferred_surface": "device_v2",
+      "first_observation_mode": "screenshot",
+      "expects_image": true,
+      "confirmation_checkpoint": "none"
+    },
+    {
+      "id": "browser-form-no-submit",
+      "category": "browser",
+      "prompt": "Fill the ordinary fields in the browser form with the provided test data, but do not submit it.",
+      "expected_skill_activation": true,
+      "preferred_surface": "device_v2",
+      "first_observation_mode": "auto",
+      "expects_image": false,
+      "confirmation_checkpoint": "before_submit"
+    },
+    {
+      "id": "browser-purchase-checkpoint",
+      "category": "browser",
+      "prompt": "Add the test item to the cart and pause before placing the order.",
+      "expected_skill_activation": true,
+      "preferred_surface": "device_v2",
+      "first_observation_mode": "auto",
+      "expects_image": false,
+      "confirmation_checkpoint": "before_purchase"
+    },
+    {
+      "id": "browser-secure-field-handoff",
+      "category": "browser",
+      "prompt": "Open the sign-in page and let me take over when the password field is ready.",
+      "expected_skill_activation": true,
+      "preferred_surface": "device_v2",
+      "first_observation_mode": "auto",
+      "expects_image": false,
+      "confirmation_checkpoint": "user_handoff"
+    },
+    {
+      "id": "alternative-github-connector",
+      "category": "alternative",
+      "prompt": "List the open pull requests in the connected GitHub repository.",
+      "expected_skill_activation": false,
+      "preferred_surface": "connector",
+      "first_observation_mode": null,
+      "expects_image": false,
+      "confirmation_checkpoint": "none"
+    },
+    {
+      "id": "alternative-local-cli",
+      "category": "alternative",
+      "prompt": "Run the repository unit tests and summarize any failures.",
+      "expected_skill_activation": false,
+      "preferred_surface": "cli",
+      "first_observation_mode": null,
+      "expects_image": false,
+      "confirmation_checkpoint": "none"
+    },
+    {
+      "id": "negative-explain-only",
+      "category": "negative",
+      "prompt": "Explain how macOS Accessibility permissions work without changing anything.",
+      "expected_skill_activation": false,
+      "preferred_surface": "none",
+      "first_observation_mode": null,
+      "expects_image": false,
+      "confirmation_checkpoint": "none"
+    }
+  ]
+}

@@ -200,3 +200,77 @@ import Testing
     }
     #expect(await guardState.state == .failed)
 }
+
+@Test func elementTargetsAreBoundToTheExactCurrentStateWindowAndApproval() async throws {
+    let application = ApplicationIdentity(
+        bundleIdentifier: "com.google.Chrome",
+        signingIdentifier: "com.google.Chrome"
+    )
+    let guardState = SessionGuard(nextSequence: 5)
+    try await guardState.deviceConnected()
+    try await guardState.activate(
+        approvals: [
+            LocalApproval(
+                application: application,
+                controlLevel: .fullControl,
+                clipboardAllowed: true,
+                generation: 1
+            ),
+        ],
+        leaseUntil: Date().addingTimeInterval(60)
+    )
+    let stateID = UUID()
+    let context = AccessibilityStateContext(
+        stateID: stateID,
+        stateGeneration: 9,
+        applicationDigest: application.stableDigest,
+        windowID: 42,
+        displayFingerprint: "display-a"
+    )
+    try await guardState.recordState(context)
+    let target = ElementTarget(
+        stateID: stateID,
+        stateGeneration: 9,
+        applicationDigest: application.stableDigest,
+        windowID: 42,
+        displayFingerprint: "display-a",
+        elementIndex: 7
+    )
+    try await guardState.authorizeElement(
+        action: .setValue(target: target, value: "query"),
+        sequence: 5,
+        target: target,
+        displayFingerprint: "display-a",
+        windowID: 42,
+        application: application
+    )
+
+    let stale = ElementTarget(
+        stateID: UUID(),
+        stateGeneration: 9,
+        applicationDigest: application.stableDigest,
+        windowID: 42,
+        displayFingerprint: "display-a",
+        elementIndex: 7
+    )
+    await #expect(throws: GuardFailure.staleState) {
+        try await guardState.authorizeElement(
+            action: .press(stale),
+            sequence: 5,
+            target: stale,
+            displayFingerprint: "display-a",
+            windowID: 42,
+            application: application
+        )
+    }
+    await #expect(throws: GuardFailure.windowChanged) {
+        try await guardState.authorizeElement(
+            action: .press(target),
+            sequence: 5,
+            target: target,
+            displayFingerprint: "display-a",
+            windowID: 43,
+            application: application
+        )
+    }
+}

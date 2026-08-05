@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Remote Device"
-  short_description: "Operate approved remote Mac applications reliably"
-  default_prompt: "Use $agent-remote-device to inspect and operate an approved Mac application."
+  short_description: "Operate remote Mac apps with efficient AX state"
+  default_prompt: "Use $agent-remote-device to operate an approved Mac app through fresh AX state and minimal screenshots."

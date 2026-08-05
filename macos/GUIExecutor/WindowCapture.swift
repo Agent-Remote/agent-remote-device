@@ -54,6 +54,40 @@ public struct CapturedWindow: @unchecked Sendable {
     }
 }
 
+public struct WindowContext: Equatable, Sendable {
+    public let windowID: CGWindowID
+    public let windowFrame: CGRect
+    public let processID: pid_t
+    public let application: ApplicationIdentity
+    public let displayFingerprint: String
+
+    public init(
+        windowID: CGWindowID,
+        windowFrame: CGRect,
+        processID: pid_t,
+        application: ApplicationIdentity,
+        displayFingerprint: String
+    ) {
+        self.windowID = windowID
+        self.windowFrame = windowFrame
+        self.processID = processID
+        self.application = application
+        self.displayFingerprint = displayFingerprint
+    }
+}
+
+public extension CapturedWindow {
+    var windowContext: WindowContext {
+        WindowContext(
+            windowID: windowID,
+            windowFrame: windowFrame,
+            processID: processID,
+            application: application,
+            displayFingerprint: displayFingerprint
+        )
+    }
+}
+
 public enum CaptureFailure: Error, Equatable, Sendable {
     case screenRecordingPermissionMissing
     case approvedApplicationNotFrontmost
@@ -130,43 +164,10 @@ public struct WindowCapture: Sendable {
         guard CGPreflightScreenCaptureAccess() else {
             throw CaptureFailure.screenRecordingPermissionMissing
         }
-        guard let frontmost = NSWorkspace.shared.frontmostApplication,
-              frontmost.bundleIdentifier == application.bundleIdentifier,
-              frontmost.bundleIdentifier != excludedBundleIdentifier
-        else {
-            throw CaptureFailure.approvedApplicationNotFrontmost
-        }
-        guard Self.signingIdentifier(for: frontmost) == application.signingIdentifier else {
-            throw CaptureFailure.signingIdentifierMismatch
-        }
-        let frontmostProcessID = frontmost.processIdentifier
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            true,
-            onScreenWindowsOnly: true
-        )
-        guard let window = content.windows.first(where: {
-            $0.owningApplication?.processID == frontmostProcessID
-                && $0.isOnScreen
-                && $0.frame.width > 1
-                && $0.frame.height > 1
-        }) else {
-            throw CaptureFailure.approvedWindowMissing
-        }
-        guard let display = Self.selectedDisplay(
-            for: window.frame,
-            from: content.displays
-        ) else {
-            throw CaptureFailure.displayMissing
-        }
-        let captureFrame = window.frame.intersection(display.frame)
-        guard !captureFrame.isNull, !captureFrame.isInfinite,
-              captureFrame.width > 0, captureFrame.height > 0
-        else {
-            throw CaptureFailure.displayMissing
-        }
+        let resolved = try await resolve(application: application)
         let size = Self.scaledSize(
-            sourceWidth: captureFrame.width,
-            sourceHeight: captureFrame.height,
+            sourceWidth: resolved.captureFrame.width,
+            sourceHeight: resolved.captureFrame.height,
             maximumWidth: profile.maximumWidth,
             maximumHeight: profile.maximumHeight
         )
@@ -181,10 +182,10 @@ public struct WindowCapture: Sendable {
         configuration.showsCursor = true
         configuration.capturesAudio = false
         configuration.sourceRect = Self.displayLocalRect(
-            captureFrame,
-            displayFrame: display.frame
+            resolved.captureFrame,
+            displayFrame: resolved.display.frame
         )
-        let filter = SCContentFilter(display: display, including: [window])
+        let filter = SCContentFilter(display: resolved.display, including: [resolved.window])
         let image = try await SCScreenshotManager.captureImage(
             contentFilter: filter,
             configuration: configuration
@@ -194,13 +195,73 @@ public struct WindowCapture: Sendable {
             pngData: pngData,
             pixelWidth: UInt16(size.width),
             pixelHeight: UInt16(size.height),
-            windowID: window.windowID,
-            windowFrame: window.frame,
-            coordinateFrame: captureFrame,
-            processID: frontmostProcessID,
+            windowID: resolved.window.windowID,
+            windowFrame: resolved.window.frame,
+            coordinateFrame: resolved.captureFrame,
+            processID: resolved.processID,
             application: application,
-            displayFingerprint: Self.displayFingerprint(content.displays, selected: display)
+            displayFingerprint: Self.displayFingerprint(
+                resolved.content.displays,
+                selected: resolved.display
+            )
         )
+    }
+
+    @MainActor
+    public func context(application: ApplicationIdentity) async throws -> WindowContext {
+        let resolved = try await resolve(application: application)
+        return WindowContext(
+            windowID: resolved.window.windowID,
+            windowFrame: resolved.window.frame,
+            processID: resolved.processID,
+            application: application,
+            displayFingerprint: Self.displayFingerprint(
+                resolved.content.displays,
+                selected: resolved.display
+            )
+        )
+    }
+
+    @MainActor
+    private func resolve(application: ApplicationIdentity) async throws -> (
+        processID: pid_t,
+        content: SCShareableContent,
+        window: SCWindow,
+        display: SCDisplay,
+        captureFrame: CGRect
+    ) {
+        guard let frontmost = NSWorkspace.shared.frontmostApplication,
+              frontmost.bundleIdentifier == application.bundleIdentifier,
+              frontmost.bundleIdentifier != excludedBundleIdentifier
+        else {
+            throw CaptureFailure.approvedApplicationNotFrontmost
+        }
+        guard Self.signingIdentifier(for: frontmost) == application.signingIdentifier else {
+            throw CaptureFailure.signingIdentifierMismatch
+        }
+        let processID = frontmost.processIdentifier
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            true,
+            onScreenWindowsOnly: true
+        )
+        guard let window = content.windows.first(where: {
+            $0.owningApplication?.processID == processID
+                && $0.isOnScreen
+                && $0.frame.width > 1
+                && $0.frame.height > 1
+        }) else {
+            throw CaptureFailure.approvedWindowMissing
+        }
+        guard let display = Self.selectedDisplay(for: window.frame, from: content.displays) else {
+            throw CaptureFailure.displayMissing
+        }
+        let captureFrame = window.frame.intersection(display.frame)
+        guard !captureFrame.isNull, !captureFrame.isInfinite,
+              captureFrame.width > 0, captureFrame.height > 0
+        else {
+            throw CaptureFailure.displayMissing
+        }
+        return (processID, content, window, display, captureFrame)
     }
 
     public func activate(
