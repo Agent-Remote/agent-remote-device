@@ -478,7 +478,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                 completeRelay(relay)
             } catch {
                 guard !Task.isCancelled else { return }
-                logger.error("Relay failed: \(String(describing: error), privacy: .public)")
+                logger.error("Relay failed")
                 await abortAfterRelayFailure(configuration.binding, relay: relay)
             }
         }
