@@ -6,6 +6,33 @@ import Foundation
 import GUIExecutor
 import Testing
 
+@Test func executorReplaysTheLastCompletedRequestWithoutExecutingItTwice() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let update = try envelope(payload: JSONEncoder().encode(session)).encoded()
+    try await controller.updateSession(update)
+    let request = try actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        screenshotGeneration: 0,
+        action: .screenshot
+    )
+
+    let first = try await controller.performAction(request)
+    let replay = try await controller.performAction(request)
+
+    #expect(replay == first)
+    #expect(await recorder.captureCount == 1)
+
+    try await controller.updateSession(update)
+    _ = try await controller.performAction(request)
+    #expect(await recorder.captureCount == 2)
+}
+
 @Test func executorNegotiatesV2StateAndScreenshotGenerationsIndependently() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -127,6 +154,127 @@ import Testing
     #expect(stale.status == .failed)
     #expect(stale.message.hasPrefix("fresh_observation_required:"))
     #expect(await recorder.elementActions == [.press(target)])
+}
+
+@Test func executorRunsKeyboardContextActionWithoutScreenshotButRejectsCoordinates() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let keyboardData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.key("CMD+A"))
+    ))
+    let keyboard = try JSONDecoder().decode(ActionResponseV2.self, from: keyboardData)
+    #expect(keyboard.status == .success)
+    #expect(await recorder.actions == [.key("CMD+A")])
+
+    let clickData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        stateGeneration: 2,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.leftClick(Point(x: 10, y: 10)))
+    ))
+    let click = try JSONDecoder().decode(ActionResponseV2.self, from: clickData)
+    #expect(click.status == .failed)
+    #expect(click.message.hasPrefix("fresh_screenshot_required:"))
+    #expect(await recorder.actions == [.key("CMD+A")])
+}
+
+@Test func typedActionWaitsForFreshAccessibilityText() async throws {
+    let recorder = RuntimeRecorder()
+    let typedText = "fresh typed text"
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            observationValues: [nil, nil, typedText]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let typedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .coordinate(.type(typedText))
+    ))
+    let typed = try JSONDecoder().decode(ActionResponseV2.self, from: typedData)
+
+    #expect(typed.status == .success)
+    #expect(typed.observation?.nodes.contains { $0.value == typedText } == true)
+    #expect(await recorder.actions == [.type(typedText)])
 }
 
 @Test func executorSessionControllerActivatesStopsAndEndsOneBoundSession() async throws {
@@ -759,6 +907,170 @@ import Testing
     #expect(executor.updateCount == 1)
 }
 
+@Test func networkBrokerForwardsV2ObserveWithoutAbortingRelay() async throws {
+    let executor = ExecutorStub()
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let lifecycleRecorder = LifecycleRecorder()
+    let observe = try actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(),
+        action: .observe(application: "com.apple.Safari")
+    )
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        abortProvider: { request in
+            await lifecycleRecorder.recordAbort(request)
+            return BrokerPendingSession(
+                binding: DeviceSessionBinding(
+                    userID: request.binding.userID,
+                    deviceID: request.binding.deviceID,
+                    toolSessionID: request.binding.toolSessionID,
+                    deviceSessionID: request.binding.deviceSessionID,
+                    nodeID: request.binding.nodeID,
+                    platform: request.binding.platform,
+                    generation: request.binding.generation + 1
+                ),
+                expiresAt: Date().addingTimeInterval(60)
+            )
+        },
+        relayProvider: { _ in TriggerActionRelay(request: observe) },
+        lockProvider: { _ in }
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    for _ in 0 ..< 100 where executor.actioned == nil {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(executor.actioned == observe as NSData)
+    #expect(await lifecycleRecorder.abortRequest == nil)
+
+    let abortRequest = BrokerAbortRequest(binding: session.binding, reason: .escape)
+    let stop = try envelope(payload: JSONEncoder().encode(abortRequest)).encoded() as NSData
+    let stopError = await withCheckedContinuation { continuation in
+        broker.stopCurrentAction(stop) { continuation.resume(returning: $0?.code) }
+    }
+    #expect(stopError == nil)
+}
+
+@Test func slowExecutorActionUsesItsOwnTimeoutWithoutAbortingRelay() async throws {
+    let executor = ExecutorStub(actionReplyDelaySeconds: 0.03)
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let lifecycleRecorder = LifecycleRecorder()
+    let lockRecorder = LockRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        abortProvider: { request in
+            await lifecycleRecorder.recordAbort(request)
+            throw DeviceIPCFailure.invalidMessage
+        },
+        relayProvider: { configuration in
+            TriggerActionRelay(request: try actionEnvelope(
+                configuration: configuration,
+                requestID: UUID(),
+                sequence: 1,
+                screenshotGeneration: 0,
+                action: .screenshot
+            ))
+        },
+        lockProvider: { binding in await lockRecorder.record(binding) },
+        xpcReplyTimeout: .milliseconds(10),
+        actionReplyTimeout: .milliseconds(100)
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    #expect(await lockRecorder.value() == session.binding)
+    #expect(await lifecycleRecorder.abortRequest == nil)
+
+    let stop = try envelope(payload: JSONEncoder().encode(
+        BrokerAbortRequest(binding: session.binding, reason: .escape)
+    )).encoded() as NSData
+    _ = await withCheckedContinuation { continuation in
+        broker.stopCurrentAction(stop) { continuation.resume(returning: $0?.code) }
+    }
+}
+
+@Test func transientExecutorRenewalFailureRetriesWithoutAbortingRelay() async throws {
+    let executor = ExecutorStub(renewFailuresBeforeSuccess: 1)
+    let session = configuration(leaseUntil: Date().addingTimeInterval(3))
+    let lifecycleRecorder = LifecycleRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        abortProvider: { request in
+            await lifecycleRecorder.recordAbort(request)
+            throw DeviceIPCFailure.invalidMessage
+        },
+        relayProvider: { _ in HoldingRelay(cancellationRecorder: CancellationRecorder()) },
+        lockProvider: { _ in },
+        renewProvider: { configuration in
+            ExecutorSessionConfiguration(
+                binding: configuration.binding,
+                leaseUntil: Date().addingTimeInterval(3),
+                approvals: configuration.approvals,
+                capabilities: configuration.capabilities
+            )
+        },
+        renewalRetryDelaySeconds: 0.01
+    )
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    for _ in 0 ..< 300 where executor.renewalCount() < 2 {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(executor.renewalCount() == 2)
+    #expect(await lifecycleRecorder.abortRequest == nil)
+
+    let stop = try envelope(payload: JSONEncoder().encode(
+        BrokerAbortRequest(binding: session.binding, reason: .escape)
+    )).encoded() as NSData
+    _ = await withCheckedContinuation { continuation in
+        broker.stopCurrentAction(stop) { continuation.resume(returning: $0?.code) }
+    }
+}
+
 @Test func unresponsiveExecutorUpdateTimesOutWithoutStartingRelay() async throws {
     let executor = ExecutorStub(updateResponds: false)
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
@@ -853,7 +1165,7 @@ import Testing
     )
     let ended = try JSONDecoder().decode(BrokerEndRequest.self, from: endedEnvelope.payload)
     #expect(ended == BrokerEndRequest(binding: session.binding))
-    #expect(await approvalUI.waitForEvents(2) == [.turnStopped, .sessionEnded])
+    #expect(await approvalUI.waitForEvents(1) == [.sessionEnded])
 }
 
 @Test func completedRemoteSessionDoesNotAbortWhenRelayClosesWithAnError() async throws {
@@ -977,7 +1289,7 @@ import Testing
 
     #expect(approvalError == nil)
     #expect(await lifecycleRecorder.waitForEnd() == BrokerEndRequest(binding: session.binding))
-    #expect(await approvalUI.waitForEvents(3) == [.turnStopped, .turnStarted, .sessionEnded])
+    #expect(await approvalUI.waitForEvents(1) == [.sessionEnded])
     #expect(executor.paused != nil)
     #expect(executor.resumed != nil)
     #expect(executor.actioned == second as NSData)
@@ -1657,10 +1969,16 @@ private final class UnresponsiveApprovalUIStub: NSObject, ApprovalUIXPCProtocol,
 private actor RuntimeStub: GUIActionRuntime {
     private let guardState: SessionGuard
     private let recorder: RuntimeRecorder
+    private var observationValues: [String?]
 
-    init(guardState: SessionGuard, recorder: RuntimeRecorder) {
+    init(
+        guardState: SessionGuard,
+        recorder: RuntimeRecorder,
+        observationValues: [String?] = []
+    ) {
         self.guardState = guardState
         self.recorder = recorder
+        self.observationValues = observationValues
     }
 
     func capture(
@@ -1705,6 +2023,7 @@ private actor RuntimeStub: GUIActionRuntime {
         baseStateID: UUID?,
         policy _: ObservationPolicy
     ) async throws -> AccessibilitySnapshotResult {
+        let value = observationValues.isEmpty ? nil : observationValues.removeFirst()
         let state = AccessibilityStateContext(
             stateID: UUID(),
             stateGeneration: stateGeneration,
@@ -1725,7 +2044,7 @@ private actor RuntimeStub: GUIActionRuntime {
                     role: "AXButton",
                     title: "Continue",
                     label: nil,
-                    value: nil,
+                    value: value,
                     placeholder: nil,
                     url: nil,
                     frame: [0, 0, 20, 20],
@@ -1753,6 +2072,24 @@ private actor RuntimeStub: GUIActionRuntime {
         )
         try await guardState.accept(sequence: sequence)
         await recorder.executedElement(action)
+    }
+
+    func executeContextAction(
+        action: Action,
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        context: WindowContext
+    ) async throws {
+        try await guardState.authorizeContextAction(
+            action: action,
+            sequence: sequence,
+            stateGeneration: stateGeneration,
+            displayFingerprint: context.displayFingerprint,
+            windowID: context.windowID,
+            application: context.application
+        )
+        try await guardState.accept(sequence: sequence)
+        await recorder.executed(action)
     }
 
     func settle(
@@ -1874,15 +2211,22 @@ private final class ExecutorStub: NSObject, GUIExecutorXPCProtocol, @unchecked S
     private(set) var resumed: NSData?
     private(set) var updateCount = 0
     private let updateResponds: Bool
+    private let actionReplyDelaySeconds: TimeInterval
+    private var remainingRenewFailures: Int
+    private var renewCount = 0
 
     init(
         stopFails: Bool = false,
         endFails: Bool = false,
-        updateResponds: Bool = true
+        updateResponds: Bool = true,
+        actionReplyDelaySeconds: TimeInterval = 0,
+        renewFailuresBeforeSuccess: Int = 0
     ) {
         self.stopFails = stopFails
         self.endFails = endFails
         self.updateResponds = updateResponds
+        self.actionReplyDelaySeconds = actionReplyDelaySeconds
+        remainingRenewFailures = renewFailuresBeforeSuccess
     }
 
     func protocolVersion(reply: @escaping (UInt64) -> Void) {
@@ -1905,15 +2249,25 @@ private final class ExecutorStub: NSObject, GUIExecutorXPCProtocol, @unchecked S
     func renewSession(_ request: NSData, reply: @escaping (NSError?) -> Void) {
         lock.lock()
         renewed = request
+        renewCount += 1
+        let shouldFail = remainingRenewFailures > 0
+        remainingRenewFailures = max(0, remainingRenewFailures - 1)
         lock.unlock()
-        reply(nil)
+        reply(shouldFail ? DeviceIPCFailure.serviceUnavailable.nsError : nil)
     }
 
     func performAction(_ request: NSData, reply: @escaping (NSData?, NSError?) -> Void) {
         lock.lock()
         actioned = request
         lock.unlock()
+        if actionReplyDelaySeconds > 0 {
+            Thread.sleep(forTimeInterval: actionReplyDelaySeconds)
+        }
         reply(request, nil)
+    }
+
+    func renewalCount() -> Int {
+        lock.withLock { renewCount }
     }
 
     func pauseTurn(_ request: NSData, reply: @escaping (NSError?) -> Void) {

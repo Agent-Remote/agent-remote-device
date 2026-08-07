@@ -119,6 +119,22 @@ impl Action {
             _ => true,
         }
     }
+
+    pub fn requires_model_visible_screenshot(&self) -> bool {
+        match self {
+            Self::LeftClick { .. }
+            | Self::MouseMove { .. }
+            | Self::LeftClickDrag { .. }
+            | Self::RightClick { .. }
+            | Self::MiddleClick { .. }
+            | Self::DoubleClick { .. }
+            | Self::TripleClick { .. }
+            | Self::LeftMouseDown
+            | Self::LeftMouseUp => true,
+            Self::Scroll { coordinate, .. } => coordinate.is_some(),
+            _ => false,
+        }
+    }
 }
 
 fn valid_key(key: &str) -> bool {

@@ -20,6 +20,7 @@ use tokio::{
 
 const MAX_HOOK_INPUT_BYTES: u64 = 64 * 1024;
 const MAX_LOCAL_FRAME_BYTES: usize = 1024;
+const WARM_CONNECTION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum NotifyEvent {
@@ -90,7 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("notify mode does not accept transport paths".into());
         }
         validate_hook_input(event)?;
-        notify_running_proxy(&args.lifecycle_socket, event.into()).await?;
+        // Claude lifecycle hooks are non-blocking cleanup hints. The active
+        // device lease may already be gone when Stop or SessionEnd runs, so a
+        // delivery failure must not surface as a failed user turn.
+        let _ = notify_running_proxy(&args.lifecycle_socket, event.into()).await;
         return Ok(());
     }
 
@@ -131,10 +135,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn warm_connection(transport: Arc<ActivatedUnixDeviceTransport>) {
     loop {
         match transport.ensure_connected().await {
-            Ok(()) => return,
-            Err(TransportError::NotActivated | TransportError::BridgeConnect(_)) => {
-                sleep(std::time::Duration::from_millis(100)).await;
-            }
+            Ok(())
+            | Err(
+                TransportError::NotActivated
+                | TransportError::LeaseExpired
+                | TransportError::Poisoned
+                | TransportError::BridgeConnect(_)
+                | TransportError::BridgeHandshakeIo { .. }
+                | TransportError::TlsHandshakeIo(_),
+            ) => sleep(WARM_CONNECTION_POLL_INTERVAL).await,
             Err(_) => return,
         }
     }
@@ -311,5 +320,19 @@ mod tests {
         let socket_path = directory.path().join("lifecycle.sock");
         std::fs::write(&socket_path, b"occupied").expect("write occupied path");
         assert!(bind_lifecycle_socket(&socket_path).is_err());
+    }
+
+    #[tokio::test]
+    async fn warm_connection_keeps_watching_after_context_is_not_activated() {
+        let directory = tempdir().expect("temporary directory");
+        let transport = Arc::new(ActivatedUnixDeviceTransport::new(
+            &directory.path().join("missing-context.json"),
+            &directory.path().join("missing-bridge.sock"),
+        ));
+        let task = tokio::spawn(warm_connection(transport));
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!task.is_finished());
+        task.abort();
     }
 }

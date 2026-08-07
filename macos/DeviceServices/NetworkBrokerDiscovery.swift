@@ -117,10 +117,10 @@ public actor NetworkBrokerDiscoveryCoordinator {
             transport: transport,
             now: now
         )
-        let active = try await client.approve(
+        let active = try await approve(
             pendingSession,
-            approvals: decision.approvals,
-            result: decision.result,
+            decision: decision,
+            client: client,
             now: now
         )
         self.pendingSession = nil
@@ -280,5 +280,60 @@ public actor NetworkBrokerDiscoveryCoordinator {
             throw NetworkBrokerControlPlaneFailure.invalidRequest
         }
         try await outboundPolicyChecker.verify(controlPlaneHost: host, now: now)
+    }
+
+    private func approve(
+        _ session: ControlPlaneDeviceSession,
+        decision: BrokerApprovalDecision,
+        client: NetworkBrokerControlPlaneClient,
+        now: Date
+    ) async throws -> ControlPlaneDeviceSession {
+        do {
+            return try await client.approve(
+                session,
+                approvals: decision.approvals,
+                result: decision.result,
+                now: now
+            )
+        } catch {
+            guard decision.result == .allowed, Self.isTransientApprovalFailure(error) else {
+                throw error
+            }
+
+            // A timed-out POST may have committed. Reconcile before retrying so approval
+            // remains bounded and never creates a second control-plane transition.
+            let inbox = try await client.deviceInbox(now: now)
+            guard let reconciled = inbox.first(where: { $0.id == session.id }),
+                  reconciled.binding == session.binding
+            else {
+                throw NetworkBrokerControlPlaneFailure.bindingMismatch
+            }
+            if reconciled.status == .active {
+                guard reconciled.leaseUntil != nil else {
+                    throw NetworkBrokerControlPlaneFailure.invalidResponse
+                }
+                return reconciled
+            }
+            guard reconciled.status == .pendingUserApproval else {
+                throw NetworkBrokerControlPlaneFailure.bindingMismatch
+            }
+            return try await client.approve(
+                reconciled,
+                approvals: decision.approvals,
+                result: decision.result,
+                now: now
+            )
+        }
+    }
+
+    private static func isTransientApprovalFailure(_ error: Error) -> Bool {
+        guard let failure = error as? URLError else { return false }
+        switch failure.code {
+        case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .networkConnectionLost, .notConnectedToInternet:
+            return true
+        default:
+            return false
+        }
     }
 }

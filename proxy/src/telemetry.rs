@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
     transport::{DeviceResult, DeviceResultV2, TransportError},
 };
 
-pub const OPTIMIZATION_METRIC_SCHEMA_VERSION: u8 = 1;
+pub const OPTIMIZATION_METRIC_SCHEMA_VERSION: u8 = 2;
 const MAX_METRICS_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +62,7 @@ pub enum MetricErrorCode {
 #[serde(deny_unknown_fields)]
 pub struct OptimizationEvent {
     pub schema_version: u8,
+    pub timestamp: DateTime<Utc>,
     pub path: ExecutionPath,
     pub action: MetricAction,
     pub observation_mode: Option<ObservationMode>,
@@ -90,6 +92,7 @@ impl OptimizationEvent {
             .unwrap_or(0);
         Self {
             schema_version: OPTIMIZATION_METRIC_SCHEMA_VERSION,
+            timestamp: Utc::now(),
             path: ExecutionPath::V1,
             action: metric_action_v1(action),
             observation_mode: Some(ObservationMode::Screenshot),
@@ -106,14 +109,15 @@ impl OptimizationEvent {
             model_visible_image: result.screenshot.is_some(),
             coordinate_fallback: false,
             stale_target: false,
-            retry_count: 0,
-            manual_recovery: false,
+            retry_count: result.retry_count,
+            manual_recovery: result.manual_recovery,
         }
     }
 
     pub fn failure_v1(action: &Action, error: &TransportError, elapsed: Duration) -> Self {
         Self {
             schema_version: OPTIMIZATION_METRIC_SCHEMA_VERSION,
+            timestamp: Utc::now(),
             path: ExecutionPath::V1,
             action: metric_action_v1(action),
             observation_mode: Some(ObservationMode::Screenshot),
@@ -159,9 +163,16 @@ impl OptimizationEvent {
             .as_ref()
             .map(|image| bounded_u32(image.base64_data.len()))
             .unwrap_or(0);
-        let coordinate = matches!(action, ActionV2::Coordinate { .. });
+        let coordinate = matches!(
+            action,
+            ActionV2::Coordinate { action } if action.requires_model_visible_screenshot()
+        );
+        let stale_target = result
+            .message
+            .contains("Typed text was not visible in AX before the freshness deadline.");
         Self {
             schema_version: OPTIMIZATION_METRIC_SCHEMA_VERSION,
+            timestamp: Utc::now(),
             path: ExecutionPath::V2,
             action: metric_action_v2(action),
             observation_mode: Some(policy.mode),
@@ -177,9 +188,9 @@ impl OptimizationEvent {
             settle_status: Some(result.settle.status),
             model_visible_image: result.screenshot.is_some(),
             coordinate_fallback: coordinate,
-            stale_target: false,
-            retry_count: 0,
-            manual_recovery: false,
+            stale_target,
+            retry_count: result.retry_count,
+            manual_recovery: result.manual_recovery,
         }
     }
 
@@ -193,6 +204,7 @@ impl OptimizationEvent {
         let stale_target = matches!(error_code, MetricErrorCode::StaleTarget);
         Self {
             schema_version: OPTIMIZATION_METRIC_SCHEMA_VERSION,
+            timestamp: Utc::now(),
             path: ExecutionPath::V2,
             action: metric_action_v2(action),
             observation_mode: Some(policy.mode),
@@ -446,7 +458,8 @@ mod tests {
     fn summary_is_zero_content_and_computes_release_metrics() {
         let events = vec![
             OptimizationEvent {
-                schema_version: 1,
+                schema_version: OPTIMIZATION_METRIC_SCHEMA_VERSION,
+                timestamp: Utc::now(),
                 path: ExecutionPath::V1,
                 action: MetricAction::Coordinate,
                 observation_mode: Some(ObservationMode::Screenshot),
@@ -467,7 +480,8 @@ mod tests {
                 manual_recovery: false,
             },
             OptimizationEvent {
-                schema_version: 1,
+                schema_version: OPTIMIZATION_METRIC_SCHEMA_VERSION,
+                timestamp: Utc::now(),
                 path: ExecutionPath::V2,
                 action: MetricAction::Press,
                 observation_mode: Some(ObservationMode::AxDiff),
@@ -515,7 +529,8 @@ mod tests {
         let path = directory.path().join("metrics.jsonl");
         let mut metrics = OptimizationMetrics::with_jsonl_sink(&path).expect("metrics sink");
         metrics.record(OptimizationEvent {
-            schema_version: 1,
+            schema_version: OPTIMIZATION_METRIC_SCHEMA_VERSION,
+            timestamp: Utc::now(),
             path: ExecutionPath::V2,
             action: MetricAction::Observe,
             observation_mode: Some(ObservationMode::Auto),
@@ -540,6 +555,7 @@ mod tests {
         let line = std::fs::read_to_string(&path).expect("metrics JSONL");
         assert_eq!(line.lines().count(), 1);
         assert!(line.ends_with('\n'));
+        assert!(line.contains("\"timestamp\":"));
         let _: OptimizationEvent = serde_json::from_str(line.trim_end()).expect("event JSON");
 
         let target = directory.path().join("target");
@@ -550,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn every_v2_coordinate_action_counts_as_a_fallback() {
+    fn only_screen_coordinate_actions_count_as_a_fallback() {
         let event = OptimizationEvent::success_v2(
             &ActionV2::Coordinate {
                 action: Action::Key {
@@ -559,7 +575,8 @@ mod tests {
             },
             &ObservationPolicy::default(),
             &DeviceResultV2 {
-                message: "done".to_owned(),
+                message: "Action completed. Typed text was not visible in AX before the freshness deadline."
+                    .to_owned(),
                 state_generation: 1,
                 screenshot_generation: 0,
                 state_id: uuid::Uuid::new_v4(),
@@ -573,11 +590,45 @@ mod tests {
                     elapsed_ms: 0,
                 },
                 screenshot: None,
+                retry_count: 2,
+                manual_recovery: true,
             },
             Duration::from_millis(1),
         );
-        assert!(event.coordinate_fallback);
+        assert!(!event.coordinate_fallback);
         assert!(!event.model_visible_image);
+        assert!(event.stale_target);
+        assert_eq!(event.retry_count, 2);
+        assert!(event.manual_recovery);
+
+        let click = OptimizationEvent::success_v2(
+            &ActionV2::Coordinate {
+                action: Action::LeftClick {
+                    coordinate: [10, 20],
+                },
+            },
+            &ObservationPolicy::default(),
+            &DeviceResultV2 {
+                message: "done".to_owned(),
+                state_generation: 1,
+                screenshot_generation: 1,
+                state_id: uuid::Uuid::new_v4(),
+                application_digest: "a".repeat(64),
+                window_id: 1,
+                display_fingerprint: "display".to_owned(),
+                base_state_id: None,
+                observation: None,
+                settle: crate::protocol_v2::SettleResult {
+                    status: SettleStatus::NotRequested,
+                    elapsed_ms: 0,
+                },
+                screenshot: None,
+                retry_count: 0,
+                manual_recovery: false,
+            },
+            Duration::from_millis(1),
+        );
+        assert!(click.coordinate_fallback);
     }
 
     fn object_keys(value: &serde_json::Value) -> std::collections::BTreeSet<&str> {

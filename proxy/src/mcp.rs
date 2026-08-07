@@ -381,6 +381,41 @@ impl ActParameters {
             }
         }
     }
+
+    fn shape_error(&self) -> &'static str {
+        match self.kind {
+            ActKind::Press => "press requires only element_index",
+            ActKind::SetValue => "set_value requires element_index and value",
+            ActKind::SelectText => {
+                "select_text requires element_index and text; prefix, suffix, and selection_type are optional"
+            }
+            ActKind::ScrollElement => {
+                "scroll_element requires element_index and direction; pages is optional"
+            }
+            ActKind::SecondaryAction => {
+                "secondary_action requires element_index and action_name"
+            }
+            ActKind::LeftClick
+            | ActKind::RightClick
+            | ActKind::MiddleClick
+            | ActKind::DoubleClick
+            | ActKind::TripleClick
+            | ActKind::MouseMove => "this coordinate action requires only coordinate",
+            ActKind::LeftClickDrag => {
+                "left_click_drag requires start and end; duration_ms is optional"
+            }
+            ActKind::LeftMouseDown | ActKind::LeftMouseUp => {
+                "mouse button state actions do not accept additional fields"
+            }
+            ActKind::Type => "type requires only text",
+            ActKind::Key => "key requires only key",
+            ActKind::HoldKey => "hold_key requires key and duration_ms",
+            ActKind::Scroll => {
+                "scroll requires delta_x and delta_y; coordinate is optional; direction is not accepted"
+            }
+            ActKind::Wait => "wait requires only duration_ms",
+        }
+    }
 }
 
 impl DeviceMcp {
@@ -574,7 +609,11 @@ impl DeviceMcp {
         let total = actions.len();
         let mut final_result = None;
         for (index, action) in actions.into_iter().enumerate() {
-            let observation = if index + 1 == total {
+            let typed_text = match &action {
+                Action::Type { text } => Some(text.clone()),
+                _ => None,
+            };
+            let observation = if index + 1 == total || typed_text.is_some() {
                 ObservationPolicy::default()
             } else {
                 observation_none()
@@ -615,6 +654,14 @@ impl DeviceMcp {
                 }
             };
             self.remember_v2_state(&result).await;
+            if let Some(text) = typed_text {
+                if !result_confirms_typed_text(&result, &text) {
+                    return Err(format!(
+                        "input sequence stopped at step {} of {total}: typed text was not observed in the focused application; no subsequent key was sent",
+                        index + 1,
+                    ));
+                }
+            }
             final_result = Some(result);
         }
         device_result_v2(final_result.expect("non-empty sequence produces a result")).await
@@ -644,6 +691,34 @@ impl DeviceMcp {
             element_index,
         })
     }
+}
+
+fn result_confirms_typed_text(result: &DeviceResultV2, text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    let without_scheme = normalized
+        .strip_prefix("https://")
+        .or_else(|| normalized.strip_prefix("http://"))
+        .unwrap_or(&normalized)
+        .trim_end_matches('/');
+    let needles = [normalized.as_str(), without_scheme];
+    result.observation.as_ref().is_some_and(|observation| {
+        observation.nodes.iter().any(|node| {
+            [
+                node.title.as_deref(),
+                node.label.as_deref(),
+                node.value.as_deref(),
+                node.url.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::to_lowercase)
+            .any(|value| {
+                needles
+                    .iter()
+                    .any(|needle| !needle.is_empty() && value.contains(needle))
+            })
+        })
+    })
 }
 
 fn observation_none() -> ObservationPolicy {
@@ -825,7 +900,7 @@ impl DeviceMcp {
         Parameters(params): Parameters<ActParameters>,
     ) -> Result<CallToolResult, String> {
         if !params.validate_shape() {
-            return Err("act fields do not match the requested action type".to_owned());
+            return Err(params.shape_error().to_owned());
         }
         let supports_v2 = self
             .transport
@@ -1011,7 +1086,7 @@ impl DeviceMcp {
     }
 
     #[tool(
-        description = "Focus an optional image coordinate, send an optional shortcut, type text, send an optional final key, optionally wait, and return only the final screenshot. Prefer this for browser address bars, searches, and forms when the intermediate focus changes are deterministic"
+        description = "Focus an optional image coordinate, send an optional shortcut, type text, send an optional final key, optionally wait, and return only the final state. A screenshot is required only when coordinate is provided"
     )]
     async fn input_text(
         &self,
@@ -1262,6 +1337,8 @@ mod tests {
             Ok(DeviceResult {
                 message: "ok".to_owned(),
                 screenshot: None,
+                retry_count: 0,
+                manual_recovery: false,
             })
         }
     }
@@ -1276,6 +1353,8 @@ mod tests {
             Ok(DeviceResult {
                 message: "ok".to_owned(),
                 screenshot: None,
+                retry_count: 0,
+                manual_recovery: false,
             })
         }
     }
@@ -1286,6 +1365,8 @@ mod tests {
             Ok(DeviceResult {
                 message: "ok".to_owned(),
                 screenshot: Some(self.screenshot.clone()),
+                retry_count: 0,
+                manual_recovery: false,
             })
         }
     }
@@ -1376,6 +1457,90 @@ mod tests {
         }))
         .expect("known fields");
         assert!(!invalid.validate_shape());
+
+        let missing_text: ActParameters = serde_json::from_value(serde_json::json!({
+            "type": "select_text",
+            "element_index": 1,
+            "selection_type": "text"
+        }))
+        .expect("known fields");
+        assert!(!missing_text.validate_shape());
+        assert_eq!(
+            missing_text.shape_error(),
+            "select_text requires element_index and text; prefix, suffix, and selection_type are optional"
+        );
+
+        let conflicting_scroll: ActParameters = serde_json::from_value(serde_json::json!({
+            "type": "scroll",
+            "direction": "down",
+            "delta_x": 0,
+            "delta_y": 400
+        }))
+        .expect("known fields");
+        assert!(!conflicting_scroll.validate_shape());
+        assert_eq!(
+            conflicting_scroll.shape_error(),
+            "scroll requires delta_x and delta_y; coordinate is optional; direction is not accepted"
+        );
+    }
+
+    #[test]
+    fn typed_text_confirmation_matches_ax_text_and_normalized_urls() {
+        use crate::protocol_v2::{
+            AccessibilityNode, AccessibilityObservation, AccessibilityObservationKind,
+            SettleResult, SettleStatus,
+        };
+
+        let result_with_value = |value: Option<&str>, url: Option<&str>| DeviceResultV2 {
+            message: "ok".to_owned(),
+            state_generation: 1,
+            screenshot_generation: 0,
+            state_id: Uuid::new_v4(),
+            application_digest: "a".repeat(64),
+            window_id: 1,
+            display_fingerprint: "display".to_owned(),
+            base_state_id: None,
+            observation: Some(AccessibilityObservation {
+                kind: AccessibilityObservationKind::Full,
+                reset: false,
+                truncated: false,
+                nodes: vec![AccessibilityNode {
+                    index: 0,
+                    parent_index: None,
+                    depth: 0,
+                    role: "AXTextField".to_owned(),
+                    title: None,
+                    label: None,
+                    value: value.map(str::to_owned),
+                    placeholder: None,
+                    url: url.map(str::to_owned),
+                    frame: None,
+                    settable: true,
+                    actions: vec![],
+                }],
+                removed: vec![],
+            }),
+            settle: SettleResult {
+                status: SettleStatus::Settled,
+                elapsed_ms: 10,
+            },
+            screenshot: None,
+            retry_count: 0,
+            manual_recovery: false,
+        };
+
+        assert!(result_confirms_typed_text(
+            &result_with_value(Some("Computer use test query"), None),
+            "computer use test"
+        ));
+        assert!(result_confirms_typed_text(
+            &result_with_value(None, Some("https://example.com/path/")),
+            "http://example.com/path"
+        ));
+        assert!(!result_confirms_typed_text(
+            &result_with_value(Some("different query"), Some("https://example.com/")),
+            "missing text"
+        ));
     }
 
     #[tokio::test]
@@ -1448,6 +1613,8 @@ mod tests {
                 Ok(DeviceResult {
                     message: "ok".to_owned(),
                     screenshot: Some(self.screenshot.clone()),
+                    retry_count: 0,
+                    manual_recovery: false,
                 })
             }
         }
@@ -1532,6 +1699,8 @@ mod tests {
                 Ok(DeviceResult {
                     message: "ok".to_owned(),
                     screenshot: None,
+                    retry_count: 0,
+                    manual_recovery: false,
                 })
             }
         }
@@ -1568,6 +1737,8 @@ mod tests {
                 base64_data: STANDARD.encode(b"not an image"),
                 mime_type: "image/png".to_owned(),
             }),
+            retry_count: 0,
+            manual_recovery: false,
         });
         assert!(malformed.is_err());
 
@@ -1578,6 +1749,8 @@ mod tests {
                 base64_data: STANDARD.encode(jpeg),
                 mime_type: "image/png".to_owned(),
             }),
+            retry_count: 0,
+            manual_recovery: false,
         });
         assert!(mislabeled.is_err());
     }

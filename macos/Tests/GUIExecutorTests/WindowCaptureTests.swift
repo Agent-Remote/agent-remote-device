@@ -7,6 +7,79 @@ import Testing
 import UniformTypeIdentifiers
 @testable import GUIExecutor
 
+@Test @MainActor func captureOperationTimeoutReturnsWithoutWaitingForHungWork() async throws {
+    let started = ContinuousClock.now
+    do {
+        let _: Int = try await WindowCapture.withOperationTimeout(.milliseconds(20)) {
+            try await Task.sleep(for: .seconds(10))
+            return 1
+        }
+        Issue.record("Expected the capture operation to time out")
+    } catch {
+        #expect(error as? CaptureFailure == .operationTimedOut)
+    }
+    #expect(ContinuousClock.now - started < .seconds(1))
+}
+
+@Test @MainActor func captureOperationTimeoutSurvivesSynchronouslyBlockedOperation() async throws {
+    let started = ContinuousClock.now
+    do {
+        let _: Int = try await WindowCapture.withOperationTimeout(.milliseconds(20)) {
+            synchronouslyBlock(for: 2)
+            return 1
+        }
+        Issue.record("Expected the blocked capture operation to time out")
+    } catch {
+        #expect(error as? CaptureFailure == .operationTimedOut)
+    }
+    #expect(ContinuousClock.now - started < .seconds(1))
+}
+
+private func synchronouslyBlock(for seconds: Double) {
+    _ = DispatchSemaphore(value: 0).wait(timeout: .now() + seconds)
+}
+
+@Test @MainActor func captureOperationReturnsBeforeTimeout() async throws {
+    let value = try await WindowCapture.withOperationTimeout(.seconds(1)) { 42 }
+    #expect(value == 42)
+}
+
+@Test func preferredWindowSkipsTinyFrontmostBrowserUtilityWindow() {
+    let selected = WindowCapture.preferredWindowID(
+        candidates: [
+            (windowID: 10, frame: CGRect(x: 10, y: 50, width: 66, height: 20)),
+            (windowID: 20, frame: CGRect(x: 0, y: 39, width: 1_800, height: 1_069)),
+        ],
+        frontToBackWindowIDs: [10, 20]
+    )
+
+    #expect(selected == 20)
+}
+
+@Test func preferredWindowUsesFrontmostSubstantialWindow() {
+    let selected = WindowCapture.preferredWindowID(
+        candidates: [
+            (windowID: 10, frame: CGRect(x: 0, y: 0, width: 1_400, height: 900)),
+            (windowID: 20, frame: CGRect(x: 300, y: 200, width: 500, height: 300)),
+        ],
+        frontToBackWindowIDs: [20, 10]
+    )
+
+    #expect(selected == 20)
+}
+
+@Test func preferredWindowFallsBackToLargestCandidateWithoutZOrder() {
+    let selected = WindowCapture.preferredWindowID(
+        candidates: [
+            (windowID: 10, frame: CGRect(x: 0, y: 0, width: 200, height: 100)),
+            (windowID: 20, frame: CGRect(x: 0, y: 0, width: 300, height: 200)),
+        ],
+        frontToBackWindowIDs: []
+    )
+
+    #expect(selected == 20)
+}
+
 @Test func captureScalingPreservesAspectRatioWithoutUpscaling() {
     #expect(WindowCapture.scaledSize(
         sourceWidth: 2_000,

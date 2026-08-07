@@ -14,6 +14,8 @@ public actor GUIExecutorSessionController {
     private var latestWindowContext: WindowContext?
     private var turnPaused = false
     private var requiresFreshScreenshot = false
+    private var lastCompletedRequest: Data?
+    private var lastCompletedResponse: Data?
     private let runtimeFactory: RuntimeFactory
 
     public init(
@@ -47,9 +49,20 @@ public actor GUIExecutorSessionController {
         latestWindowContext = nil
         turnPaused = false
         requiresFreshScreenshot = false
+        clearReplayCache()
     }
 
     public func performAction(_ data: Data) async throws -> Data {
+        if data == lastCompletedRequest, let lastCompletedResponse {
+            return lastCompletedResponse
+        }
+        let response = try await performActionOnce(data)
+        lastCompletedRequest = data
+        lastCompletedResponse = response
+        return response
+    }
+
+    private func performActionOnce(_ data: Data) async throws -> Data {
         if try requestVersion(in: data) == protocolVersionV2 {
             return try await performActionV2(data)
         }
@@ -148,6 +161,7 @@ public actor GUIExecutorSessionController {
         latestWindowContext = nil
         await runtime.clearAccessibilityState()
         turnPaused = true
+        clearReplayCache()
     }
 
     public func resumeTurn(_ data: Data) throws {
@@ -180,6 +194,7 @@ public actor GUIExecutorSessionController {
         latestWindowContext = nil
         turnPaused = false
         requiresFreshScreenshot = false
+        clearReplayCache()
     }
 
     public func hasActiveSession() async -> Bool {
@@ -204,6 +219,12 @@ public actor GUIExecutorSessionController {
         latestWindowContext = nil
         turnPaused = false
         requiresFreshScreenshot = false
+        clearReplayCache()
+    }
+
+    private func clearReplayCache() {
+        lastCompletedRequest = nil
+        lastCompletedResponse = nil
     }
 
     private func performValidatedAction(_ data: Data) async throws -> Data {
@@ -398,7 +419,7 @@ public actor GUIExecutorSessionController {
         default: nil
         }
 
-        let windowContext: WindowContext
+        var windowContext: WindowContext
         do {
             if case .observe = request.action {
                 windowContext = try await runtime.windowContext(
@@ -434,19 +455,28 @@ public actor GUIExecutorSessionController {
                     sequence: request.context.monotonicSequence
                 )
             case let .coordinate(action):
-                guard let latestCapture else {
-                    return try failureResponseV2(
-                        request: request,
-                        code: "fresh_screenshot_required",
-                        message: "A model-visible screenshot is required for coordinate actions."
+                if action.requiresModelVisibleScreenshot {
+                    guard let latestCapture else {
+                        return try failureResponseV2(
+                            request: request,
+                            code: "fresh_screenshot_required",
+                            message: "A model-visible screenshot is required for actions that use screen coordinates."
+                        )
+                    }
+                    try await runtime.execute(
+                        action: action,
+                        sequence: request.context.monotonicSequence,
+                        screenshotGeneration: currentScreenshotGeneration,
+                        capture: latestCapture
+                    )
+                } else {
+                    try await runtime.executeContextAction(
+                        action: action,
+                        sequence: request.context.monotonicSequence,
+                        stateGeneration: currentStateGeneration,
+                        context: windowContext
                     )
                 }
-                try await runtime.execute(
-                    action: action,
-                    sequence: request.context.monotonicSequence,
-                    screenshotGeneration: currentScreenshotGeneration,
-                    capture: latestCapture
-                )
             case let .press(target),
                  let .setValue(target, _),
                  let .selectText(target, _, _, _, _),
@@ -490,6 +520,25 @@ public actor GUIExecutorSessionController {
         }
 
         let isObservationOnly: Bool = if case .observe = request.action { true } else { false }
+        var observationBaseStateID = request.observation.mode == .axFull
+            ? nil
+            : request.context.baseStateID
+        if !isObservationOnly {
+            do {
+                let refreshed = try await runtime.windowContext(
+                    approvedApplications: approvedApplications,
+                    targetApplication: nil
+                )
+                if refreshed != windowContext {
+                    latestCapture = nil
+                    await runtime.clearAccessibilityState()
+                    observationBaseStateID = nil
+                }
+                windowContext = refreshed
+            } catch let failure as CaptureFailure {
+                message += " Follow-up window refresh failed (\(failure.diagnosticCode))."
+            }
+        }
         let settle: SettleResult
         if isObservationOnly {
             settle = SettleResult(status: .notRequested, elapsedMilliseconds: 0)
@@ -512,21 +561,47 @@ public actor GUIExecutorSessionController {
 
         var observation: AccessibilityObservation?
         var stateContext: AccessibilityStateContext?
+        let expectedTypedText: String? = if case let .coordinate(.type(text)) = request.action {
+            text
+        } else {
+            nil
+        }
         let wantsAX = switch request.observation.mode {
         case .axDiff, .axFull, .both, .auto: true
         case .none, .screenshot: false
         }
         if wantsAX {
-            let baseStateID = request.observation.mode == .axFull
-                ? nil
-                : request.context.baseStateID
             do {
-                let result = try await runtime.observeAccessibility(
+                var result = try await runtime.observeAccessibility(
                     context: windowContext,
                     stateGeneration: nextStateGeneration,
-                    baseStateID: baseStateID,
+                    baseStateID: observationBaseStateID,
                     policy: request.observation
                 )
+                if let expectedTypedText,
+                   !expectedTypedText.isEmpty,
+                   !Self.observation(result.observation, confirms: expectedTypedText)
+                {
+                    let freshnessDeadline = min(
+                        Date().addingTimeInterval(2),
+                        request.leaseUntil
+                    )
+                    while Date() < freshnessDeadline {
+                        try await Task.sleep(for: .milliseconds(100))
+                        result = try await runtime.observeAccessibility(
+                            context: windowContext,
+                            stateGeneration: nextStateGeneration,
+                            baseStateID: nil,
+                            policy: request.observation
+                        )
+                        if Self.observation(result.observation, confirms: expectedTypedText) {
+                            break
+                        }
+                    }
+                    if !Self.observation(result.observation, confirms: expectedTypedText) {
+                        message += " Typed text was not visible in AX before the freshness deadline."
+                    }
+                }
                 observation = result.observation
                 stateContext = result.context
             } catch let failure as AccessibilityFailure {
@@ -626,6 +701,22 @@ public actor GUIExecutorSessionController {
             throw DeviceIPCFailure.messageTooLarge
         }
         return encoded
+    }
+
+    private static func observation(
+        _ observation: AccessibilityObservation,
+        confirms text: String
+    ) -> Bool {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let withoutScheme = normalized
+            .replacing(/^https?:\/\//, with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let needles = [normalized, withoutScheme].filter { !$0.isEmpty }
+        return observation.nodes.contains { node in
+            [node.title, node.label, node.value, node.url]
+                .compactMap { $0?.lowercased() }
+                .contains { value in needles.contains { value.contains($0) } }
+        }
     }
 
     private func requestVersion(in data: Data) throws -> UInt8 {

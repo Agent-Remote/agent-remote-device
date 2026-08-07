@@ -4,8 +4,10 @@ import Testing
 @testable import DeviceSecurity
 
 @Test func publicApplicationMappingsRemainVersionedAndConservative() {
-    #expect(ApplicationPolicy.mappingVersion == 1)
+    #expect(ApplicationPolicy.mappingVersion == 2)
     #expect(ApplicationPolicy.classify(bundleIdentifier: "com.apple.Safari").controlLevel == .viewOnly)
+    #expect(ApplicationPolicy.classify(bundleIdentifier: "com.google.Chrome").source == .pendingConfirmation)
+    #expect(ApplicationPolicy.classify(bundleIdentifier: "com.google.Chrome").controlLevel == nil)
     #expect(ApplicationPolicy.classify(bundleIdentifier: "com.apple.Terminal").controlLevel == .clickOnly)
     #expect(ApplicationPolicy.classify(bundleIdentifier: "com.apple.Terminal").warnings == [.shellAccess])
     #expect(ApplicationPolicy.classify(bundleIdentifier: "com.apple.finder").warnings == [.fileAccess])
@@ -270,6 +272,62 @@ import Testing
             target: target,
             displayFingerprint: "display-a",
             windowID: 43,
+            application: application
+        )
+    }
+}
+
+@Test func keyboardContextActionsRequireFreshAXStateButNotAScreenshot() async throws {
+    let application = ApplicationIdentity(
+        bundleIdentifier: "com.google.Chrome",
+        signingIdentifier: "com.google.Chrome"
+    )
+    let guardState = SessionGuard(nextSequence: 3)
+    try await guardState.deviceConnected()
+    try await guardState.activate(
+        approvals: [
+            LocalApproval(
+                application: application,
+                controlLevel: .fullControl,
+                clipboardAllowed: false,
+                generation: 1
+            ),
+        ],
+        leaseUntil: Date().addingTimeInterval(60)
+    )
+    try await guardState.recordState(AccessibilityStateContext(
+        stateID: UUID(),
+        stateGeneration: 4,
+        applicationDigest: application.stableDigest,
+        windowID: 42,
+        displayFingerprint: "display-a"
+    ))
+
+    try await guardState.authorizeContextAction(
+        action: .key("CMD+A"),
+        sequence: 3,
+        stateGeneration: 4,
+        displayFingerprint: "display-a",
+        windowID: 42,
+        application: application
+    )
+    await #expect(throws: GuardFailure.staleState) {
+        try await guardState.authorizeContextAction(
+            action: .type("query"),
+            sequence: 3,
+            stateGeneration: 3,
+            displayFingerprint: "display-a",
+            windowID: 42,
+            application: application
+        )
+    }
+    await #expect(throws: GuardFailure.invalidParameters) {
+        try await guardState.authorizeContextAction(
+            action: .leftClick(Point(x: 10, y: 10)),
+            sequence: 3,
+            stateGeneration: 4,
+            displayFingerprint: "display-a",
+            windowID: 42,
             application: application
         )
     }

@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -32,10 +32,10 @@ use crate::{
         MAX_FRAME_BYTES,
     },
     protocol_v2::{
-        AccessibilityObservation, ActionRequestV2, ActionResponseV2, ActionV2, ImageProfile,
-        ObservationMode, ObservationPolicy, RequestContextV2, ResponseStatusV2, SettleResult,
-        CAPABILITY_ADAPTIVE_SETTLE_V2, CAPABILITY_AX_STATE_V2, CAPABILITY_OBSERVATION_MODE_V2,
-        PROTOCOL_VERSION_V2,
+        AccessibilityObservation, AccessibilityObservationKind, ActionRequestV2, ActionResponseV2,
+        ActionV2, ImageProfile, ObservationMode, ObservationPolicy, RequestContextV2,
+        ResponseStatusV2, SettleResult, CAPABILITY_ADAPTIVE_SETTLE_V2, CAPABILITY_AX_STATE_V2,
+        CAPABILITY_OBSERVATION_MODE_V2, PROTOCOL_VERSION_V2,
     },
 };
 
@@ -44,7 +44,10 @@ const MAX_BRIDGE_CONTROL_BYTES: usize = 4096;
 const BRIDGE_PROTOCOL_VERSION: u8 = 1;
 const MAX_ACTION_RESPONSE_WAIT: Duration = Duration::from_secs(30);
 const LIFECYCLE_RESPONSE_WAIT: Duration = Duration::from_secs(15);
-const CONTEXT_READY_WAIT: Duration = Duration::from_secs(10);
+const ACTION_CONTEXT_READY_WAIT: Duration = Duration::from_secs(180);
+const BACKGROUND_CONTEXT_READY_WAIT: Duration = Duration::from_secs(10);
+const ACTION_LEASE_READY_WAIT: Duration = Duration::from_secs(15);
+const MIN_ACTION_LEASE_REMAINING: Duration = Duration::from_secs(30);
 const CONTEXT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -61,9 +64,17 @@ pub struct ManagedContext {
     pub current_screenshot_generation: u64,
     #[serde(default)]
     pub current_state_generation: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub capabilities: BTreeSet<String>,
     pub lease_until: DateTime<Utc>,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl ManagedContext {
@@ -126,6 +137,8 @@ impl ManagedContext {
 pub struct DeviceResult {
     pub message: String,
     pub screenshot: Option<Screenshot>,
+    pub retry_count: u16,
+    pub manual_recovery: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +154,8 @@ pub struct DeviceResultV2 {
     pub observation: Option<AccessibilityObservation>,
     pub settle: SettleResult,
     pub screenshot: Option<ScreenshotV2>,
+    pub retry_count: u16,
+    pub manual_recovery: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +210,46 @@ struct TransportState {
     model_ax_base_state_id: Option<Uuid>,
     model_ax_base_context: Option<(String, u32, String)>,
     poisoned: bool,
+    pending_request: Option<PendingRequest>,
+    last_completed_response_binding: Option<ResponseBinding>,
     connection: Option<TlsStream<UnixStream>>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingRequest {
+    V1(ActionRequest),
+    V2(ActionRequestV2),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResponseBinding {
+    request_id: Uuid,
+    monotonic_sequence: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseBindingEnvelope {
+    request_id: Uuid,
+    monotonic_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponseFrameKind {
+    Expected,
+    PreviousDuplicate,
+}
+
+#[derive(Debug)]
+struct ExchangeFailure {
+    error: TransportError,
+    request_started: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ExchangePhase {
+    #[default]
+    PreRequest,
+    RequestStarted,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -359,6 +413,8 @@ impl UnixDeviceTransport {
                 model_ax_base_context: None,
                 context,
                 poisoned: false,
+                pending_request: None,
+                last_completed_response_binding: None,
                 connection: None,
             }),
         }
@@ -383,20 +439,58 @@ impl UnixDeviceTransport {
         &self,
         state: &mut TransportState,
         request: &ActionRequest,
-    ) -> Result<ActionResponse, TransportError> {
-        let payload = serde_json::to_vec(&FramedRequest { request })?;
-        let response_bytes = exchange_payload(&self.socket_path, state, &payload).await?;
-        Ok(serde_json::from_slice(&response_bytes)?)
+    ) -> Result<(ActionResponse, u16), ExchangeFailure> {
+        let payload =
+            serde_json::to_vec(&FramedRequest { request }).map_err(|error| ExchangeFailure {
+                error: error.into(),
+                request_started: false,
+            })?;
+        let response_bytes = exchange_payload_with_replay(
+            &self.socket_path,
+            state,
+            &payload,
+            MAX_ACTION_RESPONSE_WAIT,
+            ResponseBinding {
+                request_id: request.request_id,
+                monotonic_sequence: request.context.monotonic_sequence,
+            },
+        )
+        .await?;
+        serde_json::from_slice(&response_bytes.0)
+            .map(|response| (response, response_bytes.1))
+            .map_err(|error| ExchangeFailure {
+                error: error.into(),
+                request_started: true,
+            })
     }
 
     async fn exchange_v2(
         &self,
         state: &mut TransportState,
         request: &ActionRequestV2,
-    ) -> Result<ActionResponseV2, TransportError> {
-        let payload = serde_json::to_vec(&FramedRequestV2 { request })?;
-        let response_bytes = exchange_payload(&self.socket_path, state, &payload).await?;
-        Ok(serde_json::from_slice(&response_bytes)?)
+    ) -> Result<(ActionResponseV2, u16), ExchangeFailure> {
+        let payload =
+            serde_json::to_vec(&FramedRequestV2 { request }).map_err(|error| ExchangeFailure {
+                error: error.into(),
+                request_started: false,
+            })?;
+        let response_bytes = exchange_payload_with_replay(
+            &self.socket_path,
+            state,
+            &payload,
+            MAX_ACTION_RESPONSE_WAIT,
+            ResponseBinding {
+                request_id: request.request_id,
+                monotonic_sequence: request.context.monotonic_sequence,
+            },
+        )
+        .await?;
+        serde_json::from_slice(&response_bytes.0)
+            .map(|response| (response, response_bytes.1))
+            .map_err(|error| ExchangeFailure {
+                error: error.into(),
+                request_started: true,
+            })
     }
 
     async fn notify_lifecycle(&self, event: LifecycleEvent) -> Result<(), TransportError> {
@@ -421,9 +515,10 @@ impl UnixDeviceTransport {
         let payload = serde_json::to_vec(&FramedLifecycle {
             lifecycle: &request,
         })?;
+        let mut phase = ExchangePhase::PreRequest;
         let response = match timeout(
             LIFECYCLE_RESPONSE_WAIT,
-            exchange_payload(&self.socket_path, &mut state, &payload),
+            exchange_payload(&self.socket_path, &mut state, &payload, &mut phase),
         )
         .await
         {
@@ -435,11 +530,17 @@ impl UnixDeviceTransport {
                 }
             },
             Ok(Err(error)) => {
-                poison(&mut state);
+                clear_failed_connection(&mut state);
+                if matches!(phase, ExchangePhase::RequestStarted) {
+                    poison(&mut state);
+                }
                 return Err(error);
             }
             Err(_) => {
-                poison(&mut state);
+                clear_failed_connection(&mut state);
+                if matches!(phase, ExchangePhase::RequestStarted) {
+                    poison(&mut state);
+                }
                 return Err(TransportError::OperationTimedOut);
             }
         };
@@ -466,6 +567,50 @@ impl UnixDeviceTransport {
         state.context.lease_until = context.lease_until;
         Ok(())
     }
+
+    async fn recover_pending(&self, state: &mut TransportState) -> Result<u16, TransportError> {
+        let Some(pending) = state.pending_request.clone() else {
+            return Ok(0);
+        };
+        let (result, retries) = match &pending {
+            PendingRequest::V1(request) => match self.exchange(state, request).await {
+                Ok((response, retries)) => (
+                    apply_response_v1(state, request, response).map(|_| ()),
+                    retries,
+                ),
+                Err(failure) => return retain_or_fail_pending(state, failure),
+            },
+            PendingRequest::V2(request) => match self.exchange_v2(state, request).await {
+                Ok((response, retries)) => (
+                    apply_response_v2(state, request, response).map(|_| ()),
+                    retries,
+                ),
+                Err(failure) => return retain_or_fail_pending(state, failure),
+            },
+        };
+        match result {
+            Ok(()) | Err(TransportError::DeviceRejected(_)) => {
+                state.pending_request = None;
+                Ok(retries.saturating_add(1))
+            }
+            Err(error) => {
+                state.pending_request = None;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn retain_or_fail_pending(
+    state: &mut TransportState,
+    failure: ExchangeFailure,
+) -> Result<u16, TransportError> {
+    clear_failed_connection(state);
+    if replayable_exchange_error(&failure.error) {
+        return Err(failure.error);
+    }
+    poison(state);
+    Err(failure.error)
 }
 
 impl ActivatedUnixDeviceTransport {
@@ -479,14 +624,15 @@ impl ActivatedUnixDeviceTransport {
 
     /// Forwards one lifecycle event using the active generation binding.
     pub async fn notify_lifecycle(&self, event: LifecycleEvent) -> Result<(), TransportError> {
-        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        let context = load_managed_context(&self.managed_context_path, Duration::ZERO).await?;
         let transport = self.transport_for_context(context).await?;
         transport.notify_lifecycle(event).await
     }
 
     /// Establishes the generation-bound relay before the first MCP action arrives.
     pub async fn ensure_connected(&self) -> Result<(), TransportError> {
-        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        let context =
+            load_managed_context(&self.managed_context_path, BACKGROUND_CONTEXT_READY_WAIT).await?;
         let transport = self.transport_for_context(context).await?;
         transport.ensure_connected().await
     }
@@ -541,10 +687,33 @@ async fn load_managed_context(
     }
 }
 
+async fn load_action_context(path: &Path) -> Result<ManagedContext, TransportError> {
+    let mut context = load_managed_context(path, ACTION_CONTEXT_READY_WAIT).await?;
+    let deadline = Instant::now() + ACTION_LEASE_READY_WAIT;
+    loop {
+        if action_lease_ready(&context, Utc::now()) {
+            return Ok(context);
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Err(TransportError::LeaseExpired);
+        }
+        sleep(CONTEXT_RETRY_INTERVAL.min(wait)).await;
+        context = ManagedContext::load(path)?;
+    }
+}
+
+fn action_lease_ready(context: &ManagedContext, now: DateTime<Utc>) -> bool {
+    (context.lease_until - now)
+        .to_std()
+        .is_ok_and(|remaining| remaining >= MIN_ACTION_LEASE_REMAINING)
+}
+
 async fn exchange_payload(
     socket_path: &Path,
     state: &mut TransportState,
     payload: &[u8],
+    phase: &mut ExchangePhase,
 ) -> Result<Vec<u8>, TransportError> {
     if payload.is_empty() || payload.len() > MAX_FRAME_BYTES {
         return Err(TransportError::FrameTooLarge);
@@ -556,6 +725,7 @@ async fn exchange_payload(
         .connection
         .as_mut()
         .ok_or(TransportError::InvalidContext)?;
+    *phase = ExchangePhase::RequestStarted;
     stream
         .write_u32(payload.len() as u32)
         .await
@@ -577,6 +747,14 @@ async fn exchange_payload(
             operation: "flush request",
             source,
         })?;
+    read_response_payload(state).await
+}
+
+async fn read_response_payload(state: &mut TransportState) -> Result<Vec<u8>, TransportError> {
+    let stream = state
+        .connection
+        .as_mut()
+        .ok_or(TransportError::InvalidContext)?;
     let response_length = stream
         .read_u32()
         .await
@@ -598,15 +776,157 @@ async fn exchange_payload(
     Ok(response)
 }
 
+async fn exchange_payload_with_replay(
+    socket_path: &Path,
+    state: &mut TransportState,
+    payload: &[u8],
+    max_attempt_wait: Duration,
+    expected_binding: ResponseBinding,
+) -> Result<(Vec<u8>, u16), ExchangeFailure> {
+    let first_wait =
+        remaining_exchange_wait(state, max_attempt_wait).map_err(|error| ExchangeFailure {
+            error,
+            request_started: false,
+        })?;
+    let mut first_phase = ExchangePhase::PreRequest;
+    let first_error = match timeout(
+        first_wait,
+        exchange_expected_payload(
+            socket_path,
+            state,
+            payload,
+            &mut first_phase,
+            expected_binding,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => return Ok((response, 0)),
+        Ok(Err(error)) if replayable_exchange_error(&error) => error,
+        Ok(Err(error)) => {
+            return Err(ExchangeFailure {
+                error,
+                request_started: matches!(first_phase, ExchangePhase::RequestStarted),
+            })
+        }
+        Err(_) => TransportError::OperationTimedOut,
+    };
+
+    // The request may already have executed. Reconnect and replay the exact bytes so the
+    // device can return its cached response without repeating input.
+    state.connection = None;
+    let retry_wait = match remaining_exchange_wait(state, max_attempt_wait) {
+        Ok(wait) => wait,
+        Err(_) => {
+            return Err(ExchangeFailure {
+                error: first_error,
+                request_started: matches!(first_phase, ExchangePhase::RequestStarted),
+            })
+        }
+    };
+    let mut retry_phase = ExchangePhase::PreRequest;
+    let result = match timeout(
+        retry_wait,
+        exchange_expected_payload(
+            socket_path,
+            state,
+            payload,
+            &mut retry_phase,
+            expected_binding,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(TransportError::OperationTimedOut),
+    };
+    result
+        .map(|response| (response, 1))
+        .map_err(|error| ExchangeFailure {
+            error,
+            request_started: matches!(first_phase, ExchangePhase::RequestStarted)
+                || matches!(retry_phase, ExchangePhase::RequestStarted),
+        })
+}
+
+async fn exchange_expected_payload(
+    socket_path: &Path,
+    state: &mut TransportState,
+    payload: &[u8],
+    phase: &mut ExchangePhase,
+    expected_binding: ResponseBinding,
+) -> Result<Vec<u8>, TransportError> {
+    let mut response = exchange_payload(socket_path, state, payload, phase).await?;
+    loop {
+        let binding =
+            serde_json::from_slice::<ResponseBindingEnvelope>(&response).map(|value| {
+                ResponseBinding {
+                    request_id: value.request_id,
+                    monotonic_sequence: value.monotonic_sequence,
+                }
+            })?;
+        match classify_response_binding(
+            binding,
+            expected_binding,
+            state.last_completed_response_binding,
+        )? {
+            ResponseFrameKind::Expected => return Ok(response),
+            ResponseFrameKind::PreviousDuplicate => {}
+        }
+
+        // A timed-out request can finish just as its exact replay is sent. In that
+        // case the old response is still queued ahead of the current response.
+        response = read_response_payload(state).await?;
+    }
+}
+
+fn classify_response_binding(
+    actual: ResponseBinding,
+    expected: ResponseBinding,
+    previous: Option<ResponseBinding>,
+) -> Result<ResponseFrameKind, TransportError> {
+    if actual == expected {
+        return Ok(ResponseFrameKind::Expected);
+    }
+    if Some(actual) == previous {
+        return Ok(ResponseFrameKind::PreviousDuplicate);
+    }
+    Err(TransportError::ResponseBinding)
+}
+
+fn remaining_exchange_wait(
+    state: &TransportState,
+    max_attempt_wait: Duration,
+) -> Result<Duration, TransportError> {
+    let remaining = (state.context.lease_until - Utc::now())
+        .to_std()
+        .map_err(|_| TransportError::LeaseExpired)?;
+    if remaining.is_zero() {
+        return Err(TransportError::LeaseExpired);
+    }
+    Ok(remaining.min(max_attempt_wait))
+}
+
+fn replayable_exchange_error(error: &TransportError) -> bool {
+    matches!(
+        error,
+        TransportError::OperationTimedOut
+            | TransportError::BridgeConnect(_)
+            | TransportError::BridgeHandshakeIo { .. }
+            | TransportError::TlsHandshakeIo(_)
+            | TransportError::ChannelIo { .. }
+    )
+}
+
 #[async_trait]
 impl DeviceTransport for ActivatedUnixDeviceTransport {
     async fn supports_v2(&self) -> Result<bool, TransportError> {
-        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        let context = load_action_context(&self.managed_context_path).await?;
         Ok(supports_v2(&context.capabilities))
     }
 
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError> {
-        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        let context = load_action_context(&self.managed_context_path).await?;
         let transport = self.transport_for_context(context).await?;
         transport.execute(action).await
     }
@@ -616,7 +936,7 @@ impl DeviceTransport for ActivatedUnixDeviceTransport {
         action: ActionV2,
         observation: ObservationPolicy,
     ) -> Result<DeviceResultV2, TransportError> {
-        let context = load_managed_context(&self.managed_context_path, CONTEXT_READY_WAIT).await?;
+        let context = load_action_context(&self.managed_context_path).await?;
         let transport = self.transport_for_context(context).await?;
         transport.execute_v2(action, observation).await
     }
@@ -634,6 +954,7 @@ impl DeviceTransport for UnixDeviceTransport {
         if state.poisoned {
             return Err(TransportError::Poisoned);
         }
+        let recovery_retries = self.recover_pending(&mut state).await?;
         if state.context.lease_until <= Utc::now() {
             poison(&mut state);
             return Err(TransportError::LeaseExpired);
@@ -661,49 +982,22 @@ impl DeviceTransport for UnixDeviceTransport {
             lease_until: state.context.lease_until,
             action,
         };
-        let remaining_lease = match (state.context.lease_until - Utc::now()).to_std() {
-            Ok(remaining) => remaining,
-            Err(_) => {
-                poison(&mut state);
-                return Err(TransportError::LeaseExpired);
+        let (response, exchange_retries) = match self.exchange(&mut state, &request).await {
+            Ok(response) => response,
+            Err(failure) => {
+                clear_failed_connection(&mut state);
+                if failure.request_started && replayable_exchange_error(&failure.error) {
+                    state.pending_request = Some(PendingRequest::V1(request));
+                } else if failure.request_started {
+                    poison(&mut state);
+                }
+                return Err(failure.error);
             }
         };
-        let response = match timeout(
-            remaining_lease.min(MAX_ACTION_RESPONSE_WAIT),
-            self.exchange(&mut state, &request),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                poison(&mut state);
-                return Err(error);
-            }
-            Err(_) => {
-                poison(&mut state);
-                return Err(TransportError::OperationTimedOut);
-            }
-        };
-        if response.request_id != request.request_id
-            || response.monotonic_sequence != request.context.monotonic_sequence
-            || response.screenshot_generation < request.context.current_screenshot_generation
-        {
-            poison(&mut state);
-            return Err(TransportError::ResponseBinding);
-        }
-        if matches!(response.status, ResponseStatus::Failed) {
-            return Err(TransportError::DeviceRejected(response.message));
-        }
-        state.context.next_sequence += 1;
-        state.context.current_screenshot_generation = response.screenshot_generation;
-        let screenshot = response.image.map(|image| Screenshot {
-            base64_data: image.base64_data,
-            mime_type: image.mime_type,
-        });
-        Ok(DeviceResult {
-            message: response.message,
-            screenshot,
-        })
+        let mut result = apply_response_v1(&mut state, &request, response)?;
+        result.retry_count = recovery_retries.saturating_add(exchange_retries);
+        result.manual_recovery = recovery_retries > 0;
+        Ok(result)
     }
 
     async fn execute_v2(
@@ -718,6 +1012,7 @@ impl DeviceTransport for UnixDeviceTransport {
         if state.poisoned {
             return Err(TransportError::Poisoned);
         }
+        let recovery_retries = self.recover_pending(&mut state).await?;
         if !supports_v2(&state.context.capabilities) {
             return Err(TransportError::CapabilityUnavailable);
         }
@@ -756,135 +1051,186 @@ impl DeviceTransport for UnixDeviceTransport {
             observation,
             action,
         };
-        let remaining_lease = match (state.context.lease_until - Utc::now()).to_std() {
-            Ok(remaining) => remaining,
-            Err(_) => {
-                poison(&mut state);
-                return Err(TransportError::LeaseExpired);
+        let (response, exchange_retries) = match self.exchange_v2(&mut state, &request).await {
+            Ok(response) => response,
+            Err(failure) => {
+                clear_failed_connection(&mut state);
+                if failure.request_started && replayable_exchange_error(&failure.error) {
+                    state.pending_request = Some(PendingRequest::V2(request));
+                } else if failure.request_started {
+                    poison(&mut state);
+                }
+                return Err(failure.error);
             }
         };
-        let response = match timeout(
-            remaining_lease.min(MAX_ACTION_RESPONSE_WAIT),
-            self.exchange_v2(&mut state, &request),
-        )
-        .await
+        let mut result = apply_response_v2(&mut state, &request, response)?;
+        result.retry_count = recovery_retries.saturating_add(exchange_retries);
+        result.manual_recovery = recovery_retries > 0;
+        Ok(result)
+    }
+}
+
+fn apply_response_v1(
+    state: &mut TransportState,
+    request: &ActionRequest,
+    response: ActionResponse,
+) -> Result<DeviceResult, TransportError> {
+    if response.request_id != request.request_id
+        || response.monotonic_sequence != request.context.monotonic_sequence
+        || response.screenshot_generation < request.context.current_screenshot_generation
+    {
+        poison(state);
+        return Err(TransportError::ResponseBinding);
+    }
+    state.last_completed_response_binding = Some(ResponseBinding {
+        request_id: response.request_id,
+        monotonic_sequence: response.monotonic_sequence,
+    });
+    if matches!(response.status, ResponseStatus::Failed) {
+        return Err(TransportError::DeviceRejected(response.message));
+    }
+    state.context.next_sequence += 1;
+    state.context.current_screenshot_generation = response.screenshot_generation;
+    let screenshot = response.image.map(|image| Screenshot {
+        base64_data: image.base64_data,
+        mime_type: image.mime_type,
+    });
+    Ok(DeviceResult {
+        message: response.message,
+        screenshot,
+        retry_count: 0,
+        manual_recovery: false,
+    })
+}
+
+fn apply_response_v2(
+    state: &mut TransportState,
+    request: &ActionRequestV2,
+    response: ActionResponseV2,
+) -> Result<DeviceResultV2, TransportError> {
+    if response.request_id != request.request_id
+        || response.monotonic_sequence != request.context.monotonic_sequence
+        || !response.validate_payload(&request.observation)
+    {
+        poison(state);
+        return Err(TransportError::ResponseBinding);
+    }
+    state.last_completed_response_binding = Some(ResponseBinding {
+        request_id: response.request_id,
+        monotonic_sequence: response.monotonic_sequence,
+    });
+    if matches!(response.status, ResponseStatusV2::Failed) {
+        if response.state_generation != request.context.current_state_generation
+            || response.screenshot_generation != request.context.current_screenshot_generation
+            || response.state_id.is_some()
+            || response.application_digest.is_some()
+            || response.window_id.is_some()
+            || response.display_fingerprint.is_some()
+            || response.observation.is_some()
+            || response.image.is_some()
         {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                poison(&mut state);
-                return Err(error);
-            }
-            Err(_) => {
-                poison(&mut state);
-                return Err(TransportError::OperationTimedOut);
-            }
-        };
-        if response.request_id != request.request_id
-            || response.monotonic_sequence != request.context.monotonic_sequence
-            || !response.validate_payload(&request.observation)
-        {
-            poison(&mut state);
+            poison(state);
             return Err(TransportError::ResponseBinding);
         }
-        if matches!(response.status, ResponseStatusV2::Failed) {
-            if response.state_generation != request.context.current_state_generation
-                || response.screenshot_generation != request.context.current_screenshot_generation
-                || response.state_id.is_some()
-                || response.application_digest.is_some()
-                || response.window_id.is_some()
-                || response.display_fingerprint.is_some()
-                || response.observation.is_some()
-                || response.image.is_some()
-            {
-                poison(&mut state);
-                return Err(TransportError::ResponseBinding);
-            }
-            return Err(TransportError::DeviceRejected(response.message));
-        }
-        let expected_state_generation = request
+        return Err(TransportError::DeviceRejected(response.message));
+    }
+    let expected_state_generation = request
+        .context
+        .current_state_generation
+        .checked_add(1)
+        .ok_or(TransportError::CounterExhausted)?;
+    let Some(state_id) = response.state_id else {
+        poison(state);
+        return Err(TransportError::ResponseBinding);
+    };
+    let (Some(application_digest), Some(window_id), Some(display_fingerprint)) = (
+        response.application_digest.clone(),
+        response.window_id,
+        response.display_fingerprint.clone(),
+    ) else {
+        poison(state);
+        return Err(TransportError::ResponseBinding);
+    };
+    if application_digest.len() != 64
+        || !application_digest
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+        || display_fingerprint.is_empty()
+        || display_fingerprint.len() > 256
+    {
+        poison(state);
+        return Err(TransportError::ResponseBinding);
+    }
+    let expected_screenshot_generation = if response.image.is_some() {
+        request
             .context
-            .current_state_generation
+            .current_screenshot_generation
             .checked_add(1)
-            .ok_or(TransportError::CounterExhausted)?;
-        let Some(state_id) = response.state_id else {
-            poison(&mut state);
-            return Err(TransportError::ResponseBinding);
-        };
-        let (Some(application_digest), Some(window_id), Some(display_fingerprint)) = (
-            response.application_digest.clone(),
-            response.window_id,
-            response.display_fingerprint.clone(),
-        ) else {
-            poison(&mut state);
-            return Err(TransportError::ResponseBinding);
-        };
-        if application_digest.len() != 64
-            || !application_digest
-                .bytes()
-                .all(|value| value.is_ascii_hexdigit())
-            || display_fingerprint.is_empty()
-            || display_fingerprint.len() > 256
-        {
-            poison(&mut state);
-            return Err(TransportError::ResponseBinding);
+            .ok_or(TransportError::CounterExhausted)?
+    } else {
+        request.context.current_screenshot_generation
+    };
+    if response.state_generation != expected_state_generation
+        || response.screenshot_generation != expected_screenshot_generation
+        || !valid_observation_binding(
+            response.observation.as_ref(),
+            response.base_state_id,
+            request.context.base_state_id,
+        )
+    {
+        poison(state);
+        return Err(TransportError::ResponseBinding);
+    }
+    state.context.next_sequence += 1;
+    state.context.current_state_generation = response.state_generation;
+    state.context.current_screenshot_generation = response.screenshot_generation;
+    state.state_id = Some(state_id);
+    let response_context = (
+        application_digest.clone(),
+        window_id,
+        display_fingerprint.clone(),
+    );
+    if response.observation.is_some() {
+        state.model_ax_base_state_id = Some(state_id);
+        state.model_ax_base_context = Some(response_context);
+    } else if state.model_ax_base_context.as_ref() != Some(&response_context) {
+        state.model_ax_base_state_id = None;
+        state.model_ax_base_context = None;
+    }
+    let screenshot = response.image.map(|image| ScreenshotV2 {
+        base64_data: image.base64_data,
+        mime_type: image.mime_type,
+        pixel_width: image.pixel_width,
+        pixel_height: image.pixel_height,
+        profile: image.profile,
+    });
+    Ok(DeviceResultV2 {
+        message: response.message,
+        state_generation: response.state_generation,
+        screenshot_generation: response.screenshot_generation,
+        state_id,
+        application_digest,
+        window_id,
+        display_fingerprint,
+        base_state_id: response.base_state_id,
+        observation: response.observation,
+        settle: response.settle,
+        screenshot,
+        retry_count: 0,
+        manual_recovery: false,
+    })
+}
+
+fn valid_observation_binding(
+    observation: Option<&AccessibilityObservation>,
+    response_base_state_id: Option<Uuid>,
+    request_base_state_id: Option<Uuid>,
+) -> bool {
+    match observation.map(|value| value.kind) {
+        Some(AccessibilityObservationKind::Diff) => {
+            response_base_state_id.is_some() && response_base_state_id == request_base_state_id
         }
-        let expected_screenshot_generation = if response.image.is_some() {
-            request
-                .context
-                .current_screenshot_generation
-                .checked_add(1)
-                .ok_or(TransportError::CounterExhausted)?
-        } else {
-            request.context.current_screenshot_generation
-        };
-        if response.state_generation != expected_state_generation
-            || response.screenshot_generation != expected_screenshot_generation
-            || (response.observation.is_some()
-                && response.base_state_id != request.context.base_state_id
-                && !response
-                    .observation
-                    .as_ref()
-                    .is_some_and(|value| value.reset))
-        {
-            poison(&mut state);
-            return Err(TransportError::ResponseBinding);
-        }
-        state.context.next_sequence += 1;
-        state.context.current_state_generation = response.state_generation;
-        state.context.current_screenshot_generation = response.screenshot_generation;
-        state.state_id = Some(state_id);
-        let response_context = (
-            application_digest.clone(),
-            window_id,
-            display_fingerprint.clone(),
-        );
-        if response.observation.is_some() {
-            state.model_ax_base_state_id = Some(state_id);
-            state.model_ax_base_context = Some(response_context);
-        } else if state.model_ax_base_context.as_ref() != Some(&response_context) {
-            state.model_ax_base_state_id = None;
-            state.model_ax_base_context = None;
-        }
-        let screenshot = response.image.map(|image| ScreenshotV2 {
-            base64_data: image.base64_data,
-            mime_type: image.mime_type,
-            pixel_width: image.pixel_width,
-            pixel_height: image.pixel_height,
-            profile: image.profile,
-        });
-        Ok(DeviceResultV2 {
-            message: response.message,
-            state_generation: response.state_generation,
-            screenshot_generation: response.screenshot_generation,
-            state_id,
-            application_digest,
-            window_id,
-            display_fingerprint,
-            base_state_id: response.base_state_id,
-            observation: response.observation,
-            settle: response.settle,
-            screenshot,
-        })
+        Some(AccessibilityObservationKind::Full) | None => response_base_state_id.is_none(),
     }
 }
 
@@ -900,6 +1246,10 @@ fn supports_v2(capabilities: &BTreeSet<String>) -> bool {
 
 fn poison(state: &mut TransportState) {
     state.poisoned = true;
+    clear_failed_connection(state);
+}
+
+fn clear_failed_connection(state: &mut TransportState) {
     state.connection = None;
 }
 
@@ -1051,6 +1401,81 @@ mod tests {
     };
 
     #[test]
+    fn response_binding_accepts_only_current_or_exact_previous_response() {
+        let previous = ResponseBinding {
+            request_id: Uuid::new_v4(),
+            monotonic_sequence: 4,
+        };
+        let expected = ResponseBinding {
+            request_id: Uuid::new_v4(),
+            monotonic_sequence: 5,
+        };
+        assert_eq!(
+            classify_response_binding(expected, expected, Some(previous)).expect("current"),
+            ResponseFrameKind::Expected
+        );
+        assert_eq!(
+            classify_response_binding(previous, expected, Some(previous)).expect("duplicate"),
+            ResponseFrameKind::PreviousDuplicate
+        );
+
+        let unrelated = ResponseBinding {
+            request_id: Uuid::new_v4(),
+            monotonic_sequence: 5,
+        };
+        assert!(matches!(
+            classify_response_binding(unrelated, expected, Some(previous)),
+            Err(TransportError::ResponseBinding)
+        ));
+    }
+
+    #[test]
+    fn observation_binding_accepts_full_fallback_after_a_diff_request() {
+        let requested_base = Uuid::new_v4();
+        let full = AccessibilityObservation {
+            kind: AccessibilityObservationKind::Full,
+            reset: false,
+            truncated: false,
+            nodes: vec![],
+            removed: vec![],
+        };
+
+        assert!(valid_observation_binding(
+            Some(&full),
+            None,
+            Some(requested_base)
+        ));
+    }
+
+    #[test]
+    fn observation_binding_keeps_diff_tied_to_the_requested_base() {
+        let requested_base = Uuid::new_v4();
+        let diff = AccessibilityObservation {
+            kind: AccessibilityObservationKind::Diff,
+            reset: false,
+            truncated: false,
+            nodes: vec![],
+            removed: vec![],
+        };
+
+        assert!(valid_observation_binding(
+            Some(&diff),
+            Some(requested_base),
+            Some(requested_base)
+        ));
+        assert!(!valid_observation_binding(
+            Some(&diff),
+            None,
+            Some(requested_base)
+        ));
+        assert!(!valid_observation_binding(
+            Some(&diff),
+            Some(Uuid::new_v4()),
+            Some(requested_base)
+        ));
+    }
+
+    #[test]
     fn managed_context_rejects_group_readable_file() {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("context.json");
@@ -1076,6 +1501,22 @@ mod tests {
         symlink(&target, &link).expect("create context symlink");
 
         assert!(ManagedContext::load(&link).is_err());
+    }
+
+    #[test]
+    fn managed_context_treats_null_capabilities_as_v1() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("context.json");
+        let context = test_context(1, Utc::now() + chrono::Duration::seconds(30));
+        let mut value = serde_json::to_value(context).expect("serialize context");
+        value["capabilities"] = serde_json::Value::Null;
+        std::fs::write(&path, serde_json::to_vec(&value).expect("encode context"))
+            .expect("write context");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set context permissions");
+
+        let loaded = ManagedContext::load(&path).expect("load legacy null capabilities");
+        assert!(loaded.capabilities.is_empty());
     }
 
     #[tokio::test]
@@ -1273,7 +1714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn action_wait_is_bounded_by_the_remaining_lease() {
+    async fn pre_request_timeout_is_bounded_by_the_lease_without_poisoning() {
         let directory = tempdir().expect("temp directory");
         let socket_path = directory.path().join("bridge.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind bridge socket");
@@ -1291,10 +1732,213 @@ mod tests {
             Err(TransportError::OperationTimedOut)
         ));
         let state = transport.state.lock().await;
-        assert!(state.poisoned);
+        assert!(!state.poisoned);
         assert!(state.connection.is_none());
+        assert_eq!(state.context.next_sequence, 1);
         drop(state);
         server.abort();
+    }
+
+    #[test]
+    fn action_waits_for_a_lease_that_can_cover_transport_and_capture_work() {
+        let now = Utc::now();
+        let stale = test_context(1, now + chrono::Duration::seconds(29));
+        let fresh = test_context(1, now + chrono::Duration::seconds(31));
+
+        assert!(!action_lease_ready(&stale, now));
+        assert!(action_lease_ready(&fresh, now));
+    }
+
+    #[tokio::test]
+    async fn repeated_bridge_handshake_failures_allow_a_later_fresh_action() {
+        let directory = tempdir().expect("temp directory");
+        let socket_path = directory.path().join("bridge.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind bridge socket");
+        let context = test_context(9, Utc::now() + chrono::Duration::seconds(60));
+        let server_context = context.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept failed handshake");
+                let _: BridgeHello = read_bridge_control(&mut stream)
+                    .await
+                    .expect("read failed-handshake hello");
+            }
+
+            let (mut stream, _) = listener.accept().await.expect("accept recovery handshake");
+            let hello: BridgeHello = read_bridge_control(&mut stream)
+                .await
+                .expect("read recovery hello");
+            assert_eq!(hello.generation, server_context.generation);
+            let identity = GenerationIdentity::generate().expect("device identity");
+            let exporter_context = hex::encode([0x7c_u8; 32]);
+            write_bridge_control(
+                &mut stream,
+                &BridgeMaterial {
+                    protocol_version: BRIDGE_PROTOCOL_VERSION,
+                    generation: server_context.generation,
+                    peer_spki_sha256: identity.spki_sha256_hex(),
+                    exporter_context: exporter_context.clone(),
+                },
+            )
+            .await
+            .expect("write bridge material");
+            let material = GenerationMaterial::from_hex(
+                server_context.generation,
+                &hello.spki_sha256,
+                &exporter_context,
+            )
+            .expect("generation material");
+            let acceptor = TlsAcceptor::from(Arc::new(
+                server_config(&identity, &material).expect("server config"),
+            ));
+            let mut tls = acceptor.accept(stream).await.expect("nested TLS handshake");
+            let exporter =
+                server_exporter_binding(tls.get_ref().1, &material).expect("server exporter");
+            let confirmation = confirmation_record(
+                &exporter,
+                NestedTlsRole::Device,
+                server_context.generation,
+                server_context.device_session_id,
+            );
+            tls.write_all(&confirmation)
+                .await
+                .expect("device confirmation");
+            tls.flush().await.expect("flush confirmation");
+            let mut peer_confirmation = [0_u8; CONFIRMATION_RECORD_BYTES];
+            tls.read_exact(&mut peer_confirmation)
+                .await
+                .expect("proxy confirmation");
+            verify_peer_confirmation(
+                &peer_confirmation,
+                &exporter,
+                NestedTlsRole::Device,
+                server_context.generation,
+                server_context.device_session_id,
+            )
+            .expect("verify proxy confirmation");
+
+            let request = read_framed_json(&mut tls).await;
+            let request = &request["request"];
+            assert_eq!(request["context"]["monotonic_sequence"], 1);
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": request["request_id"],
+                    "monotonic_sequence": 1,
+                    "screenshot_generation": 0,
+                    "status": "success",
+                    "message": "recovered",
+                    "image": null
+                }),
+            )
+            .await;
+        });
+
+        let transport = UnixDeviceTransport::new(&socket_path, context);
+        assert!(matches!(
+            transport.execute(Action::Screenshot).await,
+            Err(TransportError::BridgeHandshakeIo { .. })
+        ));
+        {
+            let state = transport.state.lock().await;
+            assert!(!state.poisoned);
+            assert!(state.connection.is_none());
+            assert_eq!(state.context.next_sequence, 1);
+        }
+
+        let result = transport
+            .execute(Action::Screenshot)
+            .await
+            .expect("fresh action after handshake failures");
+        assert_eq!(result.message, "recovered");
+        let state = transport.state.lock().await;
+        assert!(!state.poisoned);
+        assert_eq!(state.context.next_sequence, 2);
+        drop(state);
+        server.await.expect("bridge server");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_request_recovers_exact_replay_before_the_next_action() {
+        let directory = tempdir().expect("temp directory");
+        let socket_path = directory.path().join("bridge.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind bridge socket");
+        let context = test_context(11, Utc::now() + chrono::Duration::seconds(60));
+        let server_context = context.clone();
+        let server = tokio::spawn(async move {
+            let mut pending_request_id = None;
+            for exporter_byte in [0x31, 0x32] {
+                let mut tls = accept_test_tls(&listener, &server_context, exporter_byte).await;
+                let request = read_framed_json(&mut tls).await;
+                let request = &request["request"];
+                assert_eq!(request["context"]["monotonic_sequence"], 1);
+                let request_id = request["request_id"].clone();
+                if let Some(expected) = &pending_request_id {
+                    assert_eq!(&request_id, expected, "retry must replay exact bytes");
+                } else {
+                    pending_request_id = Some(request_id);
+                }
+                drop(tls);
+            }
+
+            let mut tls = accept_test_tls(&listener, &server_context, 0x33).await;
+            let recovered = read_framed_json(&mut tls).await;
+            let recovered = &recovered["request"];
+            assert_eq!(Some(recovered["request_id"].clone()), pending_request_id);
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": recovered["request_id"],
+                    "monotonic_sequence": 1,
+                    "screenshot_generation": 0,
+                    "status": "success",
+                    "message": "pending recovered",
+                    "image": null
+                }),
+            )
+            .await;
+
+            let next = read_framed_json(&mut tls).await;
+            let next = &next["request"];
+            assert_eq!(next["context"]["monotonic_sequence"], 2);
+            assert_ne!(next["request_id"], recovered["request_id"]);
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": next["request_id"],
+                    "monotonic_sequence": 2,
+                    "screenshot_generation": 0,
+                    "status": "success",
+                    "message": "next action completed",
+                    "image": null
+                }),
+            )
+            .await;
+        });
+
+        let transport = UnixDeviceTransport::new(&socket_path, context);
+        assert!(matches!(
+            transport.execute(Action::Screenshot).await,
+            Err(TransportError::ChannelIo { .. })
+        ));
+        {
+            let state = transport.state.lock().await;
+            assert!(!state.poisoned);
+            assert!(matches!(state.pending_request, Some(PendingRequest::V1(_))));
+            assert_eq!(state.context.next_sequence, 1);
+        }
+
+        let result = transport
+            .execute(Action::Wait { duration_ms: 1 })
+            .await
+            .expect("fresh action after pending replay recovery");
+        assert_eq!(result.message, "next action completed");
+        let state = transport.state.lock().await;
+        assert!(!state.poisoned);
+        assert!(state.pending_request.is_none());
+        assert_eq!(state.context.next_sequence, 3);
+        drop(state);
+        server.await.expect("bridge server");
     }
 
     #[tokio::test]
@@ -1538,32 +2182,29 @@ mod tests {
             assert_eq!(first["context"]["base_state_id"], serde_json::Value::Null);
             assert_eq!(first["observation"]["mode"], "auto");
             assert_eq!(first["action"]["type"], "observe");
-            write_framed_json(
-                &mut tls,
-                &serde_json::json!({
-                    "request_id": first["request_id"],
-                    "monotonic_sequence": 1,
-                    "state_generation": 1,
-                    "screenshot_generation": 0,
-                    "state_id": state_id,
-                    "application_digest": "a".repeat(64),
-                    "window_id": 7,
-                    "display_fingerprint": "display-layout",
-                    "base_state_id": null,
-                    "status": "success",
-                    "message": "Action completed.",
-                    "observation": {
-                        "kind": "full",
-                        "reset": false,
-                        "truncated": false,
-                        "nodes": [],
-                        "removed": []
-                    },
-                    "settle": {"status": "not_requested", "elapsed_ms": 0},
-                    "image": null
-                }),
-            )
-            .await;
+            let first_response = serde_json::json!({
+                "request_id": first["request_id"],
+                "monotonic_sequence": 1,
+                "state_generation": 1,
+                "screenshot_generation": 0,
+                "state_id": state_id,
+                "application_digest": "a".repeat(64),
+                "window_id": 7,
+                "display_fingerprint": "display-layout",
+                "base_state_id": null,
+                "status": "success",
+                "message": "Action completed.",
+                "observation": {
+                    "kind": "full",
+                    "reset": false,
+                    "truncated": false,
+                    "nodes": [],
+                    "removed": []
+                },
+                "settle": {"status": "not_requested", "elapsed_ms": 0},
+                "image": null
+            });
+            write_framed_json(&mut tls, &first_response).await;
 
             let second = read_framed_json(&mut tls).await;
             let second = &second["request"];
@@ -1571,6 +2212,9 @@ mod tests {
             assert_eq!(second["context"]["current_state_generation"], 1);
             assert_eq!(second["context"]["base_state_id"], state_id.to_string());
             assert_eq!(second["observation"]["mode"], "none");
+            // A delayed response from an exact replay can be queued ahead of the
+            // current response. The proxy must discard only this proven duplicate.
+            write_framed_json(&mut tls, &first_response).await;
             write_framed_json(
                 &mut tls,
                 &serde_json::json!({
@@ -1729,6 +2373,62 @@ mod tests {
             .expect("response length");
         stream.write_all(&bytes).await.expect("response bytes");
         stream.flush().await.expect("flush response");
+    }
+
+    async fn accept_test_tls(
+        listener: &UnixListener,
+        context: &ManagedContext,
+        exporter_byte: u8,
+    ) -> tokio_rustls::server::TlsStream<UnixStream> {
+        let (mut stream, _) = listener.accept().await.expect("accept proxy");
+        let hello: BridgeHello = read_bridge_control(&mut stream)
+            .await
+            .expect("bridge hello");
+        let identity = GenerationIdentity::generate().expect("device identity");
+        let exporter_context = hex::encode([exporter_byte; 32]);
+        write_bridge_control(
+            &mut stream,
+            &BridgeMaterial {
+                protocol_version: BRIDGE_PROTOCOL_VERSION,
+                generation: context.generation,
+                peer_spki_sha256: identity.spki_sha256_hex(),
+                exporter_context: exporter_context.clone(),
+            },
+        )
+        .await
+        .expect("bridge material");
+        let material =
+            GenerationMaterial::from_hex(context.generation, &hello.spki_sha256, &exporter_context)
+                .expect("generation material");
+        let acceptor = TlsAcceptor::from(Arc::new(
+            server_config(&identity, &material).expect("server config"),
+        ));
+        let mut tls = acceptor.accept(stream).await.expect("nested TLS handshake");
+        let exporter =
+            server_exporter_binding(tls.get_ref().1, &material).expect("server exporter");
+        let confirmation = confirmation_record(
+            &exporter,
+            NestedTlsRole::Device,
+            context.generation,
+            context.device_session_id,
+        );
+        tls.write_all(&confirmation)
+            .await
+            .expect("device confirmation");
+        tls.flush().await.expect("flush confirmation");
+        let mut peer_confirmation = [0_u8; CONFIRMATION_RECORD_BYTES];
+        tls.read_exact(&mut peer_confirmation)
+            .await
+            .expect("proxy confirmation");
+        verify_peer_confirmation(
+            &peer_confirmation,
+            &exporter,
+            NestedTlsRole::Device,
+            context.generation,
+            context.device_session_id,
+        )
+        .expect("verify proxy confirmation");
+        tls
     }
 
     fn test_context(generation: u64, lease_until: DateTime<Utc>) -> ManagedContext {

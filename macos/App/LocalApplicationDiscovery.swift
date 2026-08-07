@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import DeviceAppCore
 import DeviceIPC
 import DeviceSecurity
@@ -71,6 +72,21 @@ enum LocalApplicationDiscovery {
         else {
             throw DeviceIPCFailure.invalidMessage
         }
+        requestActivation(application)
+        for attempt in 0 ..< 20 {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == application.processIdentifier
+            {
+                return
+            }
+            if attempt == 10 {
+                requestActivation(application)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        // Some applications ignore the lightweight activation request. Reopening the
+        // existing bundle is a bounded fallback, not the common switching path.
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
@@ -81,15 +97,44 @@ enum LocalApplicationDiscovery {
         guard activated.processIdentifier == application.processIdentifier else {
             throw DeviceIPCFailure.serviceUnavailable
         }
-        for _ in 0 ..< 80 {
+        for attempt in 0 ..< 80 {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier
                 == application.processIdentifier
             {
                 return
             }
+            if attempt.isMultiple(of: 10) {
+                requestActivation(application)
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
         throw DeviceIPCFailure.serviceUnavailable
+    }
+
+    @MainActor
+    private static func requestActivation(_ application: NSRunningApplication) {
+        _ = application.unhide()
+        _ = application.activate(options: [.activateAllWindows])
+
+        let accessibilityApplication = AXUIElementCreateApplication(
+            application.processIdentifier
+        )
+        _ = AXUIElementSetAttributeValue(
+            accessibilityApplication,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        var rawWindows: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            accessibilityApplication,
+            kAXWindowsAttribute as CFString,
+            &rawWindows
+        ) == .success,
+            let windows = rawWindows as? [AXUIElement]
+        else { return }
+        for window in windows.prefix(8) {
+            _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        }
     }
 
     private static func isBoundedIdentifier(_ value: String) -> Bool {

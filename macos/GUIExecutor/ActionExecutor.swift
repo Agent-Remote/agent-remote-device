@@ -139,6 +139,33 @@ public final class ActionExecutor {
         }
     }
 
+    public func executeContextAction(
+        action: Action,
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        context: WindowContext
+    ) async throws {
+        do {
+            guard AXIsProcessTrusted() else {
+                throw ExecutionFailure.accessibilityPermissionMissing
+            }
+            let displayFingerprint = try await verifyLiveContext(context)
+            try await guardState.authorizeContextAction(
+                action: action,
+                sequence: sequence,
+                stateGeneration: stateGeneration,
+                displayFingerprint: displayFingerprint,
+                windowID: context.windowID,
+                application: context.application
+            )
+            try await dispatchContextAction(action, processID: context.processID)
+            try await guardState.accept(sequence: sequence)
+        } catch {
+            releasePressedState()
+            throw error
+        }
+    }
+
     public func authorizeCaptureAction(
         action: Action,
         sequence: UInt64,
@@ -228,10 +255,13 @@ public final class ActionExecutor {
     }
 
     private func verifyLiveContext(_ capture: CapturedWindow) async throws -> String {
-        try await verifyLiveContext(capture.windowContext)
+        try await verifyLiveContext(capture.windowContext, requireExactFrame: true)
     }
 
-    private func verifyLiveContext(_ context: WindowContext) async throws -> String {
+    private func verifyLiveContext(
+        _ context: WindowContext,
+        requireExactFrame: Bool = false
+    ) async throws -> String {
         guard let frontmost = NSWorkspace.shared.frontmostApplication,
               frontmost.processIdentifier == context.processID,
               frontmost.bundleIdentifier == context.application.bundleIdentifier
@@ -244,7 +274,9 @@ public final class ActionExecutor {
         )
         guard let window = content.windows.first(where: { $0.windowID == context.windowID }),
               window.owningApplication?.processID == context.processID,
-              window.frame.equalTo(context.windowFrame)
+              requireExactFrame
+                ? window.frame.equalTo(context.windowFrame)
+                : AccessibilityRuntime.windowMatchScore(window.frame, context.windowFrame) >= 0.9
         else {
             throw ExecutionFailure.windowChanged
         }
@@ -257,6 +289,54 @@ public final class ActionExecutor {
         let fingerprint = WindowCapture.displayFingerprint(content.displays, selected: display)
         guard fingerprint == context.displayFingerprint else { throw ExecutionFailure.displayChanged }
         return fingerprint
+    }
+
+    private func dispatchContextAction(_ action: Action, processID: pid_t) async throws {
+        switch action {
+        case let .type(text):
+            try typeText(text, processID: processID)
+        case let .key(key):
+            try postKey(key)
+        case let .holdKey(key, durationMilliseconds):
+            let parsed = try KeyParser.parse(key)
+            guard let down = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: parsed.keyCode,
+                keyDown: true
+            ) else {
+                throw ExecutionFailure.eventCreationFailed
+            }
+            down.flags = parsed.flags
+            down.post(tap: .cghidEventTap)
+            heldKeyCode = parsed.keyCode
+            try await Task.sleep(for: .milliseconds(durationMilliseconds))
+            guard let up = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: parsed.keyCode,
+                keyDown: false
+            ) else {
+                throw ExecutionFailure.eventCreationFailed
+            }
+            up.flags = parsed.flags
+            up.post(tap: .cghidEventTap)
+            heldKeyCode = nil
+        case let .scroll(deltaX, deltaY, nil):
+            guard let event = CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .pixel,
+                wheelCount: 2,
+                wheel1: deltaY,
+                wheel2: deltaX,
+                wheel3: 0
+            ) else {
+                throw ExecutionFailure.eventCreationFailed
+            }
+            event.post(tap: .cghidEventTap)
+        case let .wait(durationMilliseconds):
+            try await Task.sleep(for: .milliseconds(durationMilliseconds))
+        default:
+            throw ExecutionFailure.actionRequiresCapture
+        }
     }
 
     private func dispatch(_ action: Action, capture: CapturedWindow) async throws {
@@ -313,7 +393,7 @@ public final class ActionExecutor {
             try requireMouseEvent(type: .leftMouseUp, point: point, button: .left)
             leftMouseIsDown = false
         case let .type(text):
-            try typeText(text)
+            try typeText(text, processID: capture.processID)
         case let .key(key):
             try postKey(key)
         case let .holdKey(key, durationMilliseconds):
@@ -374,14 +454,76 @@ public final class ActionExecutor {
         CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: button)?.post(tap: .cghidEventTap)
     }
 
-    private func typeText(_ text: String) throws {
+    private func typeText(_ text: String, processID: pid_t) throws {
+        if setFocusedValue(text, processID: processID) {
+            return
+        }
         for chunk in text.utf16.chunked(maximumCount: 20) {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true) else {
+            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+            else {
                 throw ExecutionFailure.eventCreationFailed
             }
-            event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
-            event.post(tap: .cghidEventTap)
+            down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            down.postToPid(processID)
+            up.postToPid(processID)
+            Thread.sleep(forTimeInterval: 0.02)
         }
+    }
+
+    private func setFocusedValue(_ text: String, processID: pid_t) -> Bool {
+        let application = AXUIElementCreateApplication(processID)
+        var focusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            application,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        ) == .success,
+            let focusedValue,
+            CFGetTypeID(focusedValue) == AXUIElementGetTypeID()
+        else {
+            return false
+        }
+        let focused = focusedValue as! AXUIElement
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            focused,
+            kAXValueAttribute as CFString,
+            &settable
+        ) == .success, settable.boolValue else {
+            return false
+        }
+        var currentValue: CFTypeRef?
+        let current = if AXUIElementCopyAttributeValue(
+            focused,
+            kAXValueAttribute as CFString,
+            &currentValue
+        ) == .success {
+            currentValue as? String ?? ""
+        } else {
+            ""
+        }
+        var placeholderValue: CFTypeRef?
+        let placeholder: String? = if AXUIElementCopyAttributeValue(
+            focused,
+            kAXPlaceholderValueAttribute as CFString,
+            &placeholderValue
+        ) == .success {
+            placeholderValue as? String
+        } else {
+            nil
+        }
+        return AXUIElementSetAttributeValue(
+            focused,
+            kAXValueAttribute as CFString,
+            Self.insertionValue(current: current, placeholder: placeholder, text: text) as CFString
+        ) == .success
+    }
+
+    static func insertionValue(current: String, placeholder: String?, text: String) -> String {
+        let base = current == placeholder ? "" : current
+        return base + text
     }
 
     private func postKey(_ value: String) throws {

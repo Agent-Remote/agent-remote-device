@@ -1,8 +1,10 @@
 import DeviceIPC
 import DeviceProtocol
 import Foundation
+import OSLog
 
 public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @unchecked Sendable {
+    private let logger = Logger(subsystem: "dev.agentremote.device", category: "relay")
     public typealias PendingSessionProvider = @Sendable () async throws -> BrokerPendingSession?
     public typealias CandidateProvider = @Sendable () async throws -> [BrokerSessionCandidate]
     public typealias ClaimProvider = @Sendable (BrokerClaimRequest) async throws
@@ -31,6 +33,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     private let renewProvider: RenewProvider
     private let generationRotationInterval: Duration
     private let xpcReplyTimeout: Duration
+    private let actionReplyTimeout: Duration
+    private let renewalRetryDelaySeconds: TimeInterval
     private var executorConnection: NSXPCConnection?
     private var relay: (any NetworkBrokerRelayRunning)?
     private var relayTask: Task<Void, Never>?
@@ -72,7 +76,9 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
             throw DeviceIPCFailure.serviceUnavailable
         },
         generationRotationInterval: Duration = .seconds(14 * 60),
-        xpcReplyTimeout: Duration = .seconds(15)
+        xpcReplyTimeout: Duration = .seconds(15),
+        actionReplyTimeout: Duration = .seconds(60),
+        renewalRetryDelaySeconds: TimeInterval = 1
     ) {
         self.executorOverride = executorOverride
         self.pendingSessionProvider = pendingSessionProvider
@@ -86,6 +92,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.renewProvider = renewProvider
         self.generationRotationInterval = generationRotationInterval
         self.xpcReplyTimeout = xpcReplyTimeout
+        self.actionReplyTimeout = actionReplyTimeout
+        self.renewalRetryDelaySeconds = renewalRetryDelaySeconds
     }
 
     public func pollPendingSession(reply: @escaping (NSData?, NSError?) -> Void) {
@@ -452,7 +460,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                             )
                         }
                         let response = try await performExecutorAction(request)
-                        if selection.isScreenshot, let target = selection.target {
+                        if selection.updatesTarget, let target = selection.target {
                             setRelayTargetApplication(target, binding: configuration.binding)
                         }
                         try await lockAcquirer.acquire(configuration.binding)
@@ -470,6 +478,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                 completeRelay(relay)
             } catch {
                 guard !Task.isCancelled else { return }
+                logger.error("Relay failed: \(String(describing: error), privacy: .public)")
                 await abortAfterRelayFailure(configuration.binding, relay: relay)
             }
         }
@@ -540,20 +549,57 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         Task { [weak self, weak relay] in
             guard let self, let relay else { return }
             var configuration = initialConfiguration
+            var executorLeaseUntil = initialConfiguration.leaseUntil
             do {
                 while true {
                     let remaining = configuration.leaseUntil.timeIntervalSinceNow
                     guard remaining > 1 else { throw DeviceIPCFailure.serviceUnavailable }
                     let delay = min(10, max(1, remaining / 2))
                     try await Task.sleep(for: .seconds(delay))
-                    configuration = try await renewProvider(configuration)
-                    try await renewExecutor(configuration)
+                    configuration = try await renewControlPlaneWithRetry(configuration)
+                    try await renewExecutorWithRetry(
+                        configuration,
+                        currentLeaseUntil: executorLeaseUntil
+                    )
+                    executorLeaseUntil = configuration.leaseUntil
                 }
             } catch {
                 guard !Task.isCancelled else { return }
                 await abortAfterRelayFailure(configuration.binding, relay: relay)
             }
         }
+    }
+
+    private func renewControlPlaneWithRetry(
+        _ configuration: ExecutorSessionConfiguration
+    ) async throws -> ExecutorSessionConfiguration {
+        while true {
+            do {
+                return try await renewProvider(configuration)
+            } catch {
+                try await waitForRenewalRetry(before: configuration.leaseUntil, error: error)
+            }
+        }
+    }
+
+    private func renewExecutorWithRetry(
+        _ configuration: ExecutorSessionConfiguration,
+        currentLeaseUntil: Date
+    ) async throws {
+        while true {
+            do {
+                try await renewExecutor(configuration)
+                return
+            } catch {
+                try await waitForRenewalRetry(before: currentLeaseUntil, error: error)
+            }
+        }
+    }
+
+    private func waitForRenewalRetry(before deadline: Date, error: Error) async throws {
+        let retryWindow = deadline.timeIntervalSinceNow - 1
+        guard retryWindow > 0 else { throw error }
+        try await Task.sleep(for: .seconds(min(renewalRetryDelaySeconds, retryWindow)))
     }
 
     private func renewExecutor(_ configuration: ExecutorSessionConfiguration) async throws {
@@ -583,7 +629,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         }) else {
             throw DeviceIPCFailure.serviceUnavailable
         }
-        return try await continuation.wait(timeout: xpcReplyTimeout) { callback in
+        return try await continuation.wait(timeout: actionReplyTimeout) { callback in
             executor.performAction(request as NSData) { response, error in
                 guard error == nil,
                       let response,
@@ -600,25 +646,41 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     private func applicationSelection(
         for data: Data,
         configuration: ExecutorSessionConfiguration
-    ) throws -> (target: String?, isScreenshot: Bool) {
+    ) throws -> (target: String?, updatesTarget: Bool) {
         let envelope = try DeviceIPCEnvelope.decode(data)
-        let request = try ActionRequest.decodeStrict(envelope.payload)
-        switch request.action {
-        case let .screenshotApplication(application):
-            return (application, true)
-        case .screenshot:
-            let target = configuration.approvals.count == 1
-                ? configuration.approvals.first?.application.bundleIdentifier
-                : nil
-            return (target, true)
-        default:
-            return (
-                lock.withLock {
-                    relayBinding == configuration.binding ? relayTargetApplication : nil
-                },
-                false
-            )
+        guard let object = try JSONSerialization.jsonObject(with: envelope.payload) as? [String: Any],
+              let version = object["version"] as? NSNumber
+        else {
+            throw DeviceIPCFailure.invalidMessage
         }
+        let singleApprovedTarget = configuration.approvals.count == 1
+            ? configuration.approvals.first?.application.bundleIdentifier
+            : nil
+        switch version.uint8Value {
+        case DeviceProtocol.protocolVersion:
+            let request = try ActionRequest.decodeStrict(envelope.payload)
+            switch request.action {
+            case let .screenshotApplication(application):
+                return (application, true)
+            case .screenshot:
+                return (singleApprovedTarget, true)
+            default:
+                break
+            }
+        case DeviceProtocol.protocolVersionV2:
+            let request = try ActionRequestV2.decodeStrict(envelope.payload)
+            if case let .observe(application) = request.action {
+                return (application ?? singleApprovedTarget, true)
+            }
+        default:
+            throw DeviceIPCFailure.invalidMessage
+        }
+        return (
+            lock.withLock {
+                relayBinding == configuration.binding ? relayTargetApplication : nil
+            },
+            false
+        )
     }
 
     private func activateApprovalUIApplication(
@@ -664,12 +726,6 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         case .turnStop:
             try await pauseExecutorTurn(binding)
             setTurnPaused(true, binding: binding)
-            do {
-                try await notifyApprovalUI(kind: .turnStopped, binding: binding)
-            } catch {
-                setTurnPaused(false, binding: binding)
-                throw error
-            }
         case .sessionEnd:
             cancelBackgroundLeaseTasks()
             try await endExecutorAndControlPlane(binding)
@@ -700,14 +756,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
 
     private func resumeTurnIfNeeded(_ binding: DeviceSessionBinding) async throws {
         guard isTurnPaused(binding: binding) else { return }
-        do {
-            try await notifyApprovalUI(kind: .turnStarted, binding: binding)
-            try await resumeExecutorTurn(binding)
-            setTurnPaused(false, binding: binding)
-        } catch {
-            try? await notifyApprovalUI(kind: .turnStopped, binding: binding)
-            throw error
-        }
+        try await resumeExecutorTurn(binding)
+        setTurnPaused(false, binding: binding)
     }
 
     private func resumeExecutorTurn(_ binding: DeviceSessionBinding) async throws {

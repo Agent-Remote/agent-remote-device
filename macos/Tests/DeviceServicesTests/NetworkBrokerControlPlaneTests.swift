@@ -31,6 +31,41 @@ private actor RecordingHTTPTransport: NetworkBrokerHTTPTransport {
     func recordedRequests() -> [URLRequest] { requests }
 }
 
+private actor ApprovalRecoveryHTTPTransport: NetworkBrokerHTTPTransport {
+    enum Step {
+        case response(Data, Int)
+        case failure(URLError)
+    }
+
+    private var steps: [Step]
+    private(set) var requests: [URLRequest] = []
+
+    init(steps: [Step]) {
+        self.steps = steps
+    }
+
+    func send(
+        _ request: URLRequest,
+        maximumResponseBytes _: Int
+    ) async throws -> (Data, HTTPURLResponse) {
+        requests.append(request)
+        switch steps.removeFirst() {
+        case let .failure(error):
+            throw error
+        case let .response(data, status):
+            let response = try #require(HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            ))
+            return (data, response)
+        }
+    }
+
+    func recordedRequests() -> [URLRequest] { requests }
+}
+
 private let controlPlaneDeviceID = "2cb933ce-b922-4ed7-b479-6ded90f09d2d"
 private let controlPlaneToken = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
 
@@ -517,6 +552,100 @@ private func relayMaterialJSON(
     }
     #expect(await policyChecker.callCount() == 2)
     #expect(await transport.recordedRequests().count == 3)
+}
+
+@Test func discoveryReconcilesApprovalAfterResponseTimeout() async throws {
+    let pending = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let inbox = { (session: String) in
+        Data("{\"data\":{\"items\":[\(session)]},\"request_id\":null}".utf8)
+    }
+    let transport = ApprovalRecoveryHTTPTransport(steps: [
+        .response(inbox(pending), 200),
+        .failure(URLError(.timedOut)),
+        .response(inbox(active), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let approval = LocalApproval(
+        application: ApplicationIdentity(
+            bundleIdentifier: "com.openai.codex",
+            signingIdentifier: "com.openai.codex"
+        ),
+        controlLevel: .fullControl,
+        clipboardAllowed: false,
+        generation: 1
+    )
+    let discovered = try #require(try await coordinator.nextPendingSession(now: now))
+    let configuration = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: discovered.binding,
+            approvals: [approval],
+            result: .allowed
+        ),
+        now: now
+    ))
+
+    #expect(configuration.binding == discovered.binding)
+    let requests = await transport.recordedRequests()
+    #expect(requests.map(\.url?.path) == [
+        "/api/v1/device-sessions/device-inbox",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/approve",
+        "/api/v1/device-sessions/device-inbox",
+    ])
+}
+
+@Test func discoveryRetriesApprovalOnceWhenTimeoutDidNotCommit() async throws {
+    let pending = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let inbox = { (session: String) in
+        Data("{\"data\":{\"items\":[\(session)]},\"request_id\":null}".utf8)
+    }
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = ApprovalRecoveryHTTPTransport(steps: [
+        .response(inbox(pending), 200),
+        .failure(URLError(.networkConnectionLost)),
+        .response(inbox(pending), 200),
+        .response(response(active), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let discovered = try #require(try await coordinator.nextPendingSession(now: now))
+    _ = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: discovered.binding,
+            approvals: [LocalApproval(
+                application: ApplicationIdentity(
+                    bundleIdentifier: "com.google.Chrome",
+                    signingIdentifier: "com.google.Chrome"
+                ),
+                controlLevel: .fullControl,
+                clipboardAllowed: false,
+                generation: 1
+            )],
+            result: .allowed
+        ),
+        now: now
+    ))
+
+    let requests = await transport.recordedRequests()
+    #expect(requests.filter { $0.url?.path.hasSuffix("/approve") == true }.count == 2)
 }
 
 @Test func discoveryDoesNotPollWhileLocalBindingIsActive() async throws {

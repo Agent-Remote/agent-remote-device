@@ -226,6 +226,40 @@ public actor SessionGuard {
         }
     }
 
+    public func authorizeContextAction(
+        action: Action,
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        displayFingerprint: String,
+        windowID: UInt32,
+        application: ApplicationIdentity,
+        now: Date = Date()
+    ) throws {
+        try requireActive(now: now)
+        guard sequence == nextSequence else { throw GuardFailure.sequenceMismatch }
+        guard nextSequence < UInt64.max else {
+            failClosed()
+            throw GuardFailure.counterExhausted
+        }
+        guard action.hasValidParameters, !action.requiresModelVisibleScreenshot else {
+            throw GuardFailure.invalidParameters
+        }
+        guard let state = currentState, state.stateGeneration == stateGeneration else {
+            throw GuardFailure.staleState
+        }
+        guard state.displayFingerprint == displayFingerprint else {
+            throw GuardFailure.displayChanged
+        }
+        guard state.windowID == windowID else { throw GuardFailure.windowChanged }
+        let digest = application.stableDigest
+        guard state.applicationDigest == digest else { throw GuardFailure.applicationChanged }
+        guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
+        guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
+        guard approval.controlLevel >= requiredLevel(for: action) else {
+            throw GuardFailure.controlLevelDenied
+        }
+    }
+
     public func authorizeClipboardV2(
         sequence: UInt64,
         stateGeneration: UInt64,

@@ -31,6 +31,12 @@ public protocol GUIActionRuntime: Sendable {
         sequence: UInt64,
         context: WindowContext
     ) async throws
+    func executeContextAction(
+        action: Action,
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        context: WindowContext
+    ) async throws
     func settle(
         context: WindowContext,
         policy: ObservationPolicy,
@@ -102,6 +108,15 @@ public extension GUIActionRuntime {
         context _: WindowContext
     ) async throws {
         throw AccessibilityFailure.operationFailed
+    }
+
+    func executeContextAction(
+        action _: Action,
+        sequence _: UInt64,
+        stateGeneration _: UInt64,
+        context _: WindowContext
+    ) async throws {
+        throw ExecutionFailure.actionRequiresCapture
     }
 
     func settle(
@@ -215,17 +230,13 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
                 $0.bundleIdentifier == frontmostBundleIdentifier
             }
         }
-        let captureCandidates: [ApplicationIdentity]
-        if targetApplication != nil, candidates.count == 1, let application = candidates.first {
-            try await captureEngine.activate(application: application)
-            captureCandidates = [application]
-        } else if targetApplication == nil, candidates.isEmpty, approvedApplications.count == 1,
-           let application = approvedApplications.first
+        let captureCandidates = if targetApplication == nil, candidates.isEmpty,
+                                   approvedApplications.count == 1,
+                                   let application = approvedApplications.first
         {
-            try await captureEngine.activate(application: application)
-            captureCandidates = [application]
+            [application]
         } else {
-            captureCandidates = candidates
+            candidates
         }
         guard captureCandidates.count == 1 else {
             if targetApplication != nil {
@@ -274,6 +285,24 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         )
     }
 
+    public func executeContextAction(
+        action: Action,
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        context: WindowContext
+    ) async throws {
+        try await captureEngine.activate(
+            application: context.application,
+            processID: context.processID
+        )
+        try await executor.executeContextAction(
+            action: action,
+            sequence: sequence,
+            stateGeneration: stateGeneration,
+            context: context
+        )
+    }
+
     public func readClipboardV2(
         sequence: UInt64,
         stateGeneration: UInt64,
@@ -316,10 +345,14 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             }
             if fingerprint == prior {
                 stableSamples += 1
-                if stableSamples >= 2 {
+                let elapsed = elapsedMilliseconds(since: started)
+                // Dynamic web views can acknowledge an AXPress before their
+                // accessibility subtree begins updating. A short grace period
+                // avoids returning the unchanged pre-action tree as settled.
+                if stableSamples >= 3, elapsed >= 700 {
                     return SettleResult(
                         status: .settled,
-                        elapsedMilliseconds: elapsedMilliseconds(since: started)
+                        elapsedMilliseconds: elapsed
                     )
                 }
             } else {

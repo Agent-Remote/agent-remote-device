@@ -52,7 +52,7 @@ public struct ApplicationIdentity: Codable, Hashable, Sendable {
 }
 
 public enum ApplicationPolicy {
-    public static let mappingVersion = 1
+    public static let mappingVersion = 2
 
     public static func classify(bundleIdentifier: String) -> ApplicationClassification {
         let identifier = bundleIdentifier.lowercased()
@@ -93,7 +93,6 @@ public enum ApplicationPolicy {
 
     private static let viewOnlyIdentifiers: Set<String> = [
         "com.apple.safari",
-        "com.google.chrome",
         "org.mozilla.firefox",
     ]
 

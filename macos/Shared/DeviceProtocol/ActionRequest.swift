@@ -129,6 +129,18 @@ public enum Action: Sendable, Equatable {
         }
     }
 
+    public var requiresModelVisibleScreenshot: Bool {
+        switch self {
+        case .leftClick, .mouseMove, .leftClickDrag, .rightClick, .middleClick,
+             .doubleClick, .tripleClick, .leftMouseDown, .leftMouseUp:
+            true
+        case let .scroll(_, _, coordinate):
+            coordinate != nil
+        default:
+            false
+        }
+    }
+
     private static func isValidKey(_ key: String) -> Bool {
         !key.isEmpty && key.utf8.count <= 64 && key.utf8.allSatisfy {
             ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)

@@ -98,6 +98,7 @@ public enum CaptureFailure: Error, Equatable, Sendable {
     case signingIdentifierMismatch
     case approvedWindowMissing
     case displayMissing
+    case operationTimedOut
     case invalidCaptureSize
     case encodingFailed
     case cropOutOfBounds
@@ -114,6 +115,7 @@ public enum CaptureFailure: Error, Equatable, Sendable {
         case .signingIdentifierMismatch: "application_identity_mismatch"
         case .approvedWindowMissing: "approved_window_not_visible"
         case .displayMissing: "window_display_not_found"
+        case .operationTimedOut: "screenshot_capture_timed_out"
         case .invalidCaptureSize: "invalid_capture_size"
         case .encodingFailed: "screenshot_png_encoding_failed"
         case .cropOutOfBounds: "zoom_region_out_of_bounds"
@@ -133,13 +135,15 @@ public enum CaptureFailure: Error, Equatable, Sendable {
         case .applicationActivationRejected:
             "macOS rejected the request to bring the approved application to the foreground."
         case .applicationActivationTimedOut:
-            "The approved application did not become frontmost within two seconds."
+            "The approved application did not become frontmost within five seconds."
         case .signingIdentifierMismatch:
             "The frontmost application does not match the approved code identity."
         case .approvedWindowMissing:
             "No visible window was found for the approved application."
         case .displayMissing:
             "The approved window is not attached to an active display."
+        case .operationTimedOut:
+            "macOS did not complete the screenshot operation within eight seconds."
         case .invalidCaptureSize:
             "The approved window has an invalid screenshot size."
         case .encodingFailed:
@@ -151,6 +155,8 @@ public enum CaptureFailure: Error, Equatable, Sendable {
 }
 
 public struct WindowCapture: Sendable {
+    static let operationTimeout: Duration = .seconds(8)
+
     private let profile: CaptureProfile
     private let excludedBundleIdentifier: String
 
@@ -186,10 +192,12 @@ public struct WindowCapture: Sendable {
             displayFrame: resolved.display.frame
         )
         let filter = SCContentFilter(display: resolved.display, including: [resolved.window])
-        let image = try await SCScreenshotManager.captureImage(
-            contentFilter: filter,
-            configuration: configuration
-        )
+        let image = try await Self.withOperationTimeout {
+            try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+        }
         guard let pngData = Self.pngData(image) else { throw CaptureFailure.encodingFailed }
         return CapturedWindow(
             pngData: pngData,
@@ -230,26 +238,41 @@ public struct WindowCapture: Sendable {
         display: SCDisplay,
         captureFrame: CGRect
     ) {
-        guard let frontmost = NSWorkspace.shared.frontmostApplication,
-              frontmost.bundleIdentifier == application.bundleIdentifier,
-              frontmost.bundleIdentifier != excludedBundleIdentifier
-        else {
-            throw CaptureFailure.approvedApplicationNotFrontmost
+        guard application.bundleIdentifier != excludedBundleIdentifier else {
+            throw CaptureFailure.applicationActivationRejected
         }
-        guard Self.signingIdentifier(for: frontmost) == application.signingIdentifier else {
+        let running = NSRunningApplication.runningApplications(
+            withBundleIdentifier: application.bundleIdentifier
+        ).filter { !$0.isTerminated }
+        guard !running.isEmpty else {
+            throw CaptureFailure.approvedApplicationNotRunning
+        }
+        let matching = running.filter {
+            Self.signingIdentifier(for: $0) == application.signingIdentifier
+        }
+        guard matching.count == 1, let target = matching.first else {
             throw CaptureFailure.signingIdentifierMismatch
         }
-        let processID = frontmost.processIdentifier
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            true,
-            onScreenWindowsOnly: true
-        )
-        guard let window = content.windows.first(where: {
+        let processID = target.processIdentifier
+        let content = try await Self.withOperationTimeout {
+            try await SCShareableContent.excludingDesktopWindows(
+                true,
+                onScreenWindowsOnly: true
+            )
+        }
+        let windows = content.windows.filter {
             $0.owningApplication?.processID == processID
                 && $0.isOnScreen
                 && $0.frame.width > 1
                 && $0.frame.height > 1
-        }) else {
+        }
+        let selectedWindowID = Self.preferredWindowID(
+            candidates: windows.map { ($0.windowID, $0.frame) },
+            frontToBackWindowIDs: Self.frontToBackWindowIDs(processID: processID)
+        )
+        guard let selectedWindowID,
+              let window = windows.first(where: { $0.windowID == selectedWindowID })
+        else {
             throw CaptureFailure.approvedWindowMissing
         }
         guard let display = Self.selectedDisplay(for: window.frame, from: content.displays) else {
@@ -271,15 +294,36 @@ public struct WindowCapture: Sendable {
         guard application.bundleIdentifier != excludedBundleIdentifier else {
             throw CaptureFailure.applicationActivationRejected
         }
+        let isAlreadyFrontmost = await MainActor.run {
+            guard let frontmost = NSWorkspace.shared.frontmostApplication,
+                  frontmost.bundleIdentifier == application.bundleIdentifier,
+                  requiredProcessID == nil || frontmost.processIdentifier == requiredProcessID
+            else {
+                return false
+            }
+            return Self.signingIdentifier(for: frontmost) == application.signingIdentifier
+        }
+        if isAlreadyFrontmost { return }
+
         let processID = try await Self.requestActivation(
             application: application,
             requiredProcessID: requiredProcessID
         )
-        for _ in 0 ..< 40 {
+        for attempt in 0 ..< 100 {
             let isFrontmost = await MainActor.run {
                 NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
             }
             if isFrontmost { return }
+            if attempt.isMultiple(of: 10) {
+                await MainActor.run {
+                    guard let application = NSRunningApplication(
+                        processIdentifier: processID
+                    ) else { return }
+                    _ = application.unhide()
+                    _ = application.activate(options: [.activateAllWindows])
+                    Self.raiseAccessibilityWindows(processID: processID)
+                }
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
         throw CaptureFailure.applicationActivationTimedOut
@@ -303,6 +347,9 @@ public struct WindowCapture: Sendable {
         }) else {
             throw CaptureFailure.signingIdentifierMismatch
         }
+        _ = candidate.unhide()
+        _ = candidate.activate(options: [.activateAllWindows])
+        raiseAccessibilityWindows(processID: candidate.processIdentifier)
         guard let bundleURL = candidate.bundleURL else {
             throw CaptureFailure.applicationActivationRejected
         }
@@ -322,6 +369,26 @@ public struct WindowCapture: Sendable {
             throw CaptureFailure.applicationActivationRejected
         }
         return candidate.processIdentifier
+    }
+
+    private static func raiseAccessibilityWindows(processID: pid_t) {
+        let application = AXUIElementCreateApplication(processID)
+        _ = AXUIElementSetAttributeValue(
+            application,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        var rawWindows: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            application,
+            kAXWindowsAttribute as CFString,
+            &rawWindows
+        ) == .success,
+            let windows = rawWindows as? [AXUIElement]
+        else { return }
+        for window in windows.prefix(8) {
+            _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        }
     }
 
     public static func cropped(_ capture: CapturedWindow, to region: Region) throws -> CapturedWindow {
@@ -470,5 +537,95 @@ public struct WindowCapture: Sendable {
             width: frame.width,
             height: frame.height
         )
+    }
+
+    static func preferredWindowID(
+        candidates: [(windowID: CGWindowID, frame: CGRect)],
+        frontToBackWindowIDs: [CGWindowID]
+    ) -> CGWindowID? {
+        let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.windowID, $0.frame) })
+        if let frontmostSubstantial = frontToBackWindowIDs.first(where: { windowID in
+            guard let frame = byID[windowID] else { return false }
+            return frame.width >= 100 && frame.height >= 100
+        }) {
+            return frontmostSubstantial
+        }
+        return candidates.max { left, right in
+            let leftArea = left.frame.width * left.frame.height
+            let rightArea = right.frame.width * right.frame.height
+            if leftArea == rightArea { return left.windowID > right.windowID }
+            return leftArea < rightArea
+        }?.windowID
+    }
+
+    static func withOperationTimeout<Value: Sendable>(
+        _ timeout: Duration = operationTimeout,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let resolver = CaptureOperationResolver<Value>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                resolver.install(continuation)
+                Task.detached {
+                    do {
+                        resolver.resolve(.success(try await operation()))
+                    } catch {
+                        resolver.resolve(.failure(error))
+                    }
+                }
+                Task.detached {
+                    do {
+                        try await Task.sleep(for: timeout)
+                        resolver.resolve(.failure(CaptureFailure.operationTimedOut))
+                    } catch {}
+                }
+            }
+        } onCancel: {
+            resolver.resolve(.failure(CancellationError()))
+        }
+    }
+
+    private static func frontToBackWindowIDs(processID: pid_t) -> [CGWindowID] {
+        guard let values = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return [] }
+        return values.compactMap { value in
+            guard (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processID,
+                  (value[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let number = value[kCGWindowNumber as String] as? NSNumber
+            else { return nil }
+            return CGWindowID(number.uint32Value)
+        }
+    }
+}
+
+private final class CaptureOperationResolver<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var result: Result<Value, Error>?
+
+    func install(_ continuation: CheckedContinuation<Value, Error>) {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            continuation.resume(with: result)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resolve(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
     }
 }

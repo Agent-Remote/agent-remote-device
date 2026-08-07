@@ -64,6 +64,37 @@ import Testing
     ))
 }
 
+@MainActor
+@Test func accessibilityWindowMatchingToleratesBrowserFrameDifferences() {
+    let screenCaptureFrame = CGRect(x: 0, y: 39, width: 1_800, height: 1_069)
+    let accessibilityFrame = CGRect(x: 0, y: 25, width: 1_800, height: 1_083)
+
+    #expect(AccessibilityRuntime.windowMatchScore(
+        screenCaptureFrame,
+        accessibilityFrame
+    ) > 0.95)
+}
+
+@MainActor
+@Test func accessibilityWindowMatchingRanksTheExpectedWindowFirst() {
+    let expected = CGRect(x: 100, y: 80, width: 1_200, height: 800)
+    let sameWindow = CGRect(x: 100, y: 58, width: 1_200, height: 822)
+    let otherWindow = CGRect(x: 750, y: 120, width: 900, height: 700)
+
+    #expect(AccessibilityRuntime.windowMatchScore(sameWindow, expected)
+        > AccessibilityRuntime.windowMatchScore(otherWindow, expected))
+}
+
+@MainActor
+@Test func accessibilityWindowMatchingRejectsUnrelatedAndNestedWindows() {
+    let expected = CGRect(x: 100, y: 80, width: 1_200, height: 800)
+    let unrelated = CGRect(x: 1_500, y: 80, width: 1_200, height: 800)
+    let dialog = CGRect(x: 400, y: 250, width: 500, height: 300)
+
+    #expect(AccessibilityRuntime.windowMatchScore(unrelated, expected) == 0)
+    #expect(AccessibilityRuntime.windowMatchScore(dialog, expected) < 0.7)
+}
+
 @Test func accessibilityTraversalPrefersBoundedBrowserAndRowChildren() {
     #expect(AccessibilityTraversal.childAttributes(
         role: "AXWebArea",
@@ -120,6 +151,20 @@ import Testing
         actions: [],
         childCount: 2
     ))
+}
+
+@MainActor
+@Test func textInsertionDoesNotMaterializeAccessibilityPlaceholder() {
+    #expect(ActionExecutor.insertionValue(
+        current: "Work with ChatGPT",
+        placeholder: "Work with ChatGPT",
+        text: "hello"
+    ) == "hello")
+    #expect(ActionExecutor.insertionValue(
+        current: "existing ",
+        placeholder: "Work with ChatGPT",
+        text: "hello"
+    ) == "existing hello")
 }
 
 private func axNode(index: UInt32, title: String) -> AccessibilityNode {

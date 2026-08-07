@@ -8,6 +8,7 @@ packaged_xpc_verifier="$repo_root/scripts/verify-packaged-xpc.sh"
 development_script="$repo_root/scripts/build-development-app.sh"
 proxy_script="$repo_root/scripts/package-proxy-release.sh"
 prepare_version_script="$repo_root/scripts/prepare-version.sh"
+gui_executor_entitlements="$repo_root/macos/Entitlements/GUIExecutor.entitlements"
 
 expect_failure() {
   local expected=$1
@@ -28,6 +29,11 @@ expect_failure \
   "VERSION must be a semantic version" \
   env VERSION=invalid BUILD_NUMBER=1 SIGNING_IDENTITY=Developer TEAM_IDENTIFIER=AB12CD34EF \
   "$release_script"
+
+if grep -Fq '<key>com.apple.security.app-sandbox</key>' "$gui_executor_entitlements"; then
+  echo "GUI executor must remain outside App Sandbox for AX and CGEvent access" >&2
+  exit 1
+fi
 expect_failure \
   "VERSION must be a semantic version" \
   env VERSION=invalid BUILD_NUMBER=1 SIGNING_IDENTITY=Community \

@@ -178,18 +178,34 @@ public final class AccessibilityRuntime {
 
     private func focusedWindow(processID: pid_t, matching expectedFrame: CGRect) throws -> AXUIElement {
         let application = AXUIElementCreateApplication(processID)
+        AXUIElementSetMessagingTimeout(application, 0.5)
+        enableDynamicAccessibility(on: application)
         if let focused: AXUIElement = attribute(kAXFocusedWindowAttribute, from: application),
-           windowFrame(focused).map({ approximatelyEqual($0, expectedFrame) }) == true
+           windowFrame(focused).map({ Self.windowMatchScore($0, expectedFrame) >= 0.7 }) == true
         {
             return focused
         }
         let windows: [AXUIElement] = attribute(kAXWindowsAttribute, from: application) ?? []
-        guard let match = windows.first(where: {
-            windowFrame($0).map { approximatelyEqual($0, expectedFrame) } == true
-        }) else {
+        let candidates = windows.compactMap { window -> (AXUIElement, CGFloat)? in
+            guard let frame = windowFrame(window) else { return nil }
+            return (window, Self.windowMatchScore(frame, expectedFrame))
+        }
+        guard let match = candidates.max(by: { $0.1 < $1.1 }), match.1 >= 0.7 else {
             throw AccessibilityFailure.windowUnavailable
         }
-        return match
+        return match.0
+    }
+
+    private func enableDynamicAccessibility(on application: AXUIElement) {
+        // Chromium, Electron and WebKit surfaces may expose a cached or partial
+        // tree until an assistive client opts into their dynamic AX mode.
+        for attributeName in ["AXEnhancedUserInterface", "AXManualAccessibility"] {
+            _ = AXUIElementSetAttributeValue(
+                application,
+                attributeName as CFString,
+                kCFBooleanTrue
+            )
+        }
     }
 
     private func windowFrame(_ element: AXUIElement) -> CGRect? {
@@ -204,11 +220,19 @@ public final class AccessibilityRuntime {
         return CGRect(origin: position, size: size)
     }
 
-    private func approximatelyEqual(_ left: CGRect, _ right: CGRect) -> Bool {
-        abs(left.minX - right.minX) <= 2
-            && abs(left.minY - right.minY) <= 2
-            && abs(left.width - right.width) <= 2
-            && abs(left.height - right.height) <= 2
+    static func windowMatchScore(_ left: CGRect, _ right: CGRect) -> CGFloat {
+        guard left.width > 0, left.height > 0, right.width > 0, right.height > 0,
+              !left.isInfinite, !right.isInfinite,
+              !left.isNull, !right.isNull
+        else { return 0 }
+        let intersection = left.intersection(right)
+        guard !intersection.isNull, !intersection.isInfinite,
+              intersection.width > 0, intersection.height > 0
+        else { return 0 }
+        let intersectionArea = intersection.width * intersection.height
+        let unionArea = left.width * left.height + right.width * right.height - intersectionArea
+        guard unionArea > 0 else { return 0 }
+        return intersectionArea / unionArea
     }
 
     private func performNamedAction(_ name: String, on element: AXUIElement) throws {
@@ -320,8 +344,26 @@ public final class AccessibilityRuntime {
 }
 
 private struct BoundedAXRenderer {
+    private static let snapshotAttributeNames = [
+        kAXRoleAttribute as String,
+        kAXSubroleAttribute as String,
+        kAXHiddenAttribute as String,
+        kAXPositionAttribute as String,
+        kAXSizeAttribute as String,
+        kAXRowsAttribute as String,
+        "AXVisibleChildren",
+        kAXChildrenAttribute as String,
+        "AXContents",
+        kAXTitleAttribute as String,
+        kAXDescriptionAttribute as String,
+        kAXValueAttribute as String,
+        kAXPlaceholderValueAttribute as String,
+        "AXURL",
+    ]
+
     let policy: ObservationPolicy
     let priorElementsByHash: [UInt: [(UInt32, AXUIElement)]]
+    let deadline: ContinuousClock.Instant
     private(set) var nodes: [AccessibilityNode] = []
     private(set) var elements: [UInt32: AXUIElement] = [:]
     private var usedIndexes: Set<UInt32> = []
@@ -331,6 +373,7 @@ private struct BoundedAXRenderer {
 
     init(policy: ObservationPolicy, priorElements: [UInt32: AXUIElement]) {
         self.policy = policy
+        deadline = ContinuousClock.now.advanced(by: .seconds(3))
         priorElementsByHash = Dictionary(grouping: priorElements.sorted { $0.key < $1.key }) {
             CFHash($0.value)
         }
@@ -357,7 +400,8 @@ private struct BoundedAXRenderer {
         windowFrame: CGRect,
         ancestorVisible: Bool
     ) {
-        guard nodes.count < Int(policy.maxNodes),
+        guard ContinuousClock.now < deadline,
+              nodes.count < Int(policy.maxNodes),
               depth <= policy.maxDepth,
               textBytes < Int(policy.maxTotalTextBytes)
         else {
@@ -365,11 +409,12 @@ private struct BoundedAXRenderer {
             return
         }
         guard markSeen(element) else { return }
-        let rawRole: String = attribute(kAXRoleAttribute, from: element) ?? "AXUnknown"
-        let subrole: String? = attribute(kAXSubroleAttribute, from: element)
+        let snapshot = snapshotAttributes(of: element)
+        let rawRole: String = snapshot[kAXRoleAttribute as String] as? String ?? "AXUnknown"
+        let subrole = snapshot[kAXSubroleAttribute as String] as? String
         let secure = rawRole == "AXSecureTextField" || subrole == "AXSecureTextField"
-        let hidden: Bool = attribute(kAXHiddenAttribute, from: element) ?? false
-        let screenFrame = elementFrame(element)
+        let hidden = snapshot[kAXHiddenAttribute as String] as? Bool ?? false
+        let screenFrame = elementFrame(snapshot)
         let visible = AccessibilityVisibility.isVisible(
             hidden: hidden,
             frame: screenFrame,
@@ -378,17 +423,17 @@ private struct BoundedAXRenderer {
         )
         guard visible else { return }
 
-        let children = childElements(of: element, role: rawRole)
+        let children = childElements(snapshot: snapshot, role: rawRole)
         var settable = DarwinBoolean(false)
         _ = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
         var actionValues: CFArray?
         _ = AXUIElementCopyActionNames(element, &actionValues)
         let rawActions = (actionValues as? [String]) ?? []
-        let rawTitle: String? = attribute(kAXTitleAttribute, from: element)
-        let rawLabel: String? = attribute(kAXDescriptionAttribute, from: element)
-        let rawValue = secure ? nil : stringValue(attributeValue(kAXValueAttribute, from: element))
-        let rawPlaceholder: String? = attribute(kAXPlaceholderValueAttribute, from: element)
-        let rawURL = secure ? nil : stringValue(attributeValue("AXURL", from: element))
+        let rawTitle = snapshot[kAXTitleAttribute as String] as? String
+        let rawLabel = snapshot[kAXDescriptionAttribute as String] as? String
+        let rawValue = secure ? nil : stringValue(snapshot[kAXValueAttribute as String])
+        let rawPlaceholder = snapshot[kAXPlaceholderValueAttribute as String] as? String
+        let rawURL = secure ? nil : stringValue(snapshot["AXURL"])
         let hasSemanticText = [rawTitle, rawLabel, rawValue, rawPlaceholder, rawURL]
             .contains { $0?.isEmpty == false }
 
@@ -480,9 +525,9 @@ private struct BoundedAXRenderer {
         return true
     }
 
-    private func childElements(of element: AXUIElement, role: String) -> [AXUIElement] {
-        let rows: [AXUIElement] = attribute(kAXRowsAttribute, from: element) ?? []
-        let visibleChildren: [AXUIElement] = attribute("AXVisibleChildren", from: element) ?? []
+    private func childElements(snapshot: [String: Any], role: String) -> [AXUIElement] {
+        let rows = snapshot[kAXRowsAttribute as String] as? [AXUIElement] ?? []
+        let visibleChildren = snapshot["AXVisibleChildren"] as? [AXUIElement] ?? []
         let attributes = AccessibilityTraversal.childAttributes(
             role: role,
             hasRows: !rows.isEmpty,
@@ -496,7 +541,7 @@ private struct BoundedAXRenderer {
             } else if name == "AXVisibleChildren" {
                 values = visibleChildren
             } else {
-                values = attribute(name, from: element) ?? []
+                values = snapshot[name] as? [AXUIElement] ?? []
             }
             for child in values where !result.contains(where: { CFEqual($0, child) }) {
                 result.append(child)
@@ -525,10 +570,28 @@ private struct BoundedAXRenderer {
         return result
     }
 
-    private func elementFrame(_ element: AXUIElement) -> CGRect? {
-        guard let positionValue: AXValue = attribute(kAXPositionAttribute, from: element),
-              let sizeValue: AXValue = attribute(kAXSizeAttribute, from: element)
+    private func snapshotAttributes(of element: AXUIElement) -> [String: Any] {
+        var copiedValues: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(
+            element,
+            Self.snapshotAttributeNames as CFArray,
+            [],
+            &copiedValues
+        ) == .success,
+            let values = copiedValues as? [Any],
+            values.count == Self.snapshotAttributeNames.count
+        else { return [:] }
+        return Dictionary(uniqueKeysWithValues: zip(Self.snapshotAttributeNames, values))
+    }
+
+    private func elementFrame(_ snapshot: [String: Any]) -> CGRect? {
+        guard let rawPosition = snapshot[kAXPositionAttribute as String],
+              let rawSize = snapshot[kAXSizeAttribute as String],
+              CFGetTypeID(rawPosition as CFTypeRef) == AXValueGetTypeID(),
+              CFGetTypeID(rawSize as CFTypeRef) == AXValueGetTypeID()
         else { return nil }
+        let positionValue = rawPosition as! AXValue
+        let sizeValue = rawSize as! AXValue
         var position = CGPoint.zero
         var size = CGSize.zero
         guard AXValueGetValue(positionValue, .cgPoint, &position),
@@ -616,7 +679,7 @@ private func attribute<T>(_ name: String, from element: AXUIElement) -> T? {
     attributeValue(name, from: element) as? T
 }
 
-private func stringValue(_ value: CFTypeRef?) -> String? {
+private func stringValue(_ value: Any?) -> String? {
     if let value = value as? String { return value }
     if let value = value as? URL { return value.absoluteString }
     if let value = value as? NSNumber { return value.stringValue }
