@@ -93,7 +93,7 @@ tool surface, first observation mode, whether an image is expected, and required
 confirmation checkpoint.
 
 Replay the set after changing the skill description, MCP tool name/description,
-server instructions, observation defaults, or browser reference. A candidate is
-not eligible for rollout when it increases accidental Computer Use activation,
-selects legacy tools despite a negotiated v2 context, requests screenshots for
-ordinary represented controls, or skips a consequential checkpoint.
+server instructions, observation defaults, or browser reference. A release fails
+the quality gate when it increases accidental Computer Use activation, selects
+legacy tools despite a negotiated v2 context, requests screenshots for ordinary
+represented controls, or skips a consequential checkpoint.

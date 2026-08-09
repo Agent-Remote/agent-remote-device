@@ -109,13 +109,14 @@ checks; it preserves the last model-visible AX diff base while context is stable
 - Automatically retrying stale indexes or coordinates: smoother appearance at the
   cost of wrong-target actions.
 
-## Rollout and evidence
+## Default negotiation and evidence
 
-Roll out as v1 baseline, v2 shadow, internal signed devices, small cohort, then
-per-application expansion. Any partial capability, wrong-target result, sensitive
-telemetry, stale/fallback spike, success regression, or latency target failure
-returns new generations to the empty capability set. Existing generations are
-terminated and re-approved rather than downgraded in place.
+New generations negotiate v2 by default when the managed context contains the
+complete capability set. A mixed or older deployment naturally falls back to v1,
+and the Server emergency switch returns new generations to the empty capability
+set. Existing generations are terminated and re-approved rather than downgraded
+in place. Runtime quality evidence remains useful for regression tracking but is
+not a prerequisite for the formally supported capability.
 
 The fixed non-sensitive task corpus is `benchmark/computer-use-golden-prompts.json`;
 the zero-content trace comparison is `docs/optimization-benchmark.md`. These

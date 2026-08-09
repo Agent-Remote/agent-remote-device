@@ -2,9 +2,9 @@
 
 Protocol v2 is implemented as a capability-gated extension. Protocol v1 remains
 the mandatory compatibility fallback and the default whenever either peer lacks
-one of the required v2 capabilities. Production enablement is separate from wire
-implementation and remains subject to the release evidence and macOS security
-gates.
+one of the required v2 capabilities. New generations use v2 by default after
+general production release verification; operators retain a Server-side emergency
+switch that forces v1.
 
 ## Protocol v1 compatibility
 
@@ -98,8 +98,8 @@ adaptive_settle_v2
 Unknown capabilities, a missing capability, or a version mismatch selects the
 complete v1 behavior. The fallback is not allowed to accept a v2 frame and ignore
 unknown observation fields. Existing managed contexts with no capability list are
-read as v1 and upgraded on renewal. Deployment may use shadow mode before enabling
-the compact MCP surface for a production cohort.
+read as v1 and upgraded on renewal. The Server enables the complete set by default
+and may force the empty v1 set for emergency rollback; it never sends a partial set.
 
 ### Request observation policy
 
