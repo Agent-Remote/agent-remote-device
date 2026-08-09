@@ -2225,7 +2225,7 @@ import Testing
     #expect(approvalError == nil)
     await completed.wait()
     #expect(approvalUI.activationCount() == 0)
-    weak let releasedBroker = broker
+    weak var releasedBroker = broker
     broker = nil
     for _ in 0 ..< 100 where releasedBroker != nil {
         try await Task.sleep(for: .milliseconds(1))
