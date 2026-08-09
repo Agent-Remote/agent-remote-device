@@ -499,31 +499,31 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                 try await relay.run(
                     actionHandler: { [weak self] request in
                         guard let self else { throw DeviceIPCFailure.serviceUnavailable }
-                        guard beginRelayAction(relay, binding: configuration.binding) else {
+                        guard self.beginRelayAction(relay, binding: configuration.binding) else {
                             throw DeviceIPCFailure.serviceUnavailable
                         }
-                        defer { finishRelayAction(relay, binding: configuration.binding) }
-                        try await resumeTurnIfNeeded(configuration.binding)
-                        let selection = try applicationSelection(
+                        defer { self.finishRelayAction(relay, binding: configuration.binding) }
+                        try await self.resumeTurnIfNeeded(configuration.binding)
+                        let selection = try self.applicationSelection(
                             for: request,
                             configuration: configuration
                         )
                         if selection.activatesViaApprovalUI, let target = selection.target {
-                            try await activateApprovalUIApplication(
+                            try await self.activateApprovalUIApplication(
                                 target,
                                 configuration: configuration
                             )
                         }
-                        let response = try await performExecutorAction(request)
+                        let response = try await self.performExecutorAction(request)
                         if selection.updatesTarget, let target = selection.target {
-                            setRelayTargetApplication(target, binding: configuration.binding)
+                            self.setRelayTargetApplication(target, binding: configuration.binding)
                         }
                         try await lockAcquirer.acquire(configuration.binding)
                         return response
                     },
                     lifecycleHandler: { [weak self] event in
                         guard let self else { throw DeviceIPCFailure.serviceUnavailable }
-                        try await handleRemoteLifecycle(
+                        try await self.handleRemoteLifecycle(
                             event,
                             binding: configuration.binding,
                             relay: relay
