@@ -4,6 +4,30 @@ import Foundation
 import Testing
 
 @MainActor
+@Test func accessibilityValueFreshnessTreatsMissingEmptyValueAsCleared() {
+    #expect(AccessibilityRuntime.valueMatches(nil, expectedValue: ""))
+    #expect(AccessibilityRuntime.valueMatches("", expectedValue: ""))
+    #expect(!AccessibilityRuntime.valueMatches(nil, expectedValue: "text"))
+    #expect(!AccessibilityRuntime.valueMatches("old", expectedValue: ""))
+    #expect(AccessibilityRuntime.valueMatches("text", expectedValue: "text"))
+    #expect(AccessibilityRuntime.valueMatches(
+        "\nWork with ChatGPT",
+        expectedValue: "",
+        placeholder: "Work with ChatGPT"
+    ))
+    #expect(!AccessibilityRuntime.valueMatches(
+        "existing text",
+        expectedValue: "",
+        placeholder: "Work with ChatGPT"
+    ))
+    #expect(!AccessibilityRuntime.valueMatches(
+        "Work with ChatGPT",
+        expectedValue: "different text",
+        placeholder: "Work with ChatGPT"
+    ))
+}
+
+@MainActor
 @Test func accessibilityDiffUsesStableIndexesAndResetsLargeChanges() {
     let original = [
         axNode(index: 0, title: "Window"),
@@ -25,14 +49,389 @@ import Testing
     #expect(diff.removed.isEmpty)
 
     let reset = AccessibilityRuntime.diff(
-        previous: original,
-        current: [axNode(index: 0, title: "Replacement")],
+        previous: [
+            axNode(index: 0, role: "AXWindow", title: "Chrome"),
+            axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: "Before", url: "https://before.test"),
+            axNode(index: 2, parentIndex: 1, role: "AXHeading", title: "Before"),
+        ],
+        current: [
+            axNode(index: 0, role: "AXWindow", title: "Chrome"),
+            axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: "After", url: "https://after.test"),
+        ],
         truncated: true
     )
     #expect(reset.kind == .full)
     #expect(reset.reset)
     #expect(reset.truncated)
     #expect(reset.removed.isEmpty)
+}
+
+@MainActor
+@Test func truncatedDiffCarriesBoundedNavigationAnchors() {
+    let previous = [
+        axNode(index: 0, role: "AXWindow", title: "Chrome"),
+        axNode(
+            index: 1,
+            parentIndex: 0,
+            role: "AXWebArea",
+            title: "Search results",
+            url: "https://example.test/search"
+        ),
+        axNode(index: 2, parentIndex: 1, role: "AXHeading", title: "Search results"),
+        axNode(index: 3, parentIndex: 0, role: "AXTextField", title: "Address"),
+    ]
+    let current = previous.enumerated().map { offset, node in
+        offset == 3
+            ? axNode(index: 3, parentIndex: 0, role: "AXTextField", title: "Address focused")
+            : node
+    }
+
+    let diff = AccessibilityRuntime.diff(
+        previous: previous,
+        current: current,
+        truncated: true
+    )
+
+    #expect(diff.kind == .diff)
+    #expect(!diff.reset)
+    #expect(diff.truncated)
+    #expect(diff.nodes.map(\.index) == [1, 2, 3])
+}
+
+@MainActor
+@Test func largeChromeUiChangeStaysDiffWhenPageIdentityIsStable() {
+    let previous = [
+        axNode(index: 0, role: "AXWindow", title: "Chrome"),
+        axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: "Results", url: "https://example.test/results"),
+        axNode(index: 2, parentIndex: 0, role: "AXTextField", title: "Address"),
+        axNode(index: 3, parentIndex: 1, role: "AXHeading", title: "Results"),
+    ]
+    let focused = [
+        previous[0], previous[1], previous[3],
+        axNode(index: 4, parentIndex: 0, role: "AXTextField", title: "Address focused"),
+        axNode(index: 5, parentIndex: 0, role: "AXList", title: "Suggestions"),
+        axNode(index: 6, parentIndex: 5, role: "AXStaticText", title: "Suggestion"),
+    ]
+
+    let diff = AccessibilityRuntime.diff(previous: previous, current: focused, truncated: true)
+
+    #expect(diff.kind == .diff)
+    #expect(!diff.reset)
+    #expect(diff.removed == [2])
+}
+
+@MainActor
+@Test func largeOverlayDismissalStaysDiffWhenBoundedStateOmitsPageIdentity() {
+    let previous = [
+        axNode(index: 0, role: "AXWindow", title: "Chrome"),
+        axNode(index: 1, parentIndex: 0, role: "AXGroup", title: "Find bar"),
+        axNode(index: 2, parentIndex: 1, role: "AXTextField", title: "Find"),
+        axNode(index: 3, parentIndex: 1, role: "AXButton", title: "Close"),
+    ]
+    let current = [previous[0]]
+
+    let diff = AccessibilityRuntime.diff(
+        previous: previous,
+        current: current,
+        truncated: true
+    )
+
+    #expect(diff.kind == .diff)
+    #expect(!diff.reset)
+    #expect(diff.nodes.isEmpty)
+    #expect(diff.removed == [1, 2, 3])
+}
+
+@MainActor
+@Test func largeOverlayAppearanceStaysDiffWhenBoundedStateOmitsPageAndWindowIdentity() {
+    let previous = [
+        axNode(index: 0, role: "AXWindow", title: "Example Domain - Google Chrome"),
+        axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: "Example Domain", url: "https://example.com"),
+        axNode(index: 2, parentIndex: 1, role: "AXHeading", title: "Example Domain"),
+        axNode(index: 3, parentIndex: 1, role: "AXStaticText", title: "Example text"),
+    ]
+    let current = [
+        axNode(index: 0, role: "AXGroup", title: "Find bar"),
+        axNode(index: 1, parentIndex: 0, role: "AXTextField", title: "Find"),
+        axNode(index: 2, parentIndex: 0, role: "AXButton", title: "Previous match"),
+        axNode(index: 3, parentIndex: 0, role: "AXButton", title: "Next match"),
+        axNode(index: 4, parentIndex: 0, role: "AXButton", title: "Close"),
+    ]
+
+    let diff = AccessibilityRuntime.diff(
+        previous: previous,
+        current: current,
+        truncated: true
+    )
+
+    #expect(diff.kind == .diff)
+    #expect(!diff.reset)
+    #expect(diff.nodes == current)
+    #expect(diff.removed.isEmpty)
+}
+
+@MainActor
+@Test func largePageReplacementResetsWhenPageIdentityChanges() {
+    let previous = [
+        axNode(index: 0, role: "AXWindow", title: "Chrome"),
+        axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: "Before", url: "https://before.test"),
+        axNode(index: 2, parentIndex: 1, role: "AXHeading", title: "Before"),
+        axNode(index: 3, parentIndex: 1, role: "AXLink", title: "Before link"),
+    ]
+    let current = [
+        previous[0],
+        axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: "After", url: "https://after.test"),
+        axNode(index: 2, parentIndex: 1, role: "AXHeading", title: "After"),
+        axNode(index: 3, parentIndex: 1, role: "AXLink", title: "After link"),
+    ]
+
+    let reset = AccessibilityRuntime.diff(
+        previous: previous,
+        current: current,
+        truncated: true
+    )
+
+    #expect(reset.kind == .full)
+    #expect(reset.reset)
+    #expect(reset.nodes == current)
+    #expect(reset.removed.isEmpty)
+}
+
+@MainActor
+@Test func pageIdentityMetadataRequiresATitledOrAddressedWebArea() {
+    #expect(!AccessibilityRuntime.hasPageIdentity(in: []))
+    #expect(!AccessibilityRuntime.hasPageIdentity(in: [
+        axNode(index: 0, role: "AXWindow", title: "Chrome"),
+        axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: ""),
+    ]))
+    #expect(AccessibilityRuntime.hasPageIdentity(in: [
+        axNode(index: 0, role: "AXWebArea", title: "Example Domain"),
+    ]))
+    #expect(AccessibilityRuntime.hasPageIdentity(in: [
+        axNode(index: 0, role: "AXWebArea", title: "", url: "https://example.com"),
+    ]))
+}
+
+@Test func chromeTabElisionKeepsSelectedAndWebContentRadios() {
+    #expect(AccessibilityTraversal.shouldPruneInactiveBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXRadioButton",
+        selected: false,
+        insideWebArea: false
+    ))
+    #expect(!AccessibilityTraversal.shouldPruneInactiveBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXRadioButton",
+        selected: true,
+        insideWebArea: false
+    ))
+    #expect(!AccessibilityTraversal.shouldPruneInactiveBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXRadioButton",
+        selected: false,
+        value: "1",
+        insideWebArea: false
+    ))
+    #expect(!AccessibilityTraversal.shouldPruneInactiveBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXRadioButton",
+        selected: false,
+        insideWebArea: true
+    ))
+    #expect(!AccessibilityTraversal.shouldPruneInactiveBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.apple.Safari",
+        role: "AXRadioButton",
+        selected: false,
+        insideWebArea: false
+    ))
+}
+
+@Test func chromePrunesTopBookmarkToolbarWithoutDroppingEssentialBrowserControls() {
+    let window = CGRect(x: 0, y: 25, width: 1_800, height: 1_044)
+    #expect(AccessibilityTraversal.shouldPruneLowValueBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXToolbar",
+        label: "Bookmarks",
+        frame: CGRect(x: 0, y: 86, width: 1_800, height: 34),
+        windowFrame: window,
+        insideWebArea: false
+    ))
+    #expect(!AccessibilityTraversal.shouldPruneLowValueBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXToolbar",
+        label: nil,
+        frame: CGRect(x: 0, y: 46, width: 1_800, height: 34),
+        windowFrame: window,
+        insideWebArea: false
+    ))
+    #expect(!AccessibilityTraversal.shouldPruneLowValueBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXToolbar",
+        label: "Downloads",
+        frame: CGRect(x: 1_200, y: 86, width: 400, height: 34),
+        windowFrame: window,
+        insideWebArea: false
+    ))
+    #expect(!AccessibilityTraversal.shouldPruneLowValueBrowserChromeSubtree(
+        applicationBundleIdentifier: "com.google.Chrome",
+        role: "AXToolbar",
+        label: "Page toolbar",
+        frame: CGRect(x: 0, y: 130, width: 1_800, height: 34),
+        windowFrame: window,
+        insideWebArea: true
+    ))
+}
+
+@Test func accessibilityTraversalBoundsPreferredQueueStarvation() {
+    #expect(!AccessibilityTraversal.shouldVisitStandardQueue(
+        preferredQueueBurstCount: 3,
+        hasStandardElements: true
+    ))
+    #expect(AccessibilityTraversal.shouldVisitStandardQueue(
+        preferredQueueBurstCount: 4,
+        hasStandardElements: true
+    ))
+    #expect(!AccessibilityTraversal.shouldVisitStandardQueue(
+        preferredQueueBurstCount: 4,
+        hasStandardElements: false
+    ))
+}
+
+@Test func accessibilityTraversalDoesNotInjectFocusedWebAreaAheadOfWindowRoot() {
+    #expect(!AccessibilityTraversal.shouldPrioritizeFocusedElement(role: "AXWebArea"))
+    #expect(AccessibilityTraversal.shouldPrioritizeFocusedElement(role: "AXTextArea"))
+    #expect(AccessibilityTraversal.shouldPrioritizeFocusedElement(role: "AXTextField"))
+}
+
+@MainActor
+@Test func navigationFingerprintIgnoresChromeUiNoiseButTracksPageIdentity() {
+    let baseline = [
+        axNode(
+            index: 0,
+            role: "AXWebArea",
+            title: "Wikipedia",
+            url: "https://www.wikipedia.org/"
+        ),
+        axNode(index: 1, role: "AXRadioButton", title: "Memory 100 MB"),
+    ]
+    let chromeNoise = [
+        axNode(
+            index: 0,
+            role: "AXWebArea",
+            title: "Wikipedia",
+            url: "https://www.wikipedia.org/"
+        ),
+        axNode(index: 1, role: "AXRadioButton", title: "Memory 110 MB"),
+    ]
+    let navigated = [
+        axNode(
+            index: 0,
+            role: "AXWebArea",
+            title: "Search results",
+            url: "https://example.test/results"
+        ),
+        axNode(index: 1, role: "AXRadioButton", title: "Memory 110 MB"),
+    ]
+
+    let before = AccessibilityRuntime.stabilityFingerprint(nodes: baseline, truncated: false)
+    let noisy = AccessibilityRuntime.stabilityFingerprint(nodes: chromeNoise, truncated: false)
+    let after = AccessibilityRuntime.stabilityFingerprint(nodes: navigated, truncated: false)
+    #expect(before.content == noisy.content)
+    #expect(before.meaningful == noisy.meaningful)
+    #expect(before.content != after.content)
+    #expect(before.meaningful != after.meaningful)
+}
+
+@MainActor
+@Test func navigationSettleFingerprintIgnoresLatePeripheralAndDeepPageChurn() {
+    let baseline = [
+        axNode(index: 0, role: "AXWindow", title: "Chrome"),
+        axNode(index: 1, parentIndex: 0, role: "AXToolbar", title: "Bookmarks"),
+        axNode(index: 2, parentIndex: 0, role: "AXWebArea", title: "Results", url: "https://example.test/results"),
+        axNode(index: 3, parentIndex: 2, role: "AXHeading", title: "Results"),
+    ] + (0 ..< 24).map {
+        axNode(index: UInt32($0 + 4), parentIndex: 2, role: "AXStaticText", title: "lead-\($0)")
+    }
+    let lateChurn = baseline + [
+        axNode(index: 40, parentIndex: 1, role: "AXRadioButton", title: "Memory 110 MB"),
+        axNode(index: 41, parentIndex: 2, role: "AXStaticText", title: "lazy footer"),
+    ]
+    let headingChanged = baseline.map { node in
+        node.index == 3
+            ? axNode(index: 3, parentIndex: 2, role: "AXHeading", title: "Updated results")
+            : node
+    }
+
+    let before = AccessibilityRuntime.stabilityFingerprint(nodes: baseline, truncated: false)
+    let noisy = AccessibilityRuntime.stabilityFingerprint(nodes: lateChurn, truncated: false)
+    let updated = AccessibilityRuntime.stabilityFingerprint(nodes: headingChanged, truncated: false)
+    #expect(before.content == noisy.content)
+    #expect(before.content != updated.content)
+}
+
+@MainActor
+@Test func settleFingerprintTracksPressedElementDisappearanceWithoutTreatingPeripheralChurnAsNavigation() {
+    let baseline = [
+        axNode(index: 0, role: "AXWindow", title: "Chrome"),
+        axNode(index: 1, parentIndex: 0, role: "AXWebArea", title: "Example", url: "https://example.test/"),
+        axNode(index: 2, parentIndex: 0, role: "AXButton", title: "Close"),
+    ]
+    let afterPress = baseline.filter { $0.index != 2 }
+
+    let before = AccessibilityRuntime.stabilityFingerprint(
+        nodes: baseline,
+        truncated: false,
+        trackingElementIndex: 2
+    )
+    let after = AccessibilityRuntime.stabilityFingerprint(
+        nodes: afterPress,
+        truncated: false,
+        trackingElementIndex: 2
+    )
+
+    #expect(before.content == after.content)
+    #expect(before.meaningful == after.meaningful)
+    #expect(before.trackedElementPresent == true)
+    #expect(after.trackedElementPresent == false)
+    #expect(before.trackedElementContent != nil)
+    #expect(after.trackedElementContent == nil)
+}
+
+@MainActor
+@Test func settleFingerprintTracksPressedElementSemanticChange() {
+    let baseline = [
+        axNode(index: 0, role: "AXWebArea", title: "Settings", url: "https://example.test/"),
+        axNode(index: 1, parentIndex: 0, role: "AXCheckBox", title: "Enabled", value: "0"),
+    ]
+    let toggled = [
+        baseline[0],
+        axNode(index: 1, parentIndex: 0, role: "AXCheckBox", title: "Enabled", value: "1"),
+    ]
+
+    let before = AccessibilityRuntime.stabilityFingerprint(
+        nodes: baseline,
+        truncated: false,
+        trackingElementIndex: 1
+    )
+    let after = AccessibilityRuntime.stabilityFingerprint(
+        nodes: toggled,
+        truncated: false,
+        trackingElementIndex: 1
+    )
+
+    #expect(before.content == after.content)
+    #expect(before.meaningful == after.meaningful)
+    #expect(before.trackedElementPresent == true)
+    #expect(after.trackedElementPresent == true)
+    #expect(before.trackedElementContent != after.trackedElementContent)
+}
+
+@Test func keyParserAcceptsCommandBracketAliases() throws {
+    let command = try KeyParser.parse("cmd+[")
+    let superAlias = try KeyParser.parse("super+[")
+    #expect(command.keyCode == 33)
+    #expect(command.flags.contains(.maskCommand))
+    #expect(superAlias == command)
 }
 
 @Test func accessibilityVisibilityRejectsHiddenAndOffWindowContent() {
@@ -113,9 +512,11 @@ import Testing
     ) == ["AXChildren", "AXRows", "AXContents", "AXVisibleChildren"])
     #expect(AccessibilityTraversal.usesRowBudget(role: "AXBrowser"))
     #expect(!AccessibilityTraversal.usesRowBudget(role: "AXWebArea"))
+    #expect(AccessibilityTraversal.usesVisibleChildren(role: "AXWebArea"))
+    #expect(!AccessibilityTraversal.usesVisibleChildren(role: "AXGroup"))
 }
 
-@Test func accessibilityTraversalElidesOnlySemanticallyEmptySingleChildWrappers() {
+@Test func accessibilityTraversalElidesSemanticallyEmptyWrappers() {
     #expect(AccessibilityTraversal.shouldElideWrapper(
         role: "AXGroup",
         hasSemanticText: false,
@@ -144,13 +545,169 @@ import Testing
         actions: [],
         childCount: 1
     ))
-    #expect(!AccessibilityTraversal.shouldElideWrapper(
+    #expect(AccessibilityTraversal.shouldElideWrapper(
         role: "AXUnknown",
         hasSemanticText: false,
         isSettable: false,
         actions: [],
         childCount: 2
     ))
+    #expect(!AccessibilityTraversal.shouldElideWrapper(
+        role: "AXGroup",
+        hasSemanticText: false,
+        isSettable: false,
+        actions: [],
+        childCount: 0
+    ))
+}
+
+@Test func accessibilityTraversalReservesTextForInteractiveControls() {
+    #expect(AccessibilityTraversal.exposedActions(
+        ["AXShowMenu", "AXScrollToVisible"],
+        role: "AXStaticText"
+    ).isEmpty)
+    #expect(AccessibilityTraversal.exposedActions(
+        ["AXPress", "AXShowMenu"],
+        role: "AXButton"
+    ) == ["AXPress", "AXShowMenu"])
+    #expect(!AccessibilityTraversal.shouldIncludeFrame(isSettable: false, actions: []))
+    #expect(AccessibilityTraversal.shouldIncludeFrame(isSettable: true, actions: []))
+    #expect(AccessibilityTraversal.shouldIncludeFrame(
+        isSettable: false,
+        actions: ["AXPress"]
+    ))
+    #expect(AccessibilityTraversal.isInteractionPriority(
+        role: "AXTextArea",
+        isSettable: false,
+        actions: []
+    ))
+    #expect(AccessibilityTraversal.isInteractionPriority(
+        role: "AXGroup",
+        isSettable: true,
+        actions: []
+    ))
+    #expect(!AccessibilityTraversal.isInteractionPriority(
+        role: "AXStaticText",
+        isSettable: false,
+        actions: []
+    ))
+    #expect(AccessibilityTraversal.supportsSettableValue(role: "AXTextArea"))
+    #expect(AccessibilityTraversal.supportsSettableValue(role: "AXSlider"))
+    #expect(!AccessibilityTraversal.supportsSettableValue(role: "AXGroup"))
+    #expect(AccessibilityTraversal.supportsSettableValue(
+        role: "AXGroup",
+        contentPriority: 2
+    ))
+    #expect(AccessibilityTraversal.textPriority(
+        role: "AXStaticText",
+        isSettable: false,
+        actions: []
+    ) == .structural)
+    #expect(AccessibilityTraversal.textPriority(
+        role: "AXButton",
+        isSettable: false,
+        actions: ["AXPress"]
+    ) == .interactive)
+    #expect(AccessibilityTraversal.textPriority(
+        role: "AXTextArea",
+        isSettable: true,
+        actions: []
+    ) == .editable)
+    #expect(AccessibilityTraversal.textBudgetLimit(
+        totalBytes: 16 * 1_024,
+        priority: .structural
+    ) == 12 * 1_024)
+    #expect(AccessibilityTraversal.textBudgetLimit(
+        totalBytes: 16 * 1_024,
+        priority: .interactive
+    ) == 14 * 1_024)
+    #expect(AccessibilityTraversal.textBudgetLimit(
+        totalBytes: 16 * 1_024,
+        priority: .editable
+    ) == 16 * 1_024)
+}
+
+@Test func accessibilityTraversalBoundsRequiredTextByUTF8Bytes() {
+    #expect(AccessibilityTraversal.boundedText(
+        "AXButton",
+        maximumCharacters: 80,
+        maximumBytes: 4
+    ) == "AXBu")
+    #expect(AccessibilityTraversal.boundedText(
+        "按钮",
+        maximumCharacters: 80,
+        maximumBytes: 3
+    ) == "按")
+    #expect(AccessibilityTraversal.boundedText(
+        "AXButton",
+        maximumCharacters: 80,
+        maximumBytes: 0
+    ) == nil)
+}
+
+@Test func accessibilityTraversalKeepsBothEndsOfBoundedContainers() {
+    #expect(AccessibilityTraversal.childTraversalLimit(
+        count: 200,
+        maximumPerContainer: 20,
+        role: "AXList"
+    ) == 20)
+    #expect(AccessibilityTraversal.childTraversalLimit(
+        count: 200,
+        maximumPerContainer: 20,
+        role: "AXGroup"
+    ) == 200)
+    #expect(AccessibilityTraversal.boundedChildOffsets(count: 4, maximum: 4) == [3, 0, 2, 1])
+    #expect(AccessibilityTraversal.boundedChildOffsets(count: 8, maximum: 5) == [7, 0, 6, 1, 5])
+    #expect(AccessibilityTraversal.boundedChildOffsets(count: 0, maximum: 5).isEmpty)
+}
+
+@Test func accessibilityTraversalProcessesSiblingFrontiersBeforeDescendants() {
+    var pending = ["root"]
+    var cursor = 0
+    var visited: [String] = []
+    let children = [
+        "root": ["sidebar", "main"],
+        "sidebar": ["history-1", "history-2"],
+        "main": ["composer"],
+    ]
+    while cursor < pending.count {
+        let value = pending[cursor]
+        cursor += 1
+        visited.append(value)
+        pending.append(contentsOf: children[value] ?? [])
+    }
+
+    #expect(visited == ["root", "sidebar", "main", "history-1", "history-2", "composer"])
+    #expect(visited.firstIndex(of: "main")! < visited.firstIndex(of: "history-1")!)
+}
+
+@Test func accessibilityTraversalPrioritizesPrimaryContentButNotWindowOrSidebar() {
+    let window = CGRect(x: 0, y: 40, width: 1_280, height: 800)
+    #expect(AccessibilityTraversal.contentPriority(
+        window,
+        windowFrame: window,
+        depth: 0
+    ) == 0)
+    #expect(AccessibilityTraversal.contentPriority(
+        CGRect(x: 0, y: 40, width: 275, height: 800),
+        windowFrame: window,
+        depth: 2
+    ) == 0)
+    #expect(AccessibilityTraversal.contentPriority(
+        CGRect(x: 275, y: 46, width: 1_005, height: 787),
+        windowFrame: window,
+        depth: 2
+    ) == 1)
+    #expect(AccessibilityTraversal.contentPriority(
+        CGRect(x: 0, y: 140, width: 1_280, height: 700),
+        windowFrame: window,
+        depth: 2
+    ) == 1)
+    #expect(AccessibilityTraversal.contentPriority(
+        CGRect(x: 410, y: 719, width: 736, height: 98),
+        windowFrame: window,
+        depth: 6
+    ) == 2)
 }
 
 @MainActor
@@ -161,25 +718,109 @@ import Testing
         text: "hello"
     ) == "hello")
     #expect(ActionExecutor.insertionValue(
+        current: "\nWork with ChatGPT",
+        placeholder: "Work with ChatGPT",
+        text: "hello"
+    ) == "hello")
+    #expect(ActionExecutor.insertionValue(
         current: "existing ",
         placeholder: "Work with ChatGPT",
         text: "hello"
     ) == "existing hello")
+    #expect(ActionExecutor.insertionValue(
+        current: "https://old.example/path",
+        placeholder: nil,
+        text: "https://example.com",
+        selectedRange: NSRange(location: 0, length: 24)
+    ) == "https://example.com")
+    #expect(ActionExecutor.insertionValue(
+        current: "beforeafter",
+        placeholder: nil,
+        text: " ",
+        selectedRange: NSRange(location: 6, length: 0)
+    ) == "before after")
 }
 
-private func axNode(index: UInt32, title: String) -> AccessibilityNode {
+@Test func accessibilityTextNormalizationSuppressesMaterializedPlaceholders() {
+    #expect(AccessibilityTextNormalization.placeholder(
+        nil,
+        value: "\nWork with ChatGPT",
+        label: "Work with ChatGPT",
+        role: "AXTextArea",
+        isSettable: true
+    ) == "Work with ChatGPT")
+    #expect(AccessibilityTextNormalization.placeholder(
+        nil,
+        value: "existing text",
+        label: "Work with ChatGPT",
+        role: "AXTextArea",
+        isSettable: true
+    ) == nil)
+    #expect(AccessibilityTextNormalization.placeholder(
+        nil,
+        value: "Work with ChatGPT",
+        label: "Work with ChatGPT",
+        role: "AXStaticText",
+        isSettable: false
+    ) == nil)
+    #expect(AccessibilityTextNormalization.value(
+        "\nWork with ChatGPT",
+        placeholder: "Work with ChatGPT"
+    ) == nil)
+    #expect(AccessibilityTextNormalization.value(
+        "existing Work with ChatGPT",
+        placeholder: "Work with ChatGPT"
+    ) == "existing Work with ChatGPT")
+    #expect(AccessibilityTextNormalization.value(
+        "existing text",
+        placeholder: nil
+    ) == "existing text")
+}
+
+private func axNode(
+    index: UInt32,
+    parentIndex: UInt32? = nil,
+    role: String? = nil,
+    title: String,
+    url: String? = nil,
+    value: String? = nil
+) -> AccessibilityNode {
     AccessibilityNode(
         index: index,
-        parentIndex: index == 0 ? nil : 0,
+        parentIndex: parentIndex ?? (index == 0 ? nil : 0),
         depth: index == 0 ? 0 : 1,
-        role: index == 0 ? "AXWindow" : "AXButton",
+        role: role ?? (index == 0 ? "AXWindow" : "AXButton"),
         title: title,
         label: nil,
-        value: nil,
+        value: value,
         placeholder: nil,
-        url: nil,
+        url: url,
         frame: [0, 0, 20, 20],
         settable: false,
         actions: index == 0 ? [] : ["AXPress"]
     )
+}
+@MainActor
+@Test func editableTextRolesUseTheShortFocusSettlePath() {
+    #expect(AccessibilityRuntime.isEditableTextRole("AXTextField", settable: true))
+    #expect(AccessibilityRuntime.isEditableTextRole("AXTextArea", settable: true))
+    #expect(AccessibilityRuntime.isEditableTextRole("AXSearchField", settable: true))
+    #expect(!AccessibilityRuntime.isEditableTextRole("AXButton", settable: true))
+    #expect(!AccessibilityRuntime.isEditableTextRole("AXTextField", settable: false))
+}
+
+@MainActor
+@Test func editablePressUsesDirectFocusInsteadOfAXPress() {
+    #expect(AccessibilityRuntime.shouldFocusEditableTextDirectly(
+        role: "AXTextArea",
+        settable: true
+    ))
+    #expect(AccessibilityRuntime.shouldFocusEditableTextDirectly(
+        role: "AXSearchField",
+        settable: true
+    ))
+    #expect(!AccessibilityRuntime.shouldFocusEditableTextDirectly(
+        role: "AXButton",
+        settable: false
+    ))
 }

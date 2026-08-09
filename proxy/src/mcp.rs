@@ -1,4 +1,4 @@
-use std::{io::Cursor, path::Path, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, io::Cursor, path::Path, sync::Arc, time::Instant};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{ImageFormat, ImageReader, Limits};
@@ -31,7 +31,7 @@ const MAX_IMAGE_DECODE_ALLOCATION_BYTES: u64 = 16 * 1024 * 1024;
 pub struct DeviceMcp {
     transport: Arc<dyn DeviceTransport>,
     operation_guard: Arc<Mutex<()>>,
-    v2_state: Arc<Mutex<Option<McpBoundState>>>,
+    v2_states: Arc<Mutex<BTreeMap<Uuid, McpBoundState>>>,
     optimization_metrics: Arc<Mutex<OptimizationMetrics>>,
     tool_router: ToolRouter<Self>,
 }
@@ -64,13 +64,20 @@ pub struct TypeParameters {
     pub text: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct InputTextParameters {
     /// Optional image-relative coordinate to focus before typing.
     pub coordinate: Option<Point>,
+    /// Latest model-visible AX state containing the element to focus.
+    pub state_id: Option<String>,
+    /// Generation returned with state_id.
+    pub state_generation: Option<u64>,
+    /// Element index from the state identified by state_id.
+    pub element_index: Option<u32>,
     /// Optional approved shortcut to send after focusing and before typing.
     pub shortcut_before: Option<String>,
+    /// Text to type. May be empty when the shortcut/key sequence clears existing text.
     pub text: String,
     /// Optional approved key to send after typing, such as Return.
     pub key_after: Option<String>,
@@ -153,23 +160,46 @@ pub struct ObserveParameters {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActParameters {
+    /// Choose an element action (press, set_value, clear_value, select_text,
+    /// scroll_element, secondary_action) or a context action. Do not mix their fields.
     #[serde(rename = "type")]
     pub kind: ActKind,
+    /// Element actions only: state identifier returned with element_index.
+    pub state_id: Option<String>,
+    /// Element actions only: state generation returned with element_index.
+    pub state_generation: Option<u64>,
+    /// Element actions only. Use type=press to activate/click an AX element;
+    /// type=left_click accepts a coordinate instead and never an element_index.
     pub element_index: Option<u32>,
+    /// type=set_value only.
     pub value: Option<String>,
+    /// type=select_text or type=type only.
     pub text: Option<String>,
+    /// type=select_text only.
     pub prefix: Option<String>,
+    /// type=select_text only.
     pub suffix: Option<String>,
+    /// type=select_text only.
     pub selection_type: Option<SelectionTypeParameter>,
+    /// type=scroll_element only. For type=scroll, provide delta_x and delta_y.
     pub direction: Option<ScrollDirectionParameter>,
+    /// type=scroll_element only.
     pub pages: Option<u8>,
+    /// type=secondary_action only.
     pub action_name: Option<String>,
+    /// Coordinate context actions only, from the latest model-visible screenshot.
     pub coordinate: Option<Point>,
+    /// type=left_click_drag only.
     pub start: Option<Point>,
+    /// type=left_click_drag only.
     pub end: Option<Point>,
+    /// type=key or type=hold_key only. Do not include state or element fields.
     pub key: Option<String>,
+    /// type=scroll only; delta_x and delta_y are both required.
     pub delta_x: Option<i32>,
+    /// type=scroll only; delta_x and delta_y are both required.
     pub delta_y: Option<i32>,
+    /// type=left_click_drag or type=hold_key only.
     pub duration_ms: Option<u32>,
 }
 
@@ -178,6 +208,7 @@ pub struct ActParameters {
 pub enum ActKind {
     Press,
     SetValue,
+    ClearValue,
     SelectText,
     ScrollElement,
     SecondaryAction,
@@ -217,6 +248,8 @@ pub enum ScrollDirectionParameter {
 impl ActParameters {
     fn validate_shape(&self) -> bool {
         let no_element_fields = self.element_index.is_none()
+            && self.state_id.is_none()
+            && self.state_generation.is_none()
             && self.value.is_none()
             && self.prefix.is_none()
             && self.suffix.is_none()
@@ -234,6 +267,8 @@ impl ActParameters {
         match self.kind {
             ActKind::Press => {
                 self.element_index.is_some()
+                    && self.state_id.is_some()
+                    && self.state_generation.is_some()
                     && self.value.is_none()
                     && self.text.is_none()
                     && self.prefix.is_none()
@@ -246,7 +281,23 @@ impl ActParameters {
             }
             ActKind::SetValue => {
                 self.element_index.is_some()
+                    && self.state_id.is_some()
+                    && self.state_generation.is_some()
                     && self.value.is_some()
+                    && self.text.is_none()
+                    && self.prefix.is_none()
+                    && self.suffix.is_none()
+                    && self.selection_type.is_none()
+                    && self.direction.is_none()
+                    && self.pages.is_none()
+                    && self.action_name.is_none()
+                    && no_coordinate_fields
+            }
+            ActKind::ClearValue => {
+                self.element_index.is_some()
+                    && self.state_id.is_some()
+                    && self.state_generation.is_some()
+                    && self.value.is_none()
                     && self.text.is_none()
                     && self.prefix.is_none()
                     && self.suffix.is_none()
@@ -258,6 +309,8 @@ impl ActParameters {
             }
             ActKind::SelectText => {
                 self.element_index.is_some()
+                    && self.state_id.is_some()
+                    && self.state_generation.is_some()
                     && self.text.is_some()
                     && self.value.is_none()
                     && self.direction.is_none()
@@ -267,6 +320,8 @@ impl ActParameters {
             }
             ActKind::ScrollElement => {
                 self.element_index.is_some()
+                    && self.state_id.is_some()
+                    && self.state_generation.is_some()
                     && self.direction.is_some()
                     && self.value.is_none()
                     && self.text.is_none()
@@ -278,6 +333,8 @@ impl ActParameters {
             }
             ActKind::SecondaryAction => {
                 self.element_index.is_some()
+                    && self.state_id.is_some()
+                    && self.state_generation.is_some()
                     && self.action_name.is_some()
                     && self.value.is_none()
                     && self.text.is_none()
@@ -384,16 +441,21 @@ impl ActParameters {
 
     fn shape_error(&self) -> &'static str {
         match self.kind {
-            ActKind::Press => "press requires only element_index",
-            ActKind::SetValue => "set_value requires element_index and value",
+            ActKind::Press => "press requires state_id, state_generation, and element_index",
+            ActKind::SetValue => {
+                "set_value requires state_id, state_generation, element_index, and value"
+            }
+            ActKind::ClearValue => {
+                "clear_value requires only state_id, state_generation, and element_index"
+            }
             ActKind::SelectText => {
-                "select_text requires element_index and text; prefix, suffix, and selection_type are optional"
+                "select_text requires state_id, state_generation, element_index, and text; prefix, suffix, and selection_type are optional"
             }
             ActKind::ScrollElement => {
-                "scroll_element requires element_index and direction; pages is optional"
+                "scroll_element requires state_id, state_generation, element_index, and direction; pages is optional"
             }
             ActKind::SecondaryAction => {
-                "secondary_action requires element_index and action_name"
+                "secondary_action requires state_id, state_generation, element_index, and action_name"
             }
             ActKind::LeftClick
             | ActKind::RightClick
@@ -456,7 +518,7 @@ impl DeviceMcp {
         Ok(Self {
             transport,
             operation_guard: Arc::new(Mutex::new(())),
-            v2_state: Arc::new(Mutex::new(None)),
+            v2_states: Arc::new(Mutex::new(BTreeMap::new())),
             optimization_metrics: Arc::new(Mutex::new(optimization_metrics)),
             tool_router,
         })
@@ -471,7 +533,7 @@ impl DeviceMcp {
             return Err("action parameters are outside the supported bounds".to_owned());
         }
         let _operation = self.operation_guard.lock().await;
-        *self.v2_state.lock().await = None;
+        self.v2_states.lock().await.clear();
         let started = Instant::now();
         let result = match self.transport.execute(action.clone()).await {
             Ok(result) => {
@@ -494,7 +556,7 @@ impl DeviceMcp {
                         &error,
                         started.elapsed(),
                     ));
-                return Err(error.to_string());
+                return Err(error.client_message());
             }
         };
         if result.screenshot.is_none() {
@@ -511,7 +573,7 @@ impl DeviceMcp {
         }
 
         let _operation = self.operation_guard.lock().await;
-        *self.v2_state.lock().await = None;
+        self.v2_states.lock().await.clear();
         let total = actions.len();
         let mut final_result = None;
         for (index, action) in actions.into_iter().enumerate() {
@@ -538,8 +600,9 @@ impl DeviceMcp {
                             started.elapsed(),
                         ));
                     return Err(format!(
-                        "input sequence stopped at step {} of {total} after {index} completed steps: {error}",
+                        "input sequence stopped at step {} of {total} after {index} completed steps: {}",
                         index + 1,
+                        error.client_message(),
                     ));
                 }
             };
@@ -594,23 +657,64 @@ impl DeviceMcp {
                         &error,
                         started.elapsed(),
                     ));
-                return Err(error.to_string());
+                return Err(error.client_message());
             }
         };
         self.remember_v2_state(&result).await;
         device_result_v2(result).await
     }
 
-    async fn dispatch_sequence_v2(&self, actions: Vec<Action>) -> Result<CallToolResult, String> {
+    async fn dispatch_clipboard_v2(&self) -> Result<CallToolResult, String> {
+        let action = ActionV2::ReadClipboard;
+        let observation = observation_none();
+        let _operation = self.operation_guard.lock().await;
+        let started = Instant::now();
+        let result = match self
+            .transport
+            .execute_v2(action.clone(), observation.clone())
+            .await
+        {
+            Ok(result) => {
+                self.optimization_metrics
+                    .lock()
+                    .await
+                    .record(OptimizationEvent::success_v2(
+                        &action,
+                        &observation,
+                        &result,
+                        started.elapsed(),
+                    ));
+                result
+            }
+            Err(error) => {
+                self.optimization_metrics
+                    .lock()
+                    .await
+                    .record(OptimizationEvent::failure_v2(
+                        &action,
+                        &observation,
+                        &error,
+                        started.elapsed(),
+                    ));
+                return Err(error.client_message());
+            }
+        };
+        self.remember_v2_state(&result).await;
+        compact_clipboard_result_v2(result)
+    }
+
+    async fn dispatch_sequence_v2(&self, actions: Vec<ActionV2>) -> Result<CallToolResult, String> {
         if actions.is_empty() || actions.iter().any(|action| !action.validate_parameters()) {
-            return Err("action parameters are outside the supported bounds".to_owned());
+            return Err("v2 action parameters are outside the supported bounds".to_owned());
         }
         let _operation = self.operation_guard.lock().await;
         let total = actions.len();
         let mut final_result = None;
         for (index, action) in actions.into_iter().enumerate() {
             let typed_text = match &action {
-                Action::Type { text } => Some(text.clone()),
+                ActionV2::Coordinate {
+                    action: Action::Type { text },
+                } => Some(text.clone()),
                 _ => None,
             };
             let observation = if index + 1 == total || typed_text.is_some() {
@@ -618,7 +722,6 @@ impl DeviceMcp {
             } else {
                 observation_none()
             };
-            let action = ActionV2::Coordinate { action };
             let started = Instant::now();
             let result = match self
                 .transport
@@ -648,14 +751,15 @@ impl DeviceMcp {
                             started.elapsed(),
                         ));
                     return Err(format!(
-                        "input sequence stopped at step {} of {total} after {index} completed steps: {error}",
+                        "input sequence stopped at step {} of {total} after {index} completed steps: {}",
                         index + 1,
+                        error.client_message(),
                     ));
                 }
             };
             self.remember_v2_state(&result).await;
             if let Some(text) = typed_text {
-                if !result_confirms_typed_text(&result, &text) {
+                if typed_text_confirmation(&result, &text) == TypedTextConfirmation::Missing {
                     return Err(format!(
                         "input sequence stopped at step {} of {total}: typed text was not observed in the focused application; no subsequent key was sent",
                         index + 1,
@@ -668,20 +772,42 @@ impl DeviceMcp {
     }
 
     async fn remember_v2_state(&self, result: &DeviceResultV2) {
-        *self.v2_state.lock().await = Some(McpBoundState {
-            state_id: result.state_id,
-            state_generation: result.state_generation,
-            application_digest: result.application_digest.clone(),
-            window_id: result.window_id,
-            display_fingerprint: result.display_fingerprint.clone(),
-        });
+        let mut states = self.v2_states.lock().await;
+        states.retain(|_, state| state.application_digest != result.application_digest);
+        states.insert(
+            result.state_id,
+            McpBoundState {
+                state_id: result.state_id,
+                state_generation: result.state_generation,
+                application_digest: result.application_digest.clone(),
+                window_id: result.window_id,
+                display_fingerprint: result.display_fingerprint.clone(),
+            },
+        );
     }
 
-    async fn element_target(&self, element_index: u32) -> Result<ElementTarget, String> {
-        let state =
-            self.v2_state.lock().await.clone().ok_or_else(|| {
-                "observe the application before using an element action".to_owned()
-            })?;
+    async fn element_target(
+        &self,
+        state_id: &str,
+        state_generation: u64,
+        element_index: u32,
+    ) -> Result<ElementTarget, String> {
+        let state_id = Uuid::parse_str(state_id).map_err(|_| {
+            "state_id must be a valid UUID from the latest visible state".to_owned()
+        })?;
+        let state = self.v2_states.lock().await.get(&state_id).cloned();
+        let Some(state) = state else {
+            return Err(
+                "stale_state: element_index is not bound to the latest model-visible state for its application; observe that application again"
+                    .to_owned(),
+            );
+        };
+        if state.state_generation != state_generation {
+            return Err(
+                "stale_state: state_generation does not match the latest model-visible state for its application; use the generation returned with that state_id"
+                    .to_owned(),
+            );
+        }
         Ok(ElementTarget {
             state_id: state.state_id,
             state_generation: state.state_generation,
@@ -693,7 +819,14 @@ impl DeviceMcp {
     }
 }
 
-fn result_confirms_typed_text(result: &DeviceResultV2, text: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypedTextConfirmation {
+    Confirmed,
+    Inconclusive,
+    Missing,
+}
+
+fn typed_text_confirmation(result: &DeviceResultV2, text: &str) -> TypedTextConfirmation {
     let normalized = text.trim().to_lowercase();
     let without_scheme = normalized
         .strip_prefix("https://")
@@ -701,24 +834,110 @@ fn result_confirms_typed_text(result: &DeviceResultV2, text: &str) -> bool {
         .unwrap_or(&normalized)
         .trim_end_matches('/');
     let needles = [normalized.as_str(), without_scheme];
-    result.observation.as_ref().is_some_and(|observation| {
-        observation.nodes.iter().any(|node| {
-            [
-                node.title.as_deref(),
-                node.label.as_deref(),
-                node.value.as_deref(),
-                node.url.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(str::to_lowercase)
-            .any(|value| {
-                needles
-                    .iter()
-                    .any(|needle| !needle.is_empty() && value.contains(needle))
-            })
+    let Some(observation) = result.observation.as_ref() else {
+        return TypedTextConfirmation::Inconclusive;
+    };
+    if observation.nodes.iter().any(|node| {
+        [
+            node.title.as_deref(),
+            node.label.as_deref(),
+            node.value.as_deref(),
+            node.url.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_lowercase)
+        .any(|value| {
+            needles
+                .iter()
+                .any(|needle| !needle.is_empty() && value.contains(needle))
         })
-    })
+    }) {
+        return TypedTextConfirmation::Confirmed;
+    }
+    if observation.truncated
+        || matches!(
+            observation.kind,
+            crate::protocol_v2::AccessibilityObservationKind::Diff
+        )
+    {
+        TypedTextConfirmation::Inconclusive
+    } else {
+        TypedTextConfirmation::Missing
+    }
+}
+
+fn input_text_actions(params: InputTextParameters) -> Vec<Action> {
+    input_text_actions_with_wait(params, true)
+}
+
+fn input_text_actions_v2(
+    params: InputTextParameters,
+    element_target: Option<ElementTarget>,
+) -> Vec<ActionV2> {
+    // Every v2 action already uses adaptive settle. A trailing fixed wait would
+    // advance the state and replace the typed-text evidence with an empty diff.
+    let mut actions = Vec::with_capacity(5);
+    if let Some(target) = element_target {
+        actions.push(ActionV2::Press { target });
+    }
+    actions.extend(
+        input_text_actions_with_wait(params, false)
+            .into_iter()
+            .map(|action| ActionV2::Coordinate { action }),
+    );
+    actions
+}
+
+fn input_text_actions_with_wait(
+    params: InputTextParameters,
+    include_explicit_wait: bool,
+) -> Vec<Action> {
+    let mut actions = Vec::with_capacity(5);
+    if let Some(coordinate) = params.coordinate {
+        actions.push(Action::LeftClick { coordinate });
+    }
+    if let Some(key) = params.shortcut_before {
+        actions.push(Action::Key { key });
+    }
+    if !params.text.is_empty() {
+        actions.push(Action::Type { text: params.text });
+    }
+    if let Some(key) = params.key_after {
+        actions.push(Action::Key { key });
+    }
+    if include_explicit_wait {
+        if let Some(duration_ms) = params.wait_after_ms {
+            actions.push(Action::Wait { duration_ms });
+        }
+    }
+    actions
+}
+
+fn input_text_element_fields(
+    params: &InputTextParameters,
+) -> Result<Option<(&str, u64, u32)>, String> {
+    let fields = (
+        params.state_id.as_deref(),
+        params.state_generation,
+        params.element_index,
+    );
+    match fields {
+        (None, None, None) => Ok(None),
+        (Some(state_id), Some(state_generation), Some(element_index)) => {
+            if params.coordinate.is_some() {
+                return Err(
+                    "input_text accepts either an AX element target or coordinate, not both"
+                        .to_owned(),
+                );
+            }
+            Ok(Some((state_id, state_generation, element_index)))
+        }
+        _ => Err(
+            "input_text AX focus requires state_id, state_generation, and element_index together"
+                .to_owned(),
+        ),
+    }
 }
 
 fn observation_none() -> ObservationPolicy {
@@ -745,6 +964,16 @@ async fn device_result_v2(result: DeviceResultV2) -> Result<CallToolResult, Stri
         content.push(block);
     }
     Ok(CallToolResult::success(content))
+}
+
+fn compact_clipboard_result_v2(result: DeviceResultV2) -> Result<CallToolResult, String> {
+    if result.observation.is_some() || result.screenshot.is_some() {
+        return Err("clipboard response unexpectedly contained visual state".to_owned());
+    }
+    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+        "clipboard={}",
+        json_string(&result.message)?,
+    ))]))
 }
 
 fn render_v2_result(result: &DeviceResultV2) -> Result<String, String> {
@@ -878,7 +1107,7 @@ impl DeviceMcp {
             .transport
             .supports_v2()
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.client_message())?
         {
             let action = match params.application {
                 Some(application) => Action::ScreenshotApplication { application },
@@ -893,7 +1122,7 @@ impl DeviceMcp {
     }
 
     #[tool(
-        description = "Act on the latest observed Mac UI. Prefer element_index actions; coordinates require a model-visible screenshot. The result contains the next AX diff by default"
+        description = "Act on the latest observed Mac UI. Element forms: press={state_id,state_generation,element_index}; set_value adds value; clear_value uses the same three fields; select_text requires non-empty text and may add prefix, suffix, or selection_type; scroll_element adds direction; secondary_action adds action_name. Use an element form only when the latest node exposes the required AX action; scroll_element needs the matching AXScroll...ByPage action, otherwise use bounded context scroll. Use press, not left_click, for an AX element. Context forms never take state or element fields: key={key}; type={text}; left_click/right_click/middle_click/double_click/triple_click/mouse_move={coordinate}; left_click_drag={start,end,duration_ms?}; scroll={delta_x,delta_y,coordinate?}; wait={duration_ms}. Key uses macOS names and + modifiers, for example cmd+Left, cmd+[, cmd+a, or Return. Coordinates require a latest model-visible screenshot. A successful result already contains the next AX diff"
     )]
     async fn act(
         &self,
@@ -906,22 +1135,44 @@ impl DeviceMcp {
             .transport
             .supports_v2()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.client_message())?;
         let action = match params.kind {
             ActKind::Press => ActionV2::Press {
                 target: self
-                    .element_target(params.element_index.expect("validated"))
+                    .element_target(
+                        params.state_id.as_deref().expect("validated"),
+                        params.state_generation.expect("validated"),
+                        params.element_index.expect("validated"),
+                    )
                     .await?,
             },
             ActKind::SetValue => ActionV2::SetValue {
                 target: self
-                    .element_target(params.element_index.expect("validated"))
+                    .element_target(
+                        params.state_id.as_deref().expect("validated"),
+                        params.state_generation.expect("validated"),
+                        params.element_index.expect("validated"),
+                    )
                     .await?,
                 value: params.value.expect("validated"),
             },
+            ActKind::ClearValue => ActionV2::SetValue {
+                target: self
+                    .element_target(
+                        params.state_id.as_deref().expect("validated"),
+                        params.state_generation.expect("validated"),
+                        params.element_index.expect("validated"),
+                    )
+                    .await?,
+                value: String::new(),
+            },
             ActKind::SelectText => ActionV2::SelectText {
                 target: self
-                    .element_target(params.element_index.expect("validated"))
+                    .element_target(
+                        params.state_id.as_deref().expect("validated"),
+                        params.state_generation.expect("validated"),
+                        params.element_index.expect("validated"),
+                    )
                     .await?,
                 text: params.text.expect("validated"),
                 prefix: params.prefix,
@@ -937,7 +1188,11 @@ impl DeviceMcp {
             },
             ActKind::ScrollElement => ActionV2::ScrollElement {
                 target: self
-                    .element_target(params.element_index.expect("validated"))
+                    .element_target(
+                        params.state_id.as_deref().expect("validated"),
+                        params.state_generation.expect("validated"),
+                        params.element_index.expect("validated"),
+                    )
                     .await?,
                 direction: match params.direction.expect("validated") {
                     ScrollDirectionParameter::Up => ScrollDirection::Up,
@@ -949,7 +1204,11 @@ impl DeviceMcp {
             },
             ActKind::SecondaryAction => ActionV2::SecondaryAction {
                 target: self
-                    .element_target(params.element_index.expect("validated"))
+                    .element_target(
+                        params.state_id.as_deref().expect("validated"),
+                        params.state_generation.expect("validated"),
+                        params.element_index.expect("validated"),
+                    )
                     .await?,
                 action_name: params.action_name.expect("validated"),
             },
@@ -1056,12 +1315,10 @@ impl DeviceMcp {
             .transport
             .supports_v2()
             .await
-            .map_err(|error| error.to_string())?
-            && self.v2_state.lock().await.is_some()
+            .map_err(|error| error.client_message())?
+            && !self.v2_states.lock().await.is_empty()
         {
-            return self
-                .dispatch_v2(ActionV2::ReadClipboard, ObservationPolicy::default())
-                .await;
+            return self.dispatch_clipboard_v2().await;
         }
         self.dispatch(Action::ReadClipboard).await
     }
@@ -1086,35 +1343,49 @@ impl DeviceMcp {
     }
 
     #[tool(
-        description = "Focus an optional image coordinate, send an optional shortcut, type text, send an optional final key, optionally wait, and return only the final state. A screenshot is required only when coordinate is provided"
+        description = "Optionally focus either a latest-state AX target={state_id,state_generation,element_index} or an image coordinate, then send an optional shortcut, type text, send an optional final key, and return only the final state. Prefer the AX target because it needs no screenshot and removes a separate act press call. The three AX fields are required together and cannot be combined with coordinate. A coordinate requires a latest model-visible screenshot. V2 uses adaptive settle instead of an extra fixed wait"
     )]
     async fn input_text(
         &self,
         Parameters(params): Parameters<InputTextParameters>,
     ) -> Result<CallToolResult, String> {
-        let mut actions = Vec::with_capacity(5);
-        if let Some(coordinate) = params.coordinate {
-            actions.push(Action::LeftClick { coordinate });
-        }
-        if let Some(key) = params.shortcut_before {
-            actions.push(Action::Key { key });
-        }
-        actions.push(Action::Type { text: params.text });
-        if let Some(key) = params.key_after {
-            actions.push(Action::Key { key });
-        }
-        if let Some(duration_ms) = params.wait_after_ms {
-            actions.push(Action::Wait { duration_ms });
-        }
-        if self
+        let element_fields = input_text_element_fields(&params)?;
+        let supports_v2 = self
             .transport
             .supports_v2()
             .await
-            .map_err(|error| error.to_string())?
-        {
+            .map_err(|error| error.client_message())?;
+        let actions_v2 = if supports_v2 {
+            let element_target = match element_fields {
+                Some((state_id, state_generation, element_index)) => Some(
+                    self.element_target(state_id, state_generation, element_index)
+                        .await?,
+                ),
+                None => None,
+            };
+            Some(input_text_actions_v2(params.clone(), element_target))
+        } else {
+            if element_fields.is_some() {
+                return Err(
+                    "input_text AX focus requires the negotiated ax_state_v2 capability".to_owned(),
+                );
+            }
+            None
+        };
+        let actions_v1 = actions_v2.is_none().then(|| input_text_actions(params));
+        let is_empty = actions_v2.as_ref().is_some_and(Vec::is_empty)
+            || actions_v1.as_ref().is_some_and(Vec::is_empty);
+        if is_empty {
+            return Err(
+                "input_text requires an AX target, coordinate, shortcut, non-empty text, final key, or wait"
+                    .to_owned(),
+            );
+        }
+        if let Some(actions) = actions_v2 {
             self.dispatch_sequence_v2(actions).await
         } else {
-            self.dispatch_sequence(actions).await
+            self.dispatch_sequence(actions_v1.expect("v1 actions exist"))
+                .await
         }
     }
 
@@ -1301,7 +1572,7 @@ fn observation_policy(
 impl ServerHandler for DeviceMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Controls only approved macOS applications. Start with observe, which returns bounded accessibility state or a diff and falls back to a screenshot when needed. Use act with fresh element_index values; use coordinates only from the latest model-visible screenshot. A successful act already returns the next state, so do not observe again immediately. Prefer input_text for deterministic browser address-bar, search, and form prefixes; keep consequential final actions separate for observation and confirmation.",
+            "Controls only approved macOS applications. Start with observe, which returns bounded accessibility state or a diff and falls back to a screenshot when needed. Bind every element operation to the state_id and state_generation returned with its fresh element_index; use coordinates only from the latest model-visible screenshot. A successful operation already returns the next state, so do not observe again immediately. Prefer one AX-targeted input_text call for deterministic address-bar, search, and form sequences; keep consequential final actions separate for observation and confirmation.",
         )
     }
 }
@@ -1424,11 +1695,13 @@ mod tests {
     #[test]
     fn compact_act_schema_accepts_each_exact_action_shape() {
         let valid = [
-            serde_json::json!({"type": "press", "element_index": 1}),
-            serde_json::json!({"type": "set_value", "element_index": 1, "value": "value"}),
-            serde_json::json!({"type": "select_text", "element_index": 1, "text": "text", "prefix": "pre", "suffix": "post", "selection_type": "cursor_after"}),
-            serde_json::json!({"type": "scroll_element", "element_index": 1, "direction": "down", "pages": 2}),
-            serde_json::json!({"type": "secondary_action", "element_index": 1, "action_name": "show_menu"}),
+            serde_json::json!({"type": "press", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1}),
+            serde_json::json!({"type": "set_value", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1, "value": "value"}),
+            serde_json::json!({"type": "set_value", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1, "value": ""}),
+            serde_json::json!({"type": "clear_value", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1}),
+            serde_json::json!({"type": "select_text", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1, "text": "text", "prefix": "pre", "suffix": "post", "selection_type": "cursor_after"}),
+            serde_json::json!({"type": "scroll_element", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1, "direction": "down", "pages": 2}),
+            serde_json::json!({"type": "secondary_action", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1, "action_name": "show_menu"}),
             serde_json::json!({"type": "left_click", "coordinate": [10, 20]}),
             serde_json::json!({"type": "right_click", "coordinate": [10, 20]}),
             serde_json::json!({"type": "middle_click", "coordinate": [10, 20]}),
@@ -1460,6 +1733,8 @@ mod tests {
 
         let missing_text: ActParameters = serde_json::from_value(serde_json::json!({
             "type": "select_text",
+            "state_id": "10000000-0000-4000-8000-000000000001",
+            "state_generation": 1,
             "element_index": 1,
             "selection_type": "text"
         }))
@@ -1467,7 +1742,32 @@ mod tests {
         assert!(!missing_text.validate_shape());
         assert_eq!(
             missing_text.shape_error(),
-            "select_text requires element_index and text; prefix, suffix, and selection_type are optional"
+            "select_text requires state_id, state_generation, element_index, and text; prefix, suffix, and selection_type are optional"
+        );
+
+        let unbound_element: ActParameters = serde_json::from_value(serde_json::json!({
+            "type": "press",
+            "element_index": 1
+        }))
+        .expect("known fields");
+        assert!(!unbound_element.validate_shape());
+        assert_eq!(
+            unbound_element.shape_error(),
+            "press requires state_id, state_generation, and element_index"
+        );
+
+        let clear_with_value: ActParameters = serde_json::from_value(serde_json::json!({
+            "type": "clear_value",
+            "state_id": "10000000-0000-4000-8000-000000000001",
+            "state_generation": 1,
+            "element_index": 1,
+            "value": ""
+        }))
+        .expect("known fields");
+        assert!(!clear_with_value.validate_shape());
+        assert_eq!(
+            clear_with_value.shape_error(),
+            "clear_value requires only state_id, state_generation, and element_index"
         );
 
         let conflicting_scroll: ActParameters = serde_json::from_value(serde_json::json!({
@@ -1529,18 +1829,223 @@ mod tests {
             manual_recovery: false,
         };
 
-        assert!(result_confirms_typed_text(
-            &result_with_value(Some("Computer use test query"), None),
-            "computer use test"
-        ));
-        assert!(result_confirms_typed_text(
-            &result_with_value(None, Some("https://example.com/path/")),
-            "http://example.com/path"
-        ));
-        assert!(!result_confirms_typed_text(
-            &result_with_value(Some("different query"), Some("https://example.com/")),
-            "missing text"
-        ));
+        assert_eq!(
+            typed_text_confirmation(
+                &result_with_value(Some("Computer use test query"), None),
+                "computer use test"
+            ),
+            TypedTextConfirmation::Confirmed
+        );
+        assert_eq!(
+            typed_text_confirmation(
+                &result_with_value(None, Some("https://example.com/path/")),
+                "http://example.com/path"
+            ),
+            TypedTextConfirmation::Confirmed
+        );
+        assert_eq!(
+            typed_text_confirmation(
+                &result_with_value(Some("different query"), Some("https://example.com/")),
+                "missing text"
+            ),
+            TypedTextConfirmation::Missing
+        );
+
+        let mut truncated = result_with_value(Some("different query"), None);
+        truncated
+            .observation
+            .as_mut()
+            .expect("observation")
+            .truncated = true;
+        assert_eq!(
+            typed_text_confirmation(&truncated, "missing text"),
+            TypedTextConfirmation::Inconclusive
+        );
+
+        let mut diff = result_with_value(Some("different query"), None);
+        diff.observation.as_mut().expect("observation").kind = AccessibilityObservationKind::Diff;
+        assert_eq!(
+            typed_text_confirmation(&diff, "missing text"),
+            TypedTextConfirmation::Inconclusive
+        );
+    }
+
+    #[test]
+    fn compact_clipboard_output_omits_ax_image_and_settle_metadata() {
+        use crate::protocol_v2::{SettleResult, SettleStatus};
+
+        let state_id = Uuid::new_v4();
+        let result = compact_clipboard_result_v2(DeviceResultV2 {
+            message: "Clipboard v2 test".to_owned(),
+            state_generation: 9,
+            screenshot_generation: 4,
+            state_id,
+            application_digest: "a".repeat(64),
+            window_id: 1,
+            display_fingerprint: "display".to_owned(),
+            base_state_id: None,
+            observation: None,
+            settle: SettleResult {
+                status: SettleStatus::Settled,
+                elapsed_ms: 1_234,
+            },
+            screenshot: None,
+            retry_count: 0,
+            manual_recovery: false,
+        })
+        .expect("compact clipboard result");
+        let encoded = serde_json::to_string(&result).expect("serialize MCP result");
+
+        assert!(encoded.contains("Clipboard v2 test"));
+        assert!(!encoded.contains(&state_id.to_string()));
+        assert!(!encoded.contains("generation=9"));
+        assert!(!encoded.contains("settle"));
+        assert!(!encoded.contains("elapsed_ms"));
+        assert!(!encoded.contains("screenshot_generation"));
+        assert!(!encoded.contains("ax="));
+    }
+
+    #[test]
+    fn empty_input_text_omits_type_but_keeps_clear_shortcuts() {
+        let actions = input_text_actions(InputTextParameters {
+            coordinate: Some([320, 240]),
+            state_id: None,
+            state_generation: None,
+            element_index: None,
+            shortcut_before: Some("CMD+A".to_owned()),
+            text: String::new(),
+            key_after: Some("DELETE".to_owned()),
+            wait_after_ms: None,
+        });
+        assert_eq!(
+            actions,
+            vec![
+                Action::LeftClick {
+                    coordinate: [320, 240]
+                },
+                Action::Key {
+                    key: "CMD+A".to_owned()
+                },
+                Action::Key {
+                    key: "DELETE".to_owned()
+                }
+            ]
+        );
+        assert!(input_text_actions(InputTextParameters {
+            coordinate: None,
+            state_id: None,
+            state_generation: None,
+            element_index: None,
+            shortcut_before: None,
+            text: String::new(),
+            key_after: None,
+            wait_after_ms: None,
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn v2_input_text_uses_adaptive_settle_without_a_trailing_wait_state() {
+        let actions = input_text_actions_v2(
+            InputTextParameters {
+                coordinate: None,
+                state_id: None,
+                state_generation: None,
+                element_index: None,
+                shortcut_before: None,
+                text: "typed text".to_owned(),
+                key_after: None,
+                wait_after_ms: Some(300),
+            },
+            None,
+        );
+        assert_eq!(
+            actions,
+            vec![ActionV2::Coordinate {
+                action: Action::Type {
+                    text: "typed text".to_owned()
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn v2_input_text_can_focus_a_bound_ax_element_in_the_same_sequence() {
+        let state_id = Uuid::new_v4();
+        let target = ElementTarget {
+            state_id,
+            state_generation: 7,
+            application_digest: "application".to_owned(),
+            window_id: 9,
+            display_fingerprint: "display".to_owned(),
+            element_index: 12,
+        };
+        let actions = input_text_actions_v2(
+            InputTextParameters {
+                coordinate: None,
+                state_id: Some(state_id.to_string()),
+                state_generation: Some(7),
+                element_index: Some(12),
+                shortcut_before: Some("CMD+A".to_owned()),
+                text: "https://example.com".to_owned(),
+                key_after: Some("Return".to_owned()),
+                wait_after_ms: None,
+            },
+            Some(target.clone()),
+        );
+
+        assert_eq!(
+            actions,
+            vec![
+                ActionV2::Press { target },
+                ActionV2::Coordinate {
+                    action: Action::Key {
+                        key: "CMD+A".to_owned()
+                    }
+                },
+                ActionV2::Coordinate {
+                    action: Action::Type {
+                        text: "https://example.com".to_owned()
+                    }
+                },
+                ActionV2::Coordinate {
+                    action: Action::Key {
+                        key: "Return".to_owned()
+                    }
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn input_text_rejects_partial_or_mixed_ax_targets() {
+        let partial = InputTextParameters {
+            coordinate: None,
+            state_id: Some(Uuid::new_v4().to_string()),
+            state_generation: None,
+            element_index: Some(1),
+            shortcut_before: None,
+            text: "text".to_owned(),
+            key_after: None,
+            wait_after_ms: None,
+        };
+        assert!(input_text_element_fields(&partial)
+            .expect_err("partial target must fail")
+            .contains("requires state_id"));
+
+        let mixed = InputTextParameters {
+            coordinate: Some([10, 20]),
+            state_id: Some(Uuid::new_v4().to_string()),
+            state_generation: Some(1),
+            element_index: Some(1),
+            shortcut_before: None,
+            text: "text".to_owned(),
+            key_after: None,
+            wait_after_ms: None,
+        };
+        assert!(input_text_element_fields(&mixed)
+            .expect_err("mixed targets must fail")
+            .contains("not both"));
     }
 
     #[tokio::test]
@@ -1556,6 +2061,69 @@ mod tests {
         assert_eq!(summary.v1_calls, 1);
         assert_eq!(summary.successful_calls, 1);
         assert_eq!(summary.model_visible_images, 0);
+    }
+
+    #[tokio::test]
+    async fn element_target_rejects_a_model_visible_stale_state() {
+        let server = DeviceMcp::token_efficient(Arc::new(SuccessTransport));
+        let current_state_id = Uuid::new_v4();
+        server.v2_states.lock().await.insert(
+            current_state_id,
+            McpBoundState {
+                state_id: current_state_id,
+                state_generation: 7,
+                application_digest: "a".repeat(64),
+                window_id: 1,
+                display_fingerprint: "display".to_owned(),
+            },
+        );
+
+        let error = server
+            .element_target(&Uuid::new_v4().to_string(), 6, 12)
+            .await
+            .expect_err("stale state must fail before dispatch");
+        assert!(error.starts_with("stale_state:"));
+
+        let target = server
+            .element_target(&current_state_id.to_string(), 7, 12)
+            .await
+            .expect("latest state");
+        assert_eq!(target.state_id, current_state_id);
+        assert_eq!(target.state_generation, 7);
+        assert_eq!(target.element_index, 12);
+    }
+
+    #[tokio::test]
+    async fn element_target_keeps_the_latest_state_for_each_application() {
+        let server = DeviceMcp::token_efficient(Arc::new(SuccessTransport));
+        let first_state_id = Uuid::new_v4();
+        let second_state_id = Uuid::new_v4();
+        server.v2_states.lock().await.insert(
+            first_state_id,
+            McpBoundState {
+                state_id: first_state_id,
+                state_generation: 1,
+                application_digest: "a".repeat(64),
+                window_id: 1,
+                display_fingerprint: "display".to_owned(),
+            },
+        );
+        server.v2_states.lock().await.insert(
+            second_state_id,
+            McpBoundState {
+                state_id: second_state_id,
+                state_generation: 2,
+                application_digest: "b".repeat(64),
+                window_id: 2,
+                display_fingerprint: "display".to_owned(),
+            },
+        );
+
+        let target = server
+            .element_target(&first_state_id.to_string(), 1, 12)
+            .await
+            .expect("first application remains model-visible");
+        assert_eq!(target.state_id, first_state_id);
     }
 
     #[tokio::test]

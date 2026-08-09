@@ -1,7 +1,7 @@
 import DeviceIPC
 import DeviceProtocol
 import DeviceSecurity
-import DeviceServices
+@testable import DeviceServices
 import Foundation
 import GUIExecutor
 import Testing
@@ -59,6 +59,7 @@ import Testing
     #expect(first.stateID != nil)
     #expect(first.observation == nil)
     #expect(first.image?.profile == .compact)
+    #expect(await recorder.captureCount == 1)
 
     let staleData = try await controller.performAction(actionEnvelopeV2(
         configuration: session,
@@ -134,6 +135,7 @@ import Testing
     #expect(action.status == .success)
     #expect(action.stateGeneration == 2)
     #expect(await recorder.elementActions == [.press(target)])
+    #expect(await recorder.settlePhases == ["prepare", "execute"])
     #expect(await recorder.accessibilityClearCount == 0)
 
     let staleData = try await controller.performAction(actionEnvelopeV2(
@@ -225,6 +227,62 @@ import Testing
     #expect(await recorder.actions == [.key("CMD+A")])
 }
 
+@Test func executorReturnsV2ActivationFailureWithoutDroppingTheSession() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            contextActionFailure: .applicationActivationTimedOut
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let failureData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.key("CMD+L"))
+    ))
+    let failure = try JSONDecoder().decode(ActionResponseV2.self, from: failureData)
+
+    #expect(failure.status == .failed)
+    #expect(failure.message.hasPrefix("approved_application_activation_timed_out:"))
+    #expect(await controller.currentState() == .active)
+}
+
 @Test func typedActionWaitsForFreshAccessibilityText() async throws {
     let recorder = RuntimeRecorder()
     let typedText = "fresh typed text"
@@ -275,6 +333,866 @@ import Testing
     #expect(typed.status == .success)
     #expect(typed.observation?.nodes.contains { $0.value == typedText } == true)
     #expect(await recorder.actions == [.type(typedText)])
+}
+
+@Test func setValueWaitsForBoundAccessibilityValueBeforeReturningAX() async throws {
+    let recorder = RuntimeRecorder()
+    let expectedValue = "fresh bound value"
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            observationValues: [nil, expectedValue]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(30))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let target = ElementTarget(
+        stateID: try #require(observed.stateID),
+        stateGeneration: observed.stateGeneration,
+        applicationDigest: try #require(observed.applicationDigest),
+        windowID: try #require(observed.windowID),
+        displayFingerprint: try #require(observed.displayFingerprint),
+        elementIndex: 0
+    )
+    let started = Date()
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: observed.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: observed.stateID,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .setValue(target: target, value: expectedValue)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+    let calls = await recorder.valueFreshnessCalls
+
+    #expect(action.status == .success)
+    #expect(action.observation?.nodes.contains { $0.value == expectedValue } == true)
+    #expect(calls.count == 1)
+    #expect(calls.first?.0 == target)
+    #expect(calls.first?.1 == expectedValue)
+    #expect(try #require(calls.first?.2) <= session.leaseUntil)
+    #expect(try #require(calls.first?.2) <= started.addingTimeInterval(2.1))
+
+    let latestTarget = ElementTarget(
+        stateID: try #require(action.stateID),
+        stateGeneration: action.stateGeneration,
+        applicationDigest: try #require(action.applicationDigest),
+        windowID: try #require(action.windowID),
+        displayFingerprint: try #require(action.displayFingerprint),
+        elementIndex: 0
+    )
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        stateGeneration: action.stateGeneration,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .press(latestTarget)
+    ))
+    #expect(await recorder.valueFreshnessCalls.count == 1)
+}
+
+@Test func setValueFreshnessTimeoutReturnsBoundedStateWithDiagnostic() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            observationValues: [nil, nil],
+            valueFreshnessConfirmed: false
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(30))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let target = ElementTarget(
+        stateID: try #require(observed.stateID),
+        stateGeneration: observed.stateGeneration,
+        applicationDigest: try #require(observed.applicationDigest),
+        windowID: try #require(observed.windowID),
+        displayFingerprint: try #require(observed.displayFingerprint),
+        elementIndex: 0
+    )
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: observed.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: observed.stateID,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .setValue(target: target, value: "not yet visible")
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.stateID != nil)
+    #expect(action.message.contains("Expected accessibility value was not visible"))
+    #expect(await recorder.valueFreshnessCalls.count == 1)
+}
+
+@Test func v2ActionFollowUpStateStaysBoundToTheObservedApplication() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            observationValues: [nil, "bound text"]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let chrome = ApplicationIdentity(
+        bundleIdentifier: "com.google.Chrome",
+        signingIdentifier: "com.google.Chrome"
+    )
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: [
+            LocalApproval(
+                application: base.approvals[0].application,
+                controlLevel: .fullControl,
+                clipboardAllowed: false,
+                generation: base.binding.generation
+            ),
+            LocalApproval(
+                application: chrome,
+                controlLevel: .fullControl,
+                clipboardAllowed: false,
+                generation: base.binding.generation
+            ),
+        ]
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: "com.apple.Safari")
+    ))
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .coordinate(.type("bound text"))
+    ))
+
+    #expect(await recorder.captureTargets == [
+        "com.apple.Safari",
+        "com.apple.Safari",
+    ])
+}
+
+@Test func v2ElementStatesRemainUsableAcrossApprovedApplications() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let chrome = ApplicationIdentity(
+        bundleIdentifier: "com.google.Chrome",
+        signingIdentifier: "com.google.Chrome"
+    )
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: [
+            LocalApproval(
+                application: base.approvals[0].application,
+                controlLevel: .clickOnly,
+                clipboardAllowed: false,
+                generation: base.binding.generation
+            ),
+            LocalApproval(
+                application: chrome,
+                controlLevel: .clickOnly,
+                clipboardAllowed: false,
+                generation: base.binding.generation
+            ),
+        ]
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let firstData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: base.approvals[0].application.bundleIdentifier)
+    ))
+    let first = try JSONDecoder().decode(ActionResponseV2.self, from: firstData)
+    let firstTarget = ElementTarget(
+        stateID: try #require(first.stateID),
+        stateGeneration: first.stateGeneration,
+        applicationDigest: try #require(first.applicationDigest),
+        windowID: try #require(first.windowID),
+        displayFingerprint: try #require(first.displayFingerprint),
+        elementIndex: 0
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: chrome.bundleIdentifier)
+    ))
+
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        stateGeneration: 2,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .press(firstTarget)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.stateGeneration == 3)
+    #expect(await recorder.elementActions == [.press(firstTarget)])
+    #expect(await recorder.accessibilityClearCount == 0)
+}
+
+@Test func accessibilityIdentityIgnoresWindowGeometryButRejectsBindingChanges() {
+    let approvedApplication = ApplicationIdentity(
+        bundleIdentifier: "com.google.Chrome",
+        signingIdentifier: "com.google.Chrome"
+    )
+    let original = WindowContext(
+        windowID: 7,
+        windowFrame: CGRect(x: 0, y: 0, width: 1_800, height: 1_000),
+        processID: 42,
+        application: approvedApplication,
+        displayFingerprint: "display-a"
+    )
+    func context(
+        windowID: UInt32 = 7,
+        frame: CGRect = CGRect(x: 0.25, y: 0, width: 1_799.75, height: 1_000),
+        processID: Int32 = 42,
+        application: ApplicationIdentity? = nil,
+        displayFingerprint: String = "display-a"
+    ) -> WindowContext {
+        WindowContext(
+            windowID: windowID,
+            windowFrame: frame,
+            processID: processID,
+            application: application ?? approvedApplication,
+            displayFingerprint: displayFingerprint
+        )
+    }
+
+    #expect(GUIExecutorSessionController.sameAccessibilityIdentity(original, context()))
+    #expect(!GUIExecutorSessionController.sameAccessibilityIdentity(
+        original,
+        context(windowID: 8)
+    ))
+    #expect(!GUIExecutorSessionController.sameAccessibilityIdentity(
+        original,
+        context(processID: 43)
+    ))
+    #expect(!GUIExecutorSessionController.sameAccessibilityIdentity(
+        original,
+        context(application: ApplicationIdentity(
+            bundleIdentifier: "com.google.Chrome",
+            signingIdentifier: "different-signer"
+        ))
+    ))
+    #expect(!GUIExecutorSessionController.sameAccessibilityIdentity(
+        original,
+        context(displayFingerprint: "display-b")
+    ))
+}
+
+@Test func windowGeometryJitterPreservesTheActionDiffBase() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextFrames: [
+                CGRect(x: 0, y: 0, width: 1_800, height: 1_000),
+                CGRect(x: 0.25, y: 0, width: 1_799.75, height: 1_000),
+            ]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let observedStateID = try #require(observed.stateID)
+    let target = ElementTarget(
+        stateID: observedStateID,
+        stateGeneration: observed.stateGeneration,
+        applicationDigest: try #require(observed.applicationDigest),
+        windowID: try #require(observed.windowID),
+        displayFingerprint: try #require(observed.displayFingerprint),
+        elementIndex: 0
+    )
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: observed.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: observedStateID,
+        observation: ObservationPolicy(mode: .axDiff),
+        action: .setValue(target: target, value: "computer accessibility")
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.observation?.kind == .diff)
+    #expect(action.baseStateID == observedStateID)
+    #expect(await recorder.observationBaseStateIDs == [nil, observedStateID])
+    #expect(await recorder.accessibilityClearCount == 0)
+}
+
+@Test func adaptiveSettleUsesLongerGraceOnlyForNavigationCapableActions() {
+    let target = ElementTarget(
+        stateID: UUID(),
+        stateGeneration: 1,
+        applicationDigest: "app",
+        windowID: 7,
+        displayFingerprint: "display",
+        elementIndex: 0
+    )
+
+    #expect(ActionSettleTiming.minimumStableMilliseconds(for: .press(target)) == 600)
+    #expect(ActionSettleTiming.minimumStableMilliseconds(
+        for: .coordinate(.key("Return"))
+    ) == 600)
+    #expect(ActionSettleTiming.minimumStableMilliseconds(
+        for: .coordinate(.type("text"))
+    ) == 300)
+    #expect(ActionSettleTiming.minimumStableMilliseconds(
+        for: .coordinate(.key("cmd+c"))
+    ) == 200)
+    #expect(ActionSettleTiming.minimumStableMilliseconds(
+        for: .setValue(target: target, value: "text")
+    ) == 300)
+    #expect(ActionSettleTiming.requiredStableSamples(for: .press(target)) == 6)
+    #expect(ActionSettleTiming.requiredStableSamples(
+        for: .setValue(target: target, value: "text")
+    ) == 2)
+    #expect(ActionSettleTiming.requiredStableSamples(
+        for: .coordinate(.key("super+a"))
+    ) == 1)
+    #expect(ActionSettleTiming.requiresMeaningfulChange(for: .press(target)))
+    #expect(ActionSettleTiming.requiresMeaningfulChange(
+        for: .coordinate(.key("alt+Left"))
+    ))
+    for shortcut in ["cmd+Left", "cmd+Right", "super+Left", "super+Right", "cmd+[", "cmd+]"] {
+        #expect(ActionSettleTiming.requiresMeaningfulChange(
+            for: .coordinate(.key(shortcut))
+        ))
+        #expect(ActionSettleTiming.requiredStableSamples(
+            for: .coordinate(.key(shortcut))
+        ) == 6)
+    }
+    #expect(ActionSettleTiming.noChangeGraceMilliseconds(for: .press(target)) == 2_000)
+    #expect(ActionSettleTiming.noChangeGraceMilliseconds(
+        for: .coordinate(.type("text"))
+    ) == 0)
+    #expect(ActionSettleTiming.minimumStableMilliseconds(
+        for: .press(target),
+        pressTargetsEditableText: true
+    ) == 250)
+    #expect(ActionSettleTiming.requiredStableSamples(
+        for: .press(target),
+        pressTargetsEditableText: true
+    ) == 2)
+    #expect(!ActionSettleTiming.requiresMeaningfulChange(
+        for: .press(target),
+        pressTargetsEditableText: true
+    ))
+    #expect(ActionSettleTiming.noChangeGraceMilliseconds(
+        for: .press(target),
+        pressTargetsEditableText: true
+    ) == 0)
+    #expect(!ActionSettleTiming.canReturn(
+        stableSamples: 6,
+        requiredStableSamples: 6,
+        elapsedMilliseconds: 1_200,
+        minimumStableMilliseconds: 600,
+        observedMeaningfulChange: false,
+        noChangeGraceMilliseconds: 2_000
+    ))
+    #expect(ActionSettleTiming.canReturn(
+        stableSamples: 6,
+        requiredStableSamples: 6,
+        elapsedMilliseconds: 700,
+        minimumStableMilliseconds: 600,
+        observedMeaningfulChange: true,
+        noChangeGraceMilliseconds: 2_000
+    ))
+    #expect(ActionSettleTiming.canReturn(
+        stableSamples: 20,
+        requiredStableSamples: 6,
+        elapsedMilliseconds: 2_000,
+        minimumStableMilliseconds: 600,
+        observedMeaningfulChange: false,
+        noChangeGraceMilliseconds: 2_000
+    ))
+}
+
+@Test func navigationSettleRecoversWhenFinalDiffOmitsPageIdentity() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            settleObservedMeaningfulChange: true,
+            currentSnapshotHasPageIdentity: false
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: [LocalApproval(
+            application: base.approvals[0].application,
+            controlLevel: .clickOnly,
+            clipboardAllowed: false,
+            generation: base.binding.generation
+        )]
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let initialData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: session.approvals[0].application.bundleIdentifier)
+    ))
+    let initial = try JSONDecoder().decode(ActionResponseV2.self, from: initialData)
+    let initialStateID = try #require(initial.stateID)
+    let target = ElementTarget(
+        stateID: initialStateID,
+        stateGeneration: initial.stateGeneration,
+        applicationDigest: try #require(initial.applicationDigest),
+        windowID: try #require(initial.windowID),
+        displayFingerprint: try #require(initial.displayFingerprint),
+        elementIndex: 0
+    )
+
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        baseStateID: initialStateID,
+        observation: ObservationPolicy(mode: .axDiff),
+        action: .press(target)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.observation?.kind == .full)
+    #expect(action.observation?.reset == true)
+    #expect(action.baseStateID == nil)
+    #expect(await recorder.observationBaseStateIDs == [nil, initialStateID, nil])
+}
+
+@Test func fullObservationResetMatchesWhetherItReplacesAModelVisibleBase() {
+    let full = AccessibilityObservation(
+        kind: .full,
+        reset: false,
+        truncated: false,
+        nodes: [],
+        removed: []
+    )
+    let first = GUIExecutorSessionController.observationRequiringResetWhenReplacingModelBase(
+        full,
+        modelBaseStateID: nil
+    )
+    let replacement = GUIExecutorSessionController.observationRequiringResetWhenReplacingModelBase(
+        full,
+        modelBaseStateID: UUID()
+    )
+
+    #expect(!first.reset)
+    #expect(replacement.reset)
+}
+
+@Test func localElementChangesDoNotTriggerNavigationObservationRecovery() {
+    let target = ElementTarget(
+        stateID: UUID(),
+        stateGeneration: 1,
+        applicationDigest: String(repeating: "a", count: 64),
+        windowID: 7,
+        displayFingerprint: "display-a",
+        elementIndex: 0
+    )
+    let settle = ActionSettleOutcome(
+        result: SettleResult(status: .settled, elapsedMilliseconds: 10),
+        observedMeaningfulChange: true
+    )
+    let diff = AccessibilityObservation(
+        kind: .diff,
+        reset: false,
+        truncated: false,
+        nodes: [],
+        removed: []
+    )
+
+    for action in [
+        ActionV2.setValue(target: target, value: "query"),
+        .selectText(
+            target: target,
+            text: "query",
+            prefix: nil,
+            suffix: nil,
+            selectionType: .text
+        ),
+        .scrollElement(target: target, direction: .down, pages: 1),
+    ] {
+        #expect(!GUIExecutorSessionController.needsNavigationObservationRecovery(
+            settleOutcome: settle,
+            observation: diff,
+            baseHadPageIdentity: true,
+            currentHasPageIdentity: true,
+            action: action
+        ))
+    }
+    #expect(!GUIExecutorSessionController.needsNavigationObservationRecovery(
+        settleOutcome: ActionSettleOutcome(
+            result: settle.result,
+            observedMeaningfulChange: true,
+            pressTargetWasEditableText: true
+        ),
+        observation: diff,
+        baseHadPageIdentity: true,
+        currentHasPageIdentity: true,
+        action: .press(target)
+    ))
+    #expect(GUIExecutorSessionController.needsNavigationObservationRecovery(
+        settleOutcome: settle,
+        observation: diff,
+        baseHadPageIdentity: true,
+        currentHasPageIdentity: false,
+        action: .press(target)
+    ))
+    #expect(!GUIExecutorSessionController.needsNavigationObservationRecovery(
+        settleOutcome: settle,
+        observation: diff,
+        baseHadPageIdentity: true,
+        currentHasPageIdentity: false,
+        action: .coordinate(.key("cmd+c"))
+    ))
+
+    #expect(!GUIExecutorSessionController.needsNavigationObservationRecovery(
+        settleOutcome: settle,
+        observation: diff,
+        baseHadPageIdentity: false,
+        currentHasPageIdentity: false,
+        action: .press(target)
+    ))
+}
+
+@Test func localBrowserUiDismissalPreservesDiffWhenCurrentSnapshotStillHasPageIdentity() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            settleObservedMeaningfulChange: true,
+            currentSnapshotHasPageIdentity: true
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: [LocalApproval(
+            application: base.approvals[0].application,
+            controlLevel: .clickOnly,
+            clipboardAllowed: false,
+            generation: base.binding.generation
+        )]
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let initialData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: session.approvals[0].application.bundleIdentifier)
+    ))
+    let initial = try JSONDecoder().decode(ActionResponseV2.self, from: initialData)
+    let initialStateID = try #require(initial.stateID)
+    let target = ElementTarget(
+        stateID: initialStateID,
+        stateGeneration: initial.stateGeneration,
+        applicationDigest: try #require(initial.applicationDigest),
+        windowID: try #require(initial.windowID),
+        displayFingerprint: try #require(initial.displayFingerprint),
+        elementIndex: 0
+    )
+
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: initial.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: initialStateID,
+        observation: ObservationPolicy(mode: .axDiff),
+        action: .press(target)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.observation?.kind == .diff)
+    #expect(action.observation?.reset == false)
+    #expect(action.baseStateID == initialStateID)
+    #expect(await recorder.observationBaseStateIDs == [nil, initialStateID])
+}
+
+@Test func editableTextPressPreservesItsDiffWithoutNavigationRecovery() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            settleObservedMeaningfulChange: true,
+            settlePressTargetWasEditableText: true
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: [LocalApproval(
+            application: base.approvals[0].application,
+            controlLevel: .clickOnly,
+            clipboardAllowed: false,
+            generation: base.binding.generation
+        )]
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let initialData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: session.approvals[0].application.bundleIdentifier)
+    ))
+    let initial = try JSONDecoder().decode(ActionResponseV2.self, from: initialData)
+    let initialStateID = try #require(initial.stateID)
+    let target = ElementTarget(
+        stateID: initialStateID,
+        stateGeneration: initial.stateGeneration,
+        applicationDigest: try #require(initial.applicationDigest),
+        windowID: try #require(initial.windowID),
+        displayFingerprint: try #require(initial.displayFingerprint),
+        elementIndex: 0
+    )
+
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        baseStateID: initialStateID,
+        observation: ObservationPolicy(mode: .axDiff),
+        action: .press(target)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.observation?.kind == .diff)
+    #expect(action.observation?.reset == false)
+    #expect(action.baseStateID == initialStateID)
+    #expect(await recorder.observationBaseStateIDs == [nil, initialStateID])
+}
+
+@Test func settleTimeoutReturnsOneFiniteSafeObservationWithoutRetry() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            settleStatus: .timeout,
+            settleElapsedMilliseconds: 5_000
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let initialData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let initial = try JSONDecoder().decode(ActionResponseV2.self, from: initialData)
+    let initialStateID = try #require(initial.stateID)
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        baseStateID: initialStateID,
+        observation: ObservationPolicy(mode: .axDiff),
+        action: .coordinate(.key("Tab"))
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.settle == SettleResult(status: .timeout, elapsedMilliseconds: 5_000))
+    #expect(action.observation?.kind == .diff)
+    #expect(action.image == nil)
+    #expect(await recorder.observationBaseStateIDs == [nil, initialStateID])
+    #expect(await recorder.actions == [.key("Tab")])
 }
 
 @Test func executorSessionControllerActivatesStopsAndEndsOneBoundSession() async throws {
@@ -427,6 +1345,87 @@ import Testing
     #expect(response.screenshotGeneration == 1)
     #expect(response.image == nil)
     #expect(await controller.currentState() == .active)
+}
+
+@Test func v2ClipboardReadPreservesTheExistingAXSnapshotForTheNextElementAction() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .clickOnly,
+                clipboardAllowed: true,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+
+    let clipboardData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: observed.stateGeneration,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .readClipboard
+    ))
+    let clipboard = try JSONDecoder().decode(ActionResponseV2.self, from: clipboardData)
+    #expect(clipboard.status == .success)
+    #expect(clipboard.message == "clipboard text")
+    #expect(clipboard.observation == nil)
+    #expect(clipboard.image == nil)
+    #expect(clipboard.stateID == observed.stateID)
+    #expect(clipboard.stateGeneration == observed.stateGeneration)
+
+    let originalTarget = ElementTarget(
+        stateID: try #require(observed.stateID),
+        stateGeneration: observed.stateGeneration,
+        applicationDigest: try #require(clipboard.applicationDigest),
+        windowID: try #require(clipboard.windowID),
+        displayFingerprint: try #require(clipboard.displayFingerprint),
+        elementIndex: 0
+    )
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        stateGeneration: clipboard.stateGeneration,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .press(originalTarget)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+    #expect(action.status == .success)
+    #expect(await recorder.elementActions == [.press(originalTarget)])
 }
 
 @Test func executorRejectsCrossGenerationStopAndEndMessages() async throws {
@@ -624,6 +1623,54 @@ import Testing
     #expect(await recorder.releaseCount == 1)
 }
 
+@Test func legacyActionFollowUpScreenshotStaysBoundToTheCapturedApplication() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let chrome = ApplicationIdentity(
+        bundleIdentifier: "com.google.Chrome",
+        signingIdentifier: "com.google.Chrome"
+    )
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: [
+            base.approvals[0],
+            LocalApproval(
+                application: chrome,
+                controlLevel: .fullControl,
+                clipboardAllowed: false,
+                generation: base.binding.generation
+            ),
+        ]
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        screenshotGeneration: 0,
+        action: .screenshotApplication("com.google.Chrome")
+    ))
+    _ = try await controller.performAction(actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        screenshotGeneration: 1,
+        action: .key("CMD+L")
+    ))
+
+    #expect(await recorder.captureTargets == [
+        "com.google.Chrome",
+        "com.google.Chrome",
+    ])
+}
+
 @Test func executorRejectsEnvelopeAndSessionBindingMismatch() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -788,6 +1835,7 @@ import Testing
 
 @Test func networkBrokerBuildsExecutorConfigurationOnlyFromValidatedApproval() async throws {
     let executor = ExecutorStub()
+    let approvalUI = ApprovalUIStub()
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
     let lifecycleRecorder = LifecycleRecorder()
     let lockRecorder = LockRecorder()
@@ -834,6 +1882,7 @@ import Testing
             await lockRecorder.record(binding)
         }
     )
+    broker.installApprovalUI(approvalUI)
     let decision = BrokerApprovalDecision(
         binding: session.binding,
         approvals: session.approvals,
@@ -907,6 +1956,160 @@ import Testing
     #expect(executor.updateCount == 1)
 }
 
+@Test func initialRelayFailureRotatesGenerationOnceWithoutRepeatingUserApproval() async throws {
+    let executor = ExecutorStub()
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let attempts = RelayAttemptRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { configuration in
+            let attempt = await attempts.record(configuration)
+            if attempt == 1 {
+                throw DeviceIPCFailure.serviceUnavailable
+            }
+            return HoldingRelay(cancellationRecorder: CancellationRecorder())
+        },
+        lockProvider: { _ in },
+        rotationProvider: { previous in rotatedConfiguration(previous) }
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let requestID = UUID()
+    let request = try DeviceIPCEnvelope(
+        requestID: requestID,
+        payload: JSONEncoder().encode(decision)
+    ).encoded() as NSData
+
+    let result = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { data, error in
+            continuation.resume(returning: (data.map { Data(referencing: $0) }, error?.code))
+        }
+    }
+
+    let response = try DeviceIPCEnvelope.decode(try #require(result.0))
+    let activated = try JSONDecoder().decode(
+        ExecutorSessionConfiguration.self,
+        from: response.payload
+    )
+    #expect(result.1 == nil)
+    #expect(response.requestID == requestID)
+    #expect(activated.binding.generation == session.binding.generation + 1)
+    #expect(activated.approvals.allSatisfy { $0.generation == activated.binding.generation })
+    #expect(await attempts.generations == [
+        session.binding.generation,
+        session.binding.generation + 1,
+    ])
+    #expect(executor.sessionUpdateCount() == 2)
+    #expect(executor.stoppedRequest() != nil)
+    #expect(approvalUI.recordedEvents().isEmpty)
+}
+
+@Test func unavailableExecutorRejectsApprovalBeforeRelayOrRotation() async throws {
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let relayAttempts = RelayAttemptRecorder()
+    let rotationAttempts = ConfigurationRecorder()
+    let lifecycleRecorder = LifecycleRecorder()
+    let broker = NetworkBrokerService(
+        approvalProvider: { _ in session },
+        abortProvider: { request in
+            await lifecycleRecorder.recordAbort(request)
+            return BrokerPendingSession(
+                binding: DeviceSessionBinding(
+                    userID: request.binding.userID,
+                    deviceID: request.binding.deviceID,
+                    toolSessionID: request.binding.toolSessionID,
+                    deviceSessionID: request.binding.deviceSessionID,
+                    nodeID: request.binding.nodeID,
+                    platform: request.binding.platform,
+                    generation: request.binding.generation + 1
+                ),
+                expiresAt: Date().addingTimeInterval(60)
+            )
+        },
+        relayProvider: { configuration in
+            _ = await relayAttempts.record(configuration)
+            return HoldingRelay(cancellationRecorder: CancellationRecorder())
+        },
+        rotationProvider: { configuration in
+            await rotationAttempts.record(configuration)
+            return rotatedConfiguration(configuration)
+        }
+    )
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+
+    let error = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(error == DeviceIPCFailure.serviceUnavailable.rawValue)
+    #expect(await relayAttempts.generations.isEmpty)
+    #expect(await rotationAttempts.first == nil)
+    #expect(await lifecycleRecorder.abortRequest?.binding == session.binding)
+}
+
+@Test func repeatedInitialRelayFailureStopsAfterOneGenerationRotation() async throws {
+    let executor = ExecutorStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let attempts = RelayAttemptRecorder()
+    let lifecycleRecorder = LifecycleRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        abortProvider: { request in
+            await lifecycleRecorder.recordAbort(request)
+            return BrokerPendingSession(
+                binding: DeviceSessionBinding(
+                    userID: request.binding.userID,
+                    deviceID: request.binding.deviceID,
+                    toolSessionID: request.binding.toolSessionID,
+                    deviceSessionID: request.binding.deviceSessionID,
+                    nodeID: request.binding.nodeID,
+                    platform: request.binding.platform,
+                    generation: request.binding.generation + 1
+                ),
+                expiresAt: Date().addingTimeInterval(60)
+            )
+        },
+        relayProvider: { configuration in
+            _ = await attempts.record(configuration)
+            throw DeviceIPCFailure.serviceUnavailable
+        },
+        rotationProvider: { previous in rotatedConfiguration(previous) }
+    )
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+
+    let error = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    let rotatedGeneration = session.binding.generation + 1
+    #expect(error == DeviceIPCFailure.serviceUnavailable.rawValue)
+    #expect(await attempts.generations == [session.binding.generation, rotatedGeneration])
+    #expect(await lifecycleRecorder.abortCount == 1)
+    #expect(await lifecycleRecorder.abortRequest?.binding.generation == rotatedGeneration)
+    #expect(executor.sessionUpdateCount() == 2)
+}
+
 @Test func networkBrokerForwardsV2ObserveWithoutAbortingRelay() async throws {
     let executor = ExecutorStub()
     let approvalUI = ApprovalUIStub()
@@ -968,6 +2171,104 @@ import Testing
         broker.stopCurrentAction(stop) { continuation.resume(returning: $0?.code) }
     }
     #expect(stopError == nil)
+}
+
+@Test func networkBrokerLeavesV2ApplicationActivationToTheGUIExecutor() async throws {
+    let executor = ExecutorStub()
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let completed = AsyncEventRecorder()
+    let observe = try actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(),
+        action: .observe(application: "com.apple.Safari")
+    )
+    let key = try actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.key("CMD+L"))
+    )
+    var broker: NetworkBrokerService? = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { _ in
+            SequentialActionRelay(requests: [observe, key], completed: completed)
+        },
+        lockProvider: { _ in }
+    )
+    broker?.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker?.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    await completed.wait()
+    #expect(approvalUI.activationCount() == 0)
+    weak let releasedBroker = broker
+    broker = nil
+    for _ in 0 ..< 100 where releasedBroker != nil {
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(releasedBroker == nil)
+}
+
+@Test func networkBrokerActivatesTheSelectedApplicationForLegacyActions() async throws {
+    let executor = ExecutorStub()
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let requestData = try actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        screenshotGeneration: 0,
+        action: .screenshotApplication("com.apple.Safari")
+    )
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { _ in TriggerActionRelay(request: requestData) },
+        lockProvider: { _ in }
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let approval = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(approval) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    for _ in 0 ..< 100 where executor.actionedRequest() == nil {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(executor.actionedRequest() == requestData as NSData)
+    #expect(approvalUI.activationCount() == 1)
 }
 
 @Test func slowExecutorActionUsesItsOwnTimeoutWithoutAbortingRelay() async throws {
@@ -1113,7 +2414,7 @@ import Testing
     #expect(executor.stoppedRequest() != nil)
 }
 
-@Test func remoteLifecycleStopsTurnWithoutAbortingAndEndsSessionAfterward() async throws {
+@Test func remoteLifecycleStopsTurnIdempotentlyWithoutAbortingAndEndsSessionAfterward() async throws {
     let executor = ExecutorStub()
     let approvalUI = ApprovalUIStub()
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
@@ -1160,6 +2461,7 @@ import Testing
     )
     let stopped = try JSONDecoder().decode(BrokerRuntimeEvent.self, from: stoppedEnvelope.payload)
     #expect(stopped == BrokerRuntimeEvent(binding: session.binding, kind: .turnStopped))
+    #expect(executor.turnPauseCount() == 1)
     let endedEnvelope = try DeviceIPCEnvelope.decode(
         Data(referencing: try #require(executor.ended))
     )
@@ -1319,7 +2621,9 @@ import Testing
         },
         relayProvider: { _ in DelayedFailureRelay() },
         lockProvider: { _ in },
-        generationRotationInterval: .milliseconds(1)
+        rotationProvider: { previous in rotatedConfiguration(previous) },
+        generationRotationInterval: .milliseconds(1),
+        generationRotationQuietPeriod: .milliseconds(25)
     )
     let decision = BrokerApprovalDecision(
         binding: session.binding,
@@ -1537,6 +2841,227 @@ import Testing
 }
 
 @Test func relayIdentityLifetimeRotatesTheActiveGeneration() async throws {
+    let rotationStartedAt = ContinuousClock().now
+    let executor = ExecutorStub(stopFails: true)
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let rotationRecorder = ConfigurationRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { configuration in
+            TriggerActionRelay(request: try actionEnvelope(
+                configuration: configuration,
+                requestID: UUID(),
+                sequence: 1,
+                screenshotGeneration: 0,
+                action: .screenshot
+            ))
+        },
+        lockProvider: { _ in },
+        rotationProvider: { previous in
+            let next = rotatedConfiguration(previous)
+            await rotationRecorder.record(next)
+            return next
+        },
+        generationRotationInterval: .milliseconds(100),
+        generationRotationQuietPeriod: .milliseconds(50)
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+    #expect(approvalError == nil)
+    let rotated = await rotationRecorder.waitForFirst()
+    #expect(rotationStartedAt.duration(to: ContinuousClock().now) >= .milliseconds(125))
+    #expect(rotated.binding.generation == session.binding.generation + 1)
+    #expect(rotated.approvals.allSatisfy { $0.generation == rotated.binding.generation })
+    for _ in 0 ..< 100 where executor.sessionUpdateCount() < 2 {
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(executor.stoppedRequest() != nil)
+    #expect(executor.sessionUpdateCount() >= 2)
+    #expect(approvalUI.recordedEvents().isEmpty)
+}
+
+@Test func relayIdentityRotationUsesTheLatestRenewedConfiguration() async throws {
+    let executor = ExecutorStub(stopFails: true)
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(2))
+    let renewalRecorder = ConfigurationRecorder()
+    let rotationRecorder = ConfigurationRecorder()
+    let renewalStarted = AsyncEventRecorder()
+    let releaseRenewal = AsyncEventRecorder()
+    let renewedLease = Date().addingTimeInterval(60)
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { configuration in
+            TriggerActionRelay(request: try actionEnvelope(
+                configuration: configuration,
+                requestID: UUID(),
+                sequence: 1,
+                screenshotGeneration: 0,
+                action: .screenshot
+            ))
+        },
+        lockProvider: { _ in },
+        renewProvider: { previous in
+            await renewalStarted.record()
+            await releaseRenewal.wait()
+            let renewed = ExecutorSessionConfiguration(
+                binding: previous.binding,
+                leaseUntil: renewedLease,
+                approvals: previous.approvals,
+                capabilities: previous.capabilities
+            )
+            await renewalRecorder.record(renewed)
+            return renewed
+        },
+        rotationProvider: { previous in
+            await rotationRecorder.record(previous)
+            return rotatedConfiguration(previous)
+        },
+        generationRotationInterval: .milliseconds(1_200),
+        generationRotationQuietPeriod: .milliseconds(50)
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    await renewalStarted.wait()
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(await rotationRecorder.first == nil)
+    await releaseRenewal.record()
+    let renewed = await renewalRecorder.waitForFirst()
+    #expect(renewed.leaseUntil == renewedLease)
+    let configurationUsedForRotation = await rotationRecorder.waitForFirst()
+    #expect(configurationUsedForRotation.leaseUntil == renewedLease)
+    #expect(configurationUsedForRotation.binding == session.binding)
+    #expect(approvalUI.recordedEvents().isEmpty)
+}
+
+@Test func transportDisconnectRotatesGenerationInsteadOfEndingManagedControl() async throws {
+    let executor = ExecutorStub(stopFails: true)
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let rotationRecorder = ConfigurationRecorder()
+    let relayAttempts = RelayAttemptRecorder()
+    let replacementRelayCancellation = CancellationRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { configuration in
+            let attempt = await relayAttempts.record(configuration)
+            if attempt == 1 {
+                return TransportDisconnectRelay()
+            }
+            return HoldingRelay(cancellationRecorder: replacementRelayCancellation)
+        },
+        lockProvider: { _ in },
+        rotationProvider: { previous in
+            let next = rotatedConfiguration(previous)
+            await rotationRecorder.record(next)
+            return next
+        }
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    let rotated = await rotationRecorder.waitForFirst()
+    #expect(rotated.binding.generation == session.binding.generation + 1)
+    for _ in 0 ..< 100 where await relayAttempts.generations.count < 2 {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(await relayAttempts.generations == [
+        session.binding.generation,
+        session.binding.generation + 1,
+    ])
+    #expect(approvalUI.recordedEvents().isEmpty)
+}
+
+@Test func relayIdentityRotationWaitsForAnInFlightAction() async throws {
+    let executor = ExecutorStub(actionReplyDelaySeconds: 0.5)
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let rotationRecorder = ConfigurationRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { configuration in
+            TriggerActionRelay(request: try actionEnvelope(
+                configuration: configuration,
+                requestID: UUID(),
+                sequence: 1,
+                screenshotGeneration: 0,
+                action: .screenshot
+            ))
+        },
+        lockProvider: { _ in },
+        rotationProvider: { previous in
+            let next = rotatedConfiguration(previous)
+            await rotationRecorder.record(next)
+            return next
+        },
+        generationRotationInterval: .milliseconds(200),
+        generationRotationQuietPeriod: .milliseconds(100)
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+    #expect(approvalError == nil)
+
+    for _ in 0 ..< 1_000 where executor.actionedRequest() == nil {
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(executor.actionedRequest() != nil)
+    try await Task.sleep(for: .milliseconds(250))
+    #expect(await rotationRecorder.first == nil)
+
+    let rotated = await rotationRecorder.waitForFirst()
+    #expect(rotated.binding.generation == session.binding.generation + 1)
+    #expect(executor.stoppedRequest() != nil)
+}
+
+@Test func failedGenerationRotationAbortsTheOldBindingAndEndsLocalApproval() async throws {
     let executor = ExecutorStub()
     let approvalUI = ApprovalUIStub()
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
@@ -1569,7 +3094,9 @@ import Testing
             ))
         },
         lockProvider: { _ in },
-        generationRotationInterval: .milliseconds(10)
+        rotationProvider: { _ in throw DeviceIPCFailure.serviceUnavailable },
+        generationRotationInterval: .milliseconds(10),
+        generationRotationQuietPeriod: .milliseconds(25)
     )
     broker.installApprovalUI(approvalUI)
     let decision = BrokerApprovalDecision(
@@ -1583,12 +3110,38 @@ import Testing
             continuation.resume(returning: error?.code)
         }
     }
+
     #expect(approvalError == nil)
-    let abort = await lifecycleRecorder.waitForAbort()
-    #expect(abort.binding == session.binding)
-    #expect(abort.reason == .disconnect)
-    #expect(executor.stoppedRequest() != nil)
+    #expect(await lifecycleRecorder.waitForAbort().binding == session.binding)
     #expect(await approvalUI.waitForEvents(1) == [.sessionEnded])
+    #expect(executor.stoppedRequest() != nil)
+}
+
+private func rotatedConfiguration(
+    _ previous: ExecutorSessionConfiguration
+) -> ExecutorSessionConfiguration {
+    let binding = DeviceSessionBinding(
+        userID: previous.binding.userID,
+        deviceID: previous.binding.deviceID,
+        toolSessionID: previous.binding.toolSessionID,
+        deviceSessionID: previous.binding.deviceSessionID,
+        nodeID: previous.binding.nodeID,
+        platform: previous.binding.platform,
+        generation: previous.binding.generation + 1
+    )
+    return ExecutorSessionConfiguration(
+        binding: binding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: previous.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: $0.controlLevel,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: binding.generation
+            )
+        },
+        capabilities: previous.capabilities
+    )
 }
 
 private func configuration(leaseUntil: Date) -> ExecutorSessionConfiguration {
@@ -1675,6 +3228,7 @@ private func actionEnvelopeV2(
     sequence: UInt64,
     stateGeneration: UInt64,
     screenshotGeneration: UInt64,
+    baseStateID: UUID? = nil,
     observation: ObservationPolicy,
     action: ActionV2
 ) throws -> Data {
@@ -1692,7 +3246,7 @@ private func actionEnvelopeV2(
             monotonicSequence: sequence,
             currentStateGeneration: stateGeneration,
             currentScreenshotGeneration: screenshotGeneration,
-            baseStateID: nil
+            baseStateID: baseStateID
         ),
         leaseUntil: configuration.leaseUntil,
         observation: observation,
@@ -1704,7 +3258,7 @@ private func actionEnvelopeV2(
         JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
     )
     var context = try #require(object["context"] as? [String: Any])
-    context["base_state_id"] = NSNull()
+    context["base_state_id"] = baseStateID?.uuidString ?? NSNull()
     object["context"] = context
     var observationObject = try #require(object["observation"] as? [String: Any])
     observationObject["region"] = NSNull()
@@ -1721,17 +3275,24 @@ private actor RuntimeRecorder {
     private(set) var captureCount = 0
     private(set) var releaseCount = 0
     private(set) var accessibilityClearCount = 0
+    private(set) var captureTargets: [String?] = []
+    private(set) var valueFreshnessCalls: [(ElementTarget, String, Date)] = []
+    private(set) var observationBaseStateIDs: [UUID?] = []
+    private(set) var settlePhases: [String] = []
 
-    func captured() {
+    func captured(targetApplication: String? = nil) {
         captureCount += 1
+        captureTargets.append(targetApplication)
     }
 
     func executed(_ action: Action) {
         actions.append(action)
+        settlePhases.append("execute")
     }
 
     func executedElement(_ action: ActionV2) {
         elementActions.append(action)
+        settlePhases.append("execute")
     }
 
     func released() {
@@ -1740,6 +3301,18 @@ private actor RuntimeRecorder {
 
     func clearedAccessibility() {
         accessibilityClearCount += 1
+    }
+
+    func checkedValueFreshness(target: ElementTarget, expectedValue: String, deadline: Date) {
+        valueFreshnessCalls.append((target, expectedValue, deadline))
+    }
+
+    func observed(baseStateID: UUID?) {
+        observationBaseStateIDs.append(baseStateID)
+    }
+
+    func preparedSettle() {
+        settlePhases.append("prepare")
     }
 }
 
@@ -1790,6 +3363,32 @@ private actor AsyncEventRecorder {
     }
 }
 
+private actor ConfigurationRecorder {
+    private(set) var first: ExecutorSessionConfiguration?
+    private var continuation: CheckedContinuation<ExecutorSessionConfiguration, Never>?
+
+    func record(_ configuration: ExecutorSessionConfiguration) {
+        guard first == nil else { return }
+        first = configuration
+        continuation?.resume(returning: configuration)
+        continuation = nil
+    }
+
+    func waitForFirst() async -> ExecutorSessionConfiguration {
+        if let first { return first }
+        return await withCheckedContinuation { continuation = $0 }
+    }
+}
+
+private actor RelayAttemptRecorder {
+    private(set) var generations: [UInt64] = []
+
+    func record(_ configuration: ExecutorSessionConfiguration) -> Int {
+        generations.append(configuration.binding.generation)
+        return generations.count
+    }
+}
+
 private final class TriggerActionRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
     private let request: Data
 
@@ -1808,6 +3407,29 @@ private final class TriggerActionRelay: NetworkBrokerRelayRunning, @unchecked Se
     func cancel() {}
 }
 
+private final class SequentialActionRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
+    private let requests: [Data]
+    private let completed: AsyncEventRecorder
+
+    init(requests: [Data], completed: AsyncEventRecorder) {
+        self.requests = requests
+        self.completed = completed
+    }
+
+    func run(
+        actionHandler: @escaping @Sendable (Data) async throws -> Data,
+        lifecycleHandler _: @escaping @Sendable (RemoteLifecycleEvent) async throws -> Void
+    ) async throws {
+        for request in requests {
+            _ = try await actionHandler(request)
+        }
+        await completed.record()
+        try await Task.sleep(for: .seconds(3_600))
+    }
+
+    func cancel() {}
+}
+
 private final class TriggerLifecycleRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
     private let request: Data
 
@@ -1820,6 +3442,7 @@ private final class TriggerLifecycleRelay: NetworkBrokerRelayRunning, @unchecked
         lifecycleHandler: @escaping @Sendable (RemoteLifecycleEvent) async throws -> Void
     ) async throws {
         _ = try await actionHandler(request)
+        try await lifecycleHandler(.turnStop)
         try await lifecycleHandler(.turnStop)
         try await lifecycleHandler(.sessionEnd)
     }
@@ -1880,6 +3503,17 @@ private final class DelayedFailureRelay: NetworkBrokerRelayRunning, @unchecked S
     func cancel() {}
 }
 
+private final class TransportDisconnectRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
+    func run(
+        actionHandler _: @escaping @Sendable (Data) async throws -> Data,
+        lifecycleHandler _: @escaping @Sendable (RemoteLifecycleEvent) async throws -> Void
+    ) async throws {
+        throw NetworkBrokerNestedTLSRelayFailure.connectionFailed
+    }
+
+    func cancel() {}
+}
+
 private final class HoldingRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
     private let cancellationRecorder: CancellationRecorder
 
@@ -1914,24 +3548,25 @@ private final class CancellationRecorder: @unchecked Sendable {
 
 private actor LockRecorder {
     private var binding: DeviceSessionBinding?
-    private var continuation: CheckedContinuation<DeviceSessionBinding, Never>?
 
     func record(_ binding: DeviceSessionBinding) {
         guard self.binding == nil else { return }
         self.binding = binding
-        continuation?.resume(returning: binding)
-        continuation = nil
     }
 
-    func value() async -> DeviceSessionBinding {
-        if let binding { return binding }
-        return await withCheckedContinuation { continuation = $0 }
+    func value() async -> DeviceSessionBinding? {
+        for _ in 0 ..< 100 {
+            if let binding { return binding }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return binding
     }
 }
 
 private final class ApprovalUIStub: NSObject, ApprovalUIXPCProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var events: [BrokerRuntimeEventKind] = []
+    private var applicationActivations = 0
 
     func handleRuntimeEvent(_ request: NSData, reply: @escaping (NSError?) -> Void) {
         do {
@@ -1946,7 +3581,16 @@ private final class ApprovalUIStub: NSObject, ApprovalUIXPCProtocol, @unchecked 
     }
 
     func activateApplication(_: NSData, reply: @escaping (NSError?) -> Void) {
+        lock.withLock { applicationActivations += 1 }
         reply(nil)
+    }
+
+    func activationCount() -> Int {
+        lock.withLock { applicationActivations }
+    }
+
+    func recordedEvents() -> [BrokerRuntimeEventKind] {
+        lock.withLock { events }
     }
 
     func waitForEvents(_ count: Int) async -> [BrokerRuntimeEventKind] {
@@ -1970,23 +3614,49 @@ private actor RuntimeStub: GUIActionRuntime {
     private let guardState: SessionGuard
     private let recorder: RuntimeRecorder
     private var observationValues: [String?]
+    private let contextActionFailure: CaptureFailure?
+    private let valueFreshnessConfirmed: Bool
+    private let settleObservedMeaningfulChange: Bool
+    private let settlePressTargetWasEditableText: Bool
+    private let settleStatus: SettleStatus
+    private let settleElapsedMilliseconds: UInt32
+    private let currentSnapshotHasPageIdentity: Bool
+    private var windowContextFrames: [CGRect]
 
     init(
         guardState: SessionGuard,
         recorder: RuntimeRecorder,
-        observationValues: [String?] = []
+        observationValues: [String?] = [],
+        contextActionFailure: CaptureFailure? = nil,
+        valueFreshnessConfirmed: Bool = true,
+        settleObservedMeaningfulChange: Bool = false,
+        settlePressTargetWasEditableText: Bool = false,
+        settleStatus: SettleStatus = .settled,
+        settleElapsedMilliseconds: UInt32 = 0,
+        currentSnapshotHasPageIdentity: Bool = true,
+        windowContextFrames: [CGRect] = []
     ) {
         self.guardState = guardState
         self.recorder = recorder
         self.observationValues = observationValues
+        self.contextActionFailure = contextActionFailure
+        self.valueFreshnessConfirmed = valueFreshnessConfirmed
+        self.settleObservedMeaningfulChange = settleObservedMeaningfulChange
+        self.settlePressTargetWasEditableText = settlePressTargetWasEditableText
+        self.settleStatus = settleStatus
+        self.settleElapsedMilliseconds = settleElapsedMilliseconds
+        self.currentSnapshotHasPageIdentity = currentSnapshotHasPageIdentity
+        self.windowContextFrames = windowContextFrames
     }
 
     func capture(
         approvedApplications: [ApplicationIdentity],
-        targetApplication _: String?
+        targetApplication: String?
     ) async throws -> CapturedWindow {
-        let application = try #require(approvedApplications.first)
-        await recorder.captured()
+        let application = try #require(approvedApplications.first {
+            targetApplication == nil || $0.bundleIdentifier == targetApplication
+        })
+        await recorder.captured(targetApplication: targetApplication)
         return CapturedWindow(
             pngData: Data("bounded png".utf8),
             pixelWidth: 100,
@@ -1997,6 +3667,24 @@ private actor RuntimeStub: GUIActionRuntime {
             processID: 42,
             application: application,
             displayFingerprint: "display-layout"
+        )
+    }
+
+    func windowContext(
+        approvedApplications: [ApplicationIdentity],
+        targetApplication: String?
+    ) async throws -> WindowContext {
+        let capture = try await capture(
+            approvedApplications: approvedApplications,
+            targetApplication: targetApplication
+        )
+        guard !windowContextFrames.isEmpty else { return capture.windowContext }
+        return WindowContext(
+            windowID: capture.windowID,
+            windowFrame: windowContextFrames.removeFirst(),
+            processID: capture.processID,
+            application: capture.application,
+            displayFingerprint: capture.displayFingerprint
         )
     }
 
@@ -2023,6 +3711,7 @@ private actor RuntimeStub: GUIActionRuntime {
         baseStateID: UUID?,
         policy _: ObservationPolicy
     ) async throws -> AccessibilitySnapshotResult {
+        await recorder.observed(baseStateID: baseStateID)
         let value = observationValues.isEmpty ? nil : observationValues.removeFirst()
         let state = AccessibilityStateContext(
             stateID: UUID(),
@@ -2052,7 +3741,9 @@ private actor RuntimeStub: GUIActionRuntime {
                     actions: ["AXPress"]
                 )],
                 removed: []
-            )
+            ),
+            baseHadPageIdentity: baseStateID != nil,
+            currentHasPageIdentity: currentSnapshotHasPageIdentity
         )
     }
 
@@ -2074,12 +3765,28 @@ private actor RuntimeStub: GUIActionRuntime {
         await recorder.executedElement(action)
     }
 
+    func rebindAccessibilityState(
+        context: WindowContext,
+        stateGeneration: UInt64
+    ) async -> AccessibilityStateContext? {
+        AccessibilityStateContext(
+            stateID: UUID(),
+            stateGeneration: stateGeneration,
+            applicationDigest: context.application.stableDigest,
+            windowID: context.windowID,
+            displayFingerprint: context.displayFingerprint
+        )
+    }
+
     func executeContextAction(
         action: Action,
         sequence: UInt64,
         stateGeneration: UInt64,
         context: WindowContext
     ) async throws {
+        if let contextActionFailure {
+            throw contextActionFailure
+        }
         try await guardState.authorizeContextAction(
             action: action,
             sequence: sequence,
@@ -2095,16 +3802,63 @@ private actor RuntimeStub: GUIActionRuntime {
     func settle(
         context _: WindowContext,
         policy: ObservationPolicy,
+        action _: ActionV2,
+        preparation _: ActionSettlePreparation?,
         deadline _: Date
-    ) async throws -> SettleResult {
-        SettleResult(
-            status: policy.settle == .none ? .notRequested : .settled,
-            elapsedMilliseconds: 0
+    ) async throws -> ActionSettleOutcome {
+        ActionSettleOutcome(
+            result: SettleResult(
+                status: policy.settle == .none ? .notRequested : settleStatus,
+                elapsedMilliseconds: policy.settle == .none ? 0 : settleElapsedMilliseconds
+            ),
+            observedMeaningfulChange: settleObservedMeaningfulChange,
+            pressTargetWasEditableText: settlePressTargetWasEditableText
         )
     }
 
-    func clearAccessibilityState() async {
+    func prepareSettle(
+        context _: WindowContext,
+        policy _: ObservationPolicy,
+        action _: ActionV2
+    ) async -> ActionSettlePreparation {
+        await recorder.preparedSettle()
+        return ActionSettlePreparation(
+            baseline: nil,
+            pressTargetWasEditableText: false
+        )
+    }
+
+    func waitForAccessibilityValue(
+        target: ElementTarget,
+        expectedValue: String,
+        deadline: Date
+    ) async throws -> Bool {
+        await recorder.checkedValueFreshness(
+            target: target,
+            expectedValue: expectedValue,
+            deadline: deadline
+        )
+        return valueFreshnessConfirmed
+    }
+
+    func clearAccessibilityState(applicationDigest _: String?) async {
         await recorder.clearedAccessibility()
+    }
+
+    func readClipboardV2(
+        sequence: UInt64,
+        stateGeneration: UInt64,
+        context: WindowContext
+    ) async throws -> String {
+        try await guardState.authorizeClipboardV2(
+            sequence: sequence,
+            stateGeneration: stateGeneration,
+            displayFingerprint: context.displayFingerprint,
+            windowID: context.windowID,
+            application: context.application
+        )
+        try await guardState.accept(sequence: sequence)
+        return "clipboard text"
     }
 
     func authorizeCaptureAction(
@@ -2210,6 +3964,7 @@ private final class ExecutorStub: NSObject, GUIExecutorXPCProtocol, @unchecked S
     private(set) var paused: NSData?
     private(set) var resumed: NSData?
     private(set) var updateCount = 0
+    private var pauseCount = 0
     private let updateResponds: Bool
     private let actionReplyDelaySeconds: TimeInterval
     private var remainingRenewFailures: Int
@@ -2270,9 +4025,24 @@ private final class ExecutorStub: NSObject, GUIExecutorXPCProtocol, @unchecked S
         lock.withLock { renewCount }
     }
 
+    func sessionUpdateCount() -> Int {
+        lock.withLock { updateCount }
+    }
+
+    func actionedRequest() -> NSData? {
+        lock.withLock { actioned }
+    }
+
     func pauseTurn(_ request: NSData, reply: @escaping (NSError?) -> Void) {
-        lock.withLock { paused = request }
+        lock.withLock {
+            paused = request
+            pauseCount += 1
+        }
         reply(nil)
+    }
+
+    func turnPauseCount() -> Int {
+        lock.withLock { pauseCount }
     }
 
     func resumeTurn(_ request: NSData, reply: @escaping (NSError?) -> Void) {

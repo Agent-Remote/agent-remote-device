@@ -25,24 +25,46 @@ and values outside documented bounds are rejected. Claude supplies only the
 `action`; the managed proxy injects `context`, `request_id`, and `lease_until`.
 
 The MCP-only `input_text` helper does not add a protocol action. The proxy expands
-it into at most five existing actions in this fixed order: optional `left_click`,
-optional `key`, `type`, optional `key`, optional `wait`. One operation guard covers
-the complete sequence, every action crosses the normal authenticated device path,
-and every step advances the existing sequence and screenshot-generation counters.
-Only the final successful screenshot is returned to the model; intermediate images
-are discarded by the proxy. A failed step stops the sequence and reports how many
-prefix steps completed so callers do not blindly replay partially applied input.
+it into at most five existing actions in this fixed order: optional state-bound
+`press` or coordinate `left_click`, optional `key`, optional non-empty `type`,
+optional `key`, optional `wait`. Omitting `type` permits a bounded select-and-clear
+shortcut sequence without manufacturing an invalid empty type action. One operation guard covers the complete sequence,
+every action crosses the normal authenticated device path, and every step advances
+the existing sequence and screenshot-generation counters. Only the final successful
+screenshot is returned to the model; intermediate images are discarded by the
+proxy. A failed step stops the sequence and reports how many prefix steps completed
+so callers do not blindly replay partially applied input. Absence of typed text in
+a truncated full state or a diff is inconclusive and does not turn a successful
+device action into a false failure; a complete, non-truncated full state that omits
+the text still stops the sequence before its final key.
+
+On v2, each action already receives adaptive settle, so `input_text` does not emit
+the legacy trailing fixed `wait`; this keeps the typed action's confirming AX state
+as the tool result instead of replacing it with an empty wait diff. When AX exposes
+the target field, callers pass its latest `state_id`, `state_generation`, and
+`element_index` directly to `input_text` and omit `coordinate`. The three AX fields
+are atomic, mutually exclusive with `coordinate`, and unavailable on the v1
+fallback. AX frames are not screenshot coordinates. A
+state-bound `set_value` accepts an empty string at the protocol boundary. The compact
+MCP `act` surface exposes `clear_value`, which maps to that operation without making
+the client serialize an empty string.
 
 The authoritative machine-readable request schema is
 `protocol/schema/action-request-v1.schema.json`. Cross-language fixtures live in
 `protocol/test-vectors`.
 
 `read_clipboard` returns at most 64 KiB of plain text and never mutates the Mac
-clipboard. It requires a current screenshot bound to an approved application and
-that application's explicit per-session clipboard approval. A successful read
-consumes the action sequence but does not create an image or advance the
-screenshot generation. Missing, non-text, oversized, and unapproved clipboard
-content return concrete device errors without dropping the encrypted channel.
+clipboard. V1 requires a current screenshot; v2 requires the current verified
+application/window state. Both paths require that application's explicit
+per-session clipboard approval. A successful read consumes the action sequence
+but does not create an image or advance the screenshot generation. Missing,
+non-text, oversized, and unapproved clipboard content return concrete device
+errors without dropping the encrypted channel.
+On the compact v2 surface it requests observation mode `none` and returns only the
+JSON-escaped clipboard text plus the unchanged `state_id` and `state_generation`.
+Because a read cannot mutate GUI state, existing element indexes remain valid without
+another `observe`. AX nodes, screenshot metadata, and settle fields are intentionally
+omitted.
 
 The context binding is the tuple `(user_id, device_id, tool_session_id,
 device_session_id, node_id, platform, generation)`. Every tuple member must match
@@ -139,21 +161,49 @@ vector is `protocol/test-vectors/action-response-v2-valid.json`:
 ```
 
 Every request still consumes the exact next `monotonic_sequence`. A successful
-observation or action advances `state_generation`. `screenshot_generation`
+observation or GUI-mutating action advances `state_generation`; a successful v2
+`read_clipboard` preserves it. `screenshot_generation`
 advances only when a new image is returned to the model and becomes a valid
 coordinate source. `state_id` is generated inside the device boundary and binds
 the full session generation, approved application, selected window, display
 fingerprint, and state generation. It is not a credential and is never accepted
 across a turn resume or device generation.
 
+`state_generation` remains a session-wide monotonic response counter, while
+element freshness is scoped to the approved application identified by the
+opaque `state_id`. The proxy and Executor retain at most one latest AX binding
+per approved application. Observing or acting in application B therefore does
+not invalidate the latest model-visible element indexes for application A.
+A newer state for A, an A window/display change, a turn boundary, or a device
+generation change still invalidates A's prior binding. The Executor never
+remaps an old index to a newer state.
+
+Before executing an action against a retained binding for a background
+application, the Executor activates that exact signed process and waits until
+`NSWorkspace` identifies it as frontmost. `NSRunningApplication.isActive` alone
+is not accepted because it may lag during an application transition. A `press`
+on a settable editable text node also establishes and verifies AX focus before
+the action sequence is committed. A successful returned state can therefore be
+followed directly by context-bound text input without an extra observation.
+
 ### Bounded accessibility state and diffs
 
 AX output is generated only by the GUI Executor. Normalized nodes may contain the
-minimum decision-relevant role, title, label, value, placeholder, URL, visible
-frame, settable marker, and exposed AX actions. Default budgets are 800 nodes, a
-depth of 20, 160 characters per node, 16 KiB total text, and 20 visible rows per
-container. Hard limits are lower than the encrypted frame limit and are enforced
-before serialization.
+minimum decision-relevant role, title, label, value, placeholder, URL, settable
+marker, and exposed AX actions. Frames are retained only for settable or actionable
+nodes; purely structural nodes omit them so browser layout motion does not inflate
+state size or turn a semantic diff into a full reset. AX frames remain metadata and
+are never valid screenshot coordinates. Token-oriented defaults are 600 nodes, a
+depth of 20, 160 characters per node, 12 KiB total text, and 12 visible rows per
+container. The hard limits remain 800 nodes, 16 KiB total text, and 20 visible rows;
+all hard limits are lower than the encrypted frame limit and are enforced before
+serialization.
+
+Text-budget exhaustion truncates text fields but does not terminate structural
+tree traversal. One quarter of the total text budget is reserved from static
+content for settable, editable, or actionable controls so navigation sidebars and
+long document text cannot hide a later search field or composer from model-visible
+AX state.
 
 Secure text values, password contents, invisible sensitive values, unbounded web
 subtrees, and redundant wrapper nodes are omitted or redacted. AX URLs describe
@@ -165,6 +215,11 @@ observations may return added, changed, and removed nodes relative to
 `reset: true` when the base was not delivered to the model, the context changed,
 the diff is too large, or either side cannot prove the base is current. A diff
 without a valid model-visible base must never be returned.
+
+If navigation recovery replaces an initially computed diff with a full state,
+the response still uses `reset: true` whenever the request carried a model-visible
+base. Clearing an internal snapshot or requesting a fresh capture must not turn
+that replacement into a misleading first-state `reset: false` response.
 
 ### State-bound element targets
 
@@ -178,7 +233,7 @@ An element action carries more than a bare index:
     "element_index": 18
   },
   "action": {
-    "type": "press | set_value | select_text | scroll | secondary_action"
+    "type": "press | set_value | clear_value | select_text | scroll | secondary_action"
   }
 }
 ```
@@ -194,15 +249,60 @@ coordinate click.
 credentials subject to hand-off policy cannot be set through AX. Coordinate
 actions remain available as a fallback and continue to require the latest
 model-visible `screenshot_generation` and exact returned image dimensions.
+`clear_value` is a compact MCP alias for a state-bound SetValue carrying an empty
+string; it avoids empty-string JSON serialization failures in model clients.
 
 ### Adaptive settle and image profiles
 
 Automatic settling verifies that the approved application, window, and display
 remain stable, then samples bounded AX loading/busy state and normalized tree
-hashes. It returns `settled` only after the debounce interval produces two stable
-observations. It stops at the minimum of five seconds, the requested hard-bounded
-timeout, the remaining lease, and the action deadline. Timeout returns the newest
-safe state with `status: timeout`; it is not reported as settled.
+hashes. In browser windows the settle hash follows page identity, editable controls,
+loading indicators, and the leading decision-relevant page text; late lazy-loaded
+footer text and browser-chrome counters do not extend the wait. Lightweight actions
+can return after the short stable debounce. Actions
+that can navigate, including element presses, click-family actions, Return, and
+browser Back/Forward shortcuts, require a page-identity change before using their
+navigation debounce when an `AXWebArea` is present. Page identity uses only the
+WebArea role, title, and URL, so focus, tab-memory labels, and browser-chrome popup
+changes cannot falsely satisfy navigation settle. The complete normalized AX
+fingerprint must then stabilize before return. Non-browser applications fall back
+to a meaningful complete-tree change. If no change occurs, one bounded two-second
+grace lets a legitimate no-op finish without waiting for the hard timeout. Settling
+stops at the minimum of five seconds, the requested
+hard-bounded timeout, the remaining lease, and the action deadline. Timeout returns
+the newest safe state with `status: timeout`; it is not reported as settled.
+
+A press bound to a settable `AXTextField`, `AXTextArea`, or `AXSearchField` is
+classified as local focus rather than navigation. It uses the shorter local settle
+policy and preserves its bounded diff instead of triggering a follow-up full
+navigation observation.
+
+Local non-navigation actions use a 300 ms minimum stable interval and two stable
+samples; editable focus uses a 250 ms minimum and two samples. Navigation-capable
+actions retain the longer 600 ms/six-sample debounce and two-second no-change
+grace. Immediate selection and clipboard shortcuts retain their short class.
+
+Navigation recovery uses the same action classifier as adaptive settle. Copy,
+select, and cut shortcuts such as `cmd+c` are local actions: selection or focus
+churn must not force a full navigation observation. Return and browser
+Back/Forward shortcuts remain navigation-capable. Recovery also distinguishes the
+complete current AX snapshot from the bounded diff sent to the model. It retries
+only when the model base contained a titled or addressed `AXWebArea` and the
+complete current snapshot temporarily has none. An unchanged WebArea omitted from
+a valid diff is not evidence of navigation, so dismissing a browser infobar does
+not manufacture a follow-up Full reset. Applications that do not expose WebAreas
+are not placed on the browser-navigation recovery path.
+
+Normalized AX output suppresses ubiquitous `AXShowMenu` and `AXScrollToVisible`
+actions when they are the only actions on structural groups, static text, images,
+or unknown nodes. Those nodes omit frames and empty wrappers may be elided; genuine
+press, edit, selection, and other control actions remain exposed.
+
+For Chrome, the bounded renderer also prunes inactive tab subtrees and the wide,
+labeled top bookmark-toolbar subtree. It retains the selected tab, address field,
+new-tab control, navigation/reload controls, transient browser prompts, and the
+page `AXWebArea`; pruning uses application identity, role, selection, and
+window-relative geometry rather than localized bookmark names.
 
 Image responses use an explicit profile:
 
@@ -236,6 +336,16 @@ application, window, and display remain unchanged. This lets a deterministic
 `input_text` prefix omit intermediate observations and still return one final AX
 diff. A context change clears the base. Explicit `ax_full` requests always send a
 null base and establish a new one.
+
+When a valid base and the application, window, and display context remain bound,
+adding or removing local UI such as a Chrome find bar, infobar, popover, or menu
+returns a diff even when the bounded traversal temporarily omits `AXWebArea` or
+more than half of the visible nodes change. A large change becomes a full reset
+only when both snapshots expose conflicting page identities. Application, native
+window, or display replacement clears the base before diffing, and an unavailable
+base produces a full state. Missing AX page or window anchors by themselves are
+not reset signals. This keeps overlay open and close symmetric and prevents a
+small local change from expanding into a redundant full tree.
 
 The managed proxy writes bounded zero-content optimization events to the fixed
 owner-only JSONL path supplied by Node. See `docs/optimization-benchmark.md` for
@@ -311,21 +421,40 @@ resumes the Executor. The Executor requires that first action to be a fresh
 `turn_started`, `turn_stopped`, and `session_ended` messages are generation-bound
 local XPC events and are not accepted from Claude, MCP arguments, or projects.
 Every safety-critical Broker request to the Executor or Approval UI has a
-15-second local reply deadline. Cancellation, timeout, or a missing callback
-fails the current relay and triggers the authenticated control-plane abort.
+bounded local reply deadline. Cancellation, timeout, or a missing callback
+fails the current relay and triggers fail-closed recovery.
 
 The proxy MCP process owns a session-private `/tmp/lifecycle.sock`. Fixed Claude
 `Stop`, `StopFailure`, and `SessionEnd` command hooks invoke the same verified proxy binary in
 notifier mode. The notifier validates the hook event name, sends one bounded
 strict local frame, and waits for the authenticated remote acknowledgement.
+Claude also emits `SessionEnd` with `reason=clear` for `/clear` while the same
+process and MCP servers remain alive. The notifier maps only that reason to
+`turn_stop`, preserving the existing lease and approvals for the cleared
+conversation. Other `SessionEnd` reasons remain `session_end`. Repeated
+`turn_stop` notifications are idempotent at the Broker.
 
 The Broker rotates an active generation after 14 minutes, before the 15-minute
-nested TLS identity limit. Rotation stops the current action, preserves no
-unconfirmed action, and returns the session to explicit local approval with a new
-generation. Relay failure and Executor loss also end the current local UI
-generation so hidden applications are restored. Pending approvals are deduplicated
-by the complete session binding, not only by device-session ID, so a rotated
-generation is always presented again.
+nested TLS identity limit. When the rotation deadline collides with an action, the
+Broker requires a continuous two-second action-free quiet window, resetting that
+window whenever an action starts or finishes. It then atomically cancels the relay
+only while the in-flight action count is still zero. This prevents a burst that
+begins at the rotation deadline from being cut mid-frame. A transport disconnect
+is different: the nested relay races connection health against the action
+handler, cancels the handler immediately when either WebSocket peer disappears,
+fails the old Executor guard, and advances the control-plane generation. The
+unknown-status request is never replayed across that generation boundary. An
+invalid frame, binding failure, explicit stop, or Executor loss still ends the
+current local UI generation and follows the fail-closed abort path so hidden
+applications are restored. A scheduled or disconnect-recovery identity rotation
+does not end the existing user authorization: the device advances the control
+plane generation, rebinds the exact approved application identities, control
+levels, and clipboard flags to that generation, resets Executor state, and opens a
+fresh mutually authenticated relay. It never widens the approval set or extends
+the device session's absolute expiry. Rotation failure performs a best-effort
+Executor stop, authenticated control-plane abort, and Approval UI cleanup so the
+next recovery requires an explicit current binding instead of silently reusing a
+partially rotated generation.
 
 ## Exporter confirmation
 
@@ -346,11 +475,25 @@ the device-session UUID as 16 network-order bytes. A malformed record, same-role
 record, binding mismatch, or authentication failure closes the generation before
 any application JSON is accepted.
 
-The proxy bounds each handshake and action exchange by the shorter of the
-remaining authorization lease and 30 seconds. Lifecycle acknowledgements have a
-15-second deadline. Timeout, malformed response, response-binding failure, or
-device rejection closes the inner connection and permanently poisons that proxy
-generation; no partially read stream is reused.
+The proxy waits at most 60 seconds for the first managed action context and at
+most 45 seconds when recovering after an active transport. A managed-context
+file that is temporarily absent while the control plane replaces it is retried
+inside that bounded window and is never surfaced as a raw filesystem error.
+The initial context, lease-readiness, and action-response budgets total less than
+the 180-second foreground tool limit. Each action exchange remains bounded by the
+shorter of the remaining authorization lease and 60 seconds. Lifecycle
+acknowledgements have a 15-second deadline. A transient bridge, TLS, channel, or
+timeout failure closes the partial inner connection and performs at most three
+same-generation reconnects using the exact serialized request and binding. A
+malformed response or response-binding failure poisons that proxy generation;
+no partially read stream is reused.
+
+If exact same-generation recovery is exhausted, the MCP surface returns the
+stable `transport_unavailable` classification with a concrete diagnostic. The
+next read-only observation waits for a strictly newer managed generation. An
+action whose execution status is unknown is never replayed across that generation
+boundary; the caller observes first and retries only after proving that the
+action did not take effect.
 
 The cross-language integration test
 `rustlsAndNetworkFrameworkExchangeAuthenticatedActionFrames` starts the real Rust

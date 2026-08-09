@@ -71,6 +71,7 @@ final class DeviceBrokerClient: @unchecked Sendable {
     private var guiConnection: NSXPCConnection?
     private var brokerConnection: NSXPCConnection?
     private var broker: NetworkBrokerXPCProtocol?
+    private var connectionGeneration: UInt64 = 0
     private var pendingSession: BrokerPendingSession?
     private var activeBinding: DeviceSessionBinding?
     private var runtimeEventHandler: (@Sendable (BrokerRuntimeEventKind) async throws -> Void)?
@@ -99,8 +100,18 @@ final class DeviceBrokerClient: @unchecked Sendable {
             let completion = OneShotConnectionReply(continuation)
             let gui = NSXPCConnection(serviceName: DeviceIPCServiceIdentifier.guiExecutor)
             gui.remoteObjectInterface = NSXPCInterface(with: GUIExecutorXPCProtocol.self)
-            gui.interruptionHandler = { completion.resolve(false) }
-            gui.invalidationHandler = { completion.resolve(false) }
+            gui.interruptionHandler = { [weak self, weak gui] in
+                if let gui {
+                    self?.invalidate(ifGUIConnectionMatches: gui)
+                }
+                completion.resolve(false)
+            }
+            gui.invalidationHandler = { [weak self, weak gui] in
+                if let gui {
+                    self?.invalidate(ifGUIConnectionMatches: gui)
+                }
+                completion.resolve(false)
+            }
             gui.activate()
             guard let executor = gui.remoteObjectProxyWithErrorHandler({ _ in
                 completion.resolve(false)
@@ -116,6 +127,10 @@ final class DeviceBrokerClient: @unchecked Sendable {
                 self.configureBroker(gui: gui, endpoint: endpoint, completion: completion)
             }
         }
+    }
+
+    func connectedGeneration() -> UInt64? {
+        lock.withLock { broker == nil ? nil : connectionGeneration }
     }
 
     func pollPendingSession() async throws -> BrokerPendingSession? {
@@ -214,15 +229,26 @@ final class DeviceBrokerClient: @unchecked Sendable {
             payload: JSONEncoder().encode(decision)
         ).encoded() as NSData
         let broker = try brokerProxy()
-        let response = try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Data?, Error>) in
-            broker.approveSession(envelope) { data, error in
-                guard error == nil else {
-                    continuation.resume(throwing: brokerFailure(error))
-                    return
+        let response: Data?
+        do {
+            response = try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Data?, Error>) in
+                broker.approveSession(envelope) { data, error in
+                    guard error == nil else {
+                        continuation.resume(throwing: brokerFailure(error))
+                        return
+                    }
+                    continuation.resume(returning: data.map { Data(referencing: $0) })
                 }
-                continuation.resume(returning: data.map { Data(referencing: $0) })
             }
+        } catch let failure as DeviceBrokerClientFailure {
+            if failure == .serviceUnavailable {
+                let refreshed = try? await pollPendingSession()
+                if refreshed?.binding != pending.binding {
+                    throw DeviceBrokerClientFailure.bindingMismatch
+                }
+            }
+            throw failure
         }
         if result == .denied {
             guard response == nil else { throw DeviceBrokerClientFailure.invalidResponse }
@@ -305,17 +331,24 @@ final class DeviceBrokerClient: @unchecked Sendable {
         connection.remoteObjectInterface = NSXPCInterface(with: NetworkBrokerXPCProtocol.self)
         connection.exportedInterface = NSXPCInterface(with: ApprovalUIXPCProtocol.self)
         connection.exportedObject = eventReceiver
-        connection.interruptionHandler = { [weak self] in
-            self?.invalidate()
+        connection.interruptionHandler = { [weak self, weak connection] in
+            if let connection {
+                self?.invalidate(ifBrokerConnectionMatches: connection)
+            }
             completion.resolve(false)
         }
-        connection.invalidationHandler = { [weak self] in
-            self?.invalidate()
+        connection.invalidationHandler = { [weak self, weak connection] in
+            if let connection {
+                self?.invalidate(ifBrokerConnectionMatches: connection)
+            }
             completion.resolve(false)
         }
         connection.activate()
-        guard let broker = connection.remoteObjectProxyWithErrorHandler({ [weak self] _ in
-            self?.invalidate()
+        guard let broker = connection.remoteObjectProxyWithErrorHandler({
+            [weak self, weak connection] _ in
+            if let connection {
+                self?.invalidate(ifBrokerConnectionMatches: connection)
+            }
             completion.resolve(false)
         }) as? NetworkBrokerXPCProtocol else {
             completion.resolve(false)
@@ -348,13 +381,28 @@ final class DeviceBrokerClient: @unchecked Sendable {
         guiConnection = gui
         self.brokerConnection = brokerConnection
         self.broker = broker
+        connectionGeneration &+= 1
         lock.unlock()
         oldGUI?.invalidate()
         oldBroker?.invalidate()
     }
 
-    private func invalidate() {
+    private func invalidate(ifGUIConnectionMatches expected: NSXPCConnection) {
+        invalidateConnections { gui, _ in gui === expected }
+    }
+
+    private func invalidate(ifBrokerConnectionMatches expected: NSXPCConnection) {
+        invalidateConnections { _, broker in broker === expected }
+    }
+
+    private func invalidateConnections(
+        ifCurrent matches: (NSXPCConnection?, NSXPCConnection?) -> Bool
+    ) {
         lock.lock()
+        guard matches(guiConnection, brokerConnection) else {
+            lock.unlock()
+            return
+        }
         let gui = guiConnection
         let brokerConnection = brokerConnection
         guiConnection = nil

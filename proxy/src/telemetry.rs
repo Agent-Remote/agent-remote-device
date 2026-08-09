@@ -15,7 +15,7 @@ use crate::{
     transport::{DeviceResult, DeviceResultV2, TransportError},
 };
 
-pub const OPTIMIZATION_METRIC_SCHEMA_VERSION: u8 = 2;
+pub const OPTIMIZATION_METRIC_SCHEMA_VERSION: u8 = 3;
 const MAX_METRICS_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +30,11 @@ pub enum ExecutionPath {
 pub enum MetricAction {
     Observe,
     Coordinate,
+    Drag,
+    Key,
+    Scroll,
+    TypeText,
+    Wait,
     Press,
     SetValue,
     SelectText,
@@ -377,17 +382,35 @@ impl OptimizationSummary {
 }
 
 fn metric_action_v1(action: &Action) -> MetricAction {
+    metric_action(action)
+}
+
+fn metric_action(action: &Action) -> MetricAction {
     match action {
-        Action::Screenshot | Action::ScreenshotApplication { .. } => MetricAction::Observe,
+        Action::Screenshot | Action::ScreenshotApplication { .. } | Action::Zoom { .. } => {
+            MetricAction::Observe
+        }
         Action::ReadClipboard => MetricAction::ReadClipboard,
-        _ => MetricAction::Coordinate,
+        Action::Type { .. } => MetricAction::TypeText,
+        Action::Key { .. } | Action::HoldKey { .. } => MetricAction::Key,
+        Action::Scroll { .. } => MetricAction::Scroll,
+        Action::LeftClickDrag { .. } => MetricAction::Drag,
+        Action::Wait { .. } => MetricAction::Wait,
+        Action::LeftClick { .. }
+        | Action::MouseMove { .. }
+        | Action::RightClick { .. }
+        | Action::MiddleClick { .. }
+        | Action::DoubleClick { .. }
+        | Action::TripleClick { .. }
+        | Action::LeftMouseDown
+        | Action::LeftMouseUp => MetricAction::Coordinate,
     }
 }
 
 fn metric_action_v2(action: &ActionV2) -> MetricAction {
     match action {
         ActionV2::Observe { .. } => MetricAction::Observe,
-        ActionV2::Coordinate { .. } => MetricAction::Coordinate,
+        ActionV2::Coordinate { action } => metric_action(action),
         ActionV2::Press { .. } => MetricAction::Press,
         ActionV2::SetValue { .. } => MetricAction::SetValue,
         ActionV2::SelectText { .. } => MetricAction::SelectText,
@@ -403,7 +426,9 @@ fn metric_error(error: &TransportError) -> MetricErrorCode {
         TransportError::InvalidContext => MetricErrorCode::InvalidRequest,
         TransportError::LeaseExpired => MetricErrorCode::LeaseExpired,
         TransportError::OperationTimedOut => MetricErrorCode::OperationTimeout,
-        TransportError::ResponseBinding => MetricErrorCode::ResponseBinding,
+        TransportError::ResponseBinding | TransportError::ResponseValidation(_) => {
+            MetricErrorCode::ResponseBinding
+        }
         TransportError::DeviceRejected(message)
             if message.starts_with("stale_element_target:")
                 || message.starts_with("stale_state:")
@@ -596,6 +621,7 @@ mod tests {
             Duration::from_millis(1),
         );
         assert!(!event.coordinate_fallback);
+        assert_eq!(event.action, MetricAction::Key);
         assert!(!event.model_visible_image);
         assert!(event.stale_target);
         assert_eq!(event.retry_count, 2);
@@ -629,6 +655,7 @@ mod tests {
             Duration::from_millis(1),
         );
         assert!(click.coordinate_fallback);
+        assert_eq!(click.action, MetricAction::Coordinate);
     }
 
     fn object_keys(value: &serde_json::Value) -> std::collections::BTreeSet<&str> {

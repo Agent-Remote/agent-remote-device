@@ -66,6 +66,66 @@ private actor ApprovalRecoveryHTTPTransport: NetworkBrokerHTTPTransport {
     func recordedRequests() -> [URLRequest] { requests }
 }
 
+private actor AsyncTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private actor RotationRaceHTTPTransport: NetworkBrokerHTTPTransport {
+    private var responses: [(Data, Int)]
+    private var requests: [URLRequest] = []
+    private let deviceConnectedStarted = AsyncTestGate()
+    private let releaseDeviceConnected = AsyncTestGate()
+
+    init(responses: [(Data, Int)]) {
+        self.responses = responses
+    }
+
+    func send(
+        _ request: URLRequest,
+        maximumResponseBytes _: Int
+    ) async throws -> (Data, HTTPURLResponse) {
+        requests.append(request)
+        if request.url?.path.hasSuffix("/device-connected") == true,
+           requests.filter({ $0.url?.path.hasSuffix("/device-connected") == true }).count == 2
+        {
+            await deviceConnectedStarted.open()
+            await releaseDeviceConnected.wait()
+        }
+        let (data, status) = responses.removeFirst()
+        let response = try #require(HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        ))
+        return (data, response)
+    }
+
+    func waitUntilRotatedDeviceConnectedStarts() async {
+        await deviceConnectedStarted.wait()
+    }
+
+    func resumeRotatedDeviceConnected() async {
+        await releaseDeviceConnected.open()
+    }
+
+    func recordedRequests() -> [URLRequest] { requests }
+}
+
 private let controlPlaneDeviceID = "2cb933ce-b922-4ed7-b479-6ded90f09d2d"
 private let controlPlaneToken = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
 
@@ -700,6 +760,142 @@ private func relayMaterialJSON(
 
     #expect(polled == nil)
     #expect(await transport.recordedRequests().count == 3)
+}
+
+@Test func discoveryRotatesAnActiveGenerationWithoutNewUserApproval() async throws {
+    let pending = sessionJSON(status: "pending_device")
+    let connected = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let rotatedPending = sessionJSON(status: "pending_device", generation: 2)
+    let rotatedConnected = sessionJSON(status: "pending_user_approval", generation: 2)
+    let rotatedActive = sessionJSON(
+        status: "active",
+        generation: 2,
+        leaseUntil: "\"2099-12-30T23:59:30Z\""
+    )
+    let inbox = Data("{\"data\":{\"items\":[\(pending)]},\"request_id\":null}".utf8)
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = RecordingHTTPTransport(responses: [
+        (inbox, 200),
+        (response(connected), 200),
+        (response(active), 200),
+        (response(rotatedPending), 200),
+        (response(rotatedConnected), 200),
+        (response(rotatedActive), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let discovered = try #require(try await coordinator.nextPendingSession(now: now))
+    let configuration = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: discovered.binding,
+            approvals: [LocalApproval(
+                application: ApplicationIdentity(
+                    bundleIdentifier: "com.google.Chrome",
+                    signingIdentifier: "com.google.Chrome"
+                ),
+                controlLevel: .fullControl,
+                clipboardAllowed: true,
+                generation: 1
+            )],
+            result: .allowed
+        ),
+        now: now
+    ))
+
+    let rotated = try await coordinator.rotate(configuration, now: now)
+
+    #expect(rotated.binding.generation == 2)
+    #expect(rotated.approvals.count == 1)
+    #expect(rotated.approvals[0].generation == 2)
+    #expect(rotated.approvals[0].application == configuration.approvals[0].application)
+    #expect(rotated.approvals[0].clipboardAllowed)
+    let requests = await transport.recordedRequests()
+    #expect(requests.map(\.url?.path).compactMap { $0 }.suffix(3) == [
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/abort",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/device-connected",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/approve",
+    ])
+    let approvalBody = try #require(requests.last?.httpBody)
+    let approvalObject = try #require(
+        JSONSerialization.jsonObject(with: approvalBody) as? [String: Any]
+    )
+    #expect(approvalObject["generation"] as? UInt64 == 2)
+}
+
+@Test func discoveryPollingCannotConsumeGenerationOwnedByRotation() async throws {
+    let pending = sessionJSON(status: "pending_device")
+    let connected = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let rotatedPending = sessionJSON(status: "pending_device", generation: 2)
+    let rotatedConnected = sessionJSON(status: "pending_user_approval", generation: 2)
+    let rotatedActive = sessionJSON(
+        status: "active",
+        generation: 2,
+        leaseUntil: "\"2099-12-30T23:59:30Z\""
+    )
+    let inbox = Data("{\"data\":{\"items\":[\(pending)]},\"request_id\":null}".utf8)
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = RotationRaceHTTPTransport(responses: [
+        (inbox, 200),
+        (response(connected), 200),
+        (response(active), 200),
+        (response(rotatedPending), 200),
+        (response(rotatedConnected), 200),
+        (response(rotatedActive), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let discovered = try #require(try await coordinator.nextPendingSession(now: now))
+    let configuration = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: discovered.binding,
+            approvals: [LocalApproval(
+                application: ApplicationIdentity(
+                    bundleIdentifier: "com.google.Chrome",
+                    signingIdentifier: "com.google.Chrome"
+                ),
+                controlLevel: .fullControl,
+                clipboardAllowed: true,
+                generation: 1
+            )],
+            result: .allowed
+        ),
+        now: now
+    ))
+
+    let rotation = Task { try await coordinator.rotate(configuration, now: now) }
+    await transport.waitUntilRotatedDeviceConnectedStarts()
+
+    let polledDuringRotation = try await coordinator.nextPendingSession(now: now)
+    #expect(polledDuringRotation == nil)
+
+    await transport.resumeRotatedDeviceConnected()
+    let rotated = try await rotation.value
+    #expect(rotated.binding.generation == 2)
+    #expect(rotated.approvals.map(\.generation) == [2])
+    let requests = await transport.recordedRequests()
+    #expect(requests.count == 6)
+    #expect(requests.filter { $0.url?.path.hasSuffix("/device-inbox") == true }.count == 1)
+    #expect(requests.filter { $0.url?.path.hasSuffix("/device-connected") == true }.count == 2)
 }
 
 @Test func discoveryRotatesAnActiveGenerationAfterBrokerRestart() async throws {

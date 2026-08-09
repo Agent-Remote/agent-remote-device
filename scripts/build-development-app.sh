@@ -64,6 +64,14 @@ install_xpc_service() {
     "$service_bundle/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" \
     "$service_bundle/Contents/Info.plist"
+  if [[ "$service_name" == "AgentRemoteNetworkBroker" ]]; then
+    /usr/libexec/PlistBuddy -c \
+      "Add :AgentRemoteOutboundPolicyMode string application" \
+      "$service_bundle/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c \
+      "Add :AgentRemoteCredentialMode string community-file" \
+      "$service_bundle/Contents/Info.plist"
+  fi
   codesign --force --sign - --timestamp=none "$service_bundle"
 }
 

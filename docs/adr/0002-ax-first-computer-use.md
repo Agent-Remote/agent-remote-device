@@ -33,18 +33,65 @@ observe(auto) -> bounded AX full/diff -> state-bound act
 
 The GUI Executor is the only AX reader. It returns bounded normalized nodes,
 prefers visible browser/list children, merges public AX child collections without
-duplicates, elides semantically empty single-child wrappers, and keeps element
-indexes when `CFEqual` proves that an AX element is the same object. Hidden,
+duplicates, elides semantically empty wrappers, suppresses low-value menu/scroll
+actions and frames on purely structural nodes, and keeps element indexes when `CFEqual` proves that an AX
+element is the same object. Hidden,
 ancestor-hidden, and off-window subtrees are not executable and do not expose
 value or URL content. The renderer uses only read-only Accessibility queries;
 private Chromium/Electron accessibility toggles are best-effort future work and
 are not a production dependency.
 
+Chrome-specific normalization removes inactive tab subtrees and the wide labeled
+bookmark toolbar near the top of the window. Essential browser controls and the
+selected page remain available, reducing fixed Full-state cost without introducing
+a page-only mode that would break address-bar and tab workflows.
+
 Every element target binds `state_id`, `state_generation`, application digest,
 window ID, display fingerprint, and index. A stale target is rejected; the
-Executor never searches by name or substitutes a neighboring element. Explicit
-coordinates remain a screenshot-generation-bound fallback. Adaptive settling is
-bounded by the request, lease, and action deadline and reports timeout honestly.
+Executor never searches by name or substitutes a neighboring element. AX frames
+are metadata, not screenshot coordinates; explicit coordinates remain a
+screenshot-generation-bound fallback. Adaptive settling is bounded by the request,
+lease, and action deadline and reports timeout honestly. Navigation-capable actions
+wait for an `AXWebArea` page-identity change before their stable debounce, then
+require the complete AX fingerprint to stabilize. Browser chrome and focus noise
+cannot satisfy the page-identity gate. Non-browser apps use a complete-tree change,
+with one bounded no-change grace for legitimate no-ops.
+
+The compact `input_text` helper accepts the same latest-state binding as `act`, so
+an editable element can be focused and filled in one MCP call without a
+model-visible image or a separate focus round trip. Partial bindings and
+AX/coordinate mixtures fail before any device operation is sent.
+
+Editable text-field presses use the local settle class and retain their bounded
+diff. The timeout path is covered deterministically: it returns one finite safe
+observation with `status=timeout` and does not retry the action. Acceptance runs do
+not manufacture a timeout; an untriggered conditional branch is not a warning.
+
+Retained bindings also support direct cross-application workflows. Before acting
+on a background application's retained element, the Executor requires that exact
+signed process to become the `NSWorkspace` frontmost process; a lagging
+`isActive` flag is insufficient. Editable presses then verify AX focus before
+committing the action sequence, preventing a following context keyboard action
+from reaching the application that was previously frontmost.
+
+Adaptive settle and post-action navigation recovery share one navigation
+classifier. Copy/select/cut shortcuts stay on the local path and preserve Diff;
+Return and browser Back/Forward remain navigation-capable. Local actions use two
+stable samples with a 300 ms minimum, editable focus uses 250 ms, and navigation
+retains the 600 ms/six-sample debounce and two-second no-change grace. Recovery
+uses internal full-snapshot page-identity presence rather than searching only the
+model-visible diff: an unchanged WebArea is normally absent from a diff and must
+not turn a local browser infobar dismissal into a redundant Full reset. Recovery
+is attempted only when the visible base had page identity and the complete current
+snapshot temporarily loses it, which also keeps non-browser buttons off the
+WebArea-specific recovery path.
+
+The proxy, transport, session guard, and AX runtime retain one latest binding per
+approved application. Switching from application A to B does not discard A's
+model-visible state, so multi-application workflows can continue without a
+redundant A observation. A new A state replaces only A's prior binding. Global
+monotonic sequence and generation counters still order every request and prevent
+replay across the device session.
 
 Observation budgets are enforced before serialization: 800 nodes, depth 20, 160
 characters per field, 16 KiB total text, and 20 visible rows per row container.

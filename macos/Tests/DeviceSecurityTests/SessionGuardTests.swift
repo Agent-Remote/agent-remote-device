@@ -1,7 +1,14 @@
 import DeviceProtocol
+import Darwin
 import Foundation
 import Testing
 @testable import DeviceSecurity
+
+@Test func runningCodeIdentityValidatesTheBoundLiveProcess() {
+    let identifier = RunningCodeIdentity.signingIdentifier(processID: getpid())
+    #expect(identifier?.isEmpty == false)
+    #expect(RunningCodeIdentity.signingIdentifier(processID: 0) == nil)
+}
 
 @Test func publicApplicationMappingsRemainVersionedAndConservative() {
     #expect(ApplicationPolicy.mappingVersion == 2)

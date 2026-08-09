@@ -162,7 +162,7 @@
           "properties": {
             "type": {"const": "set_value"},
             "target": {"$ref": "#/$defs/target"},
-            "value": {"type": "string", "minLength": 1, "maxLength": 4096}
+            "value": {"type": "string", "maxLength": 4096}
           }
         },
         {

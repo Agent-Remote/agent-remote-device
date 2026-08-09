@@ -35,6 +35,7 @@ struct AgentRemoteDeviceApp: App {
     private func monitorBroker() async {
         configureModelHandlers()
         var connectedPreviously = false
+        var connectedGeneration: UInt64?
         var presentedBinding: DeviceSessionBinding?
         while !Task.isCancelled {
             if model.state == .reconnecting {
@@ -53,6 +54,17 @@ struct AgentRemoteDeviceApp: App {
                 try? await Task.sleep(for: .seconds(2))
                 continue
             }
+            guard let currentGeneration = broker.connectedGeneration() else {
+                connectedPreviously = false
+                model.failIfInfrastructureUnavailable(false)
+                try? await Task.sleep(for: .seconds(2))
+                continue
+            }
+            if let connectedGeneration, connectedGeneration != currentGeneration {
+                presentedBinding = nil
+                model.failIfInfrastructureUnavailable(false)
+            }
+            connectedGeneration = currentGeneration
             if !connectedPreviously {
                 healthLogger.notice("Secure XPC chain ready")
             }

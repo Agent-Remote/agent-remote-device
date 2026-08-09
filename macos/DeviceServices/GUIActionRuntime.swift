@@ -4,6 +4,38 @@ import DeviceSecurity
 import Foundation
 import GUIExecutor
 
+public struct ActionSettleOutcome: Sendable {
+    public let result: SettleResult
+    public let observedMeaningfulChange: Bool
+    public let pressTargetWasEditableText: Bool
+
+    public init(
+        result: SettleResult,
+        observedMeaningfulChange: Bool,
+        pressTargetWasEditableText: Bool = false
+    ) {
+        self.result = result
+        self.observedMeaningfulChange = observedMeaningfulChange
+        self.pressTargetWasEditableText = pressTargetWasEditableText
+    }
+}
+
+public struct ActionSettlePreparation: Sendable {
+    public let baseline: AccessibilityStabilityFingerprint?
+    public let pressTargetWasEditableText: Bool
+    public let trackedElementIndex: UInt32?
+
+    public init(
+        baseline: AccessibilityStabilityFingerprint?,
+        pressTargetWasEditableText: Bool,
+        trackedElementIndex: UInt32? = nil
+    ) {
+        self.baseline = baseline
+        self.pressTargetWasEditableText = pressTargetWasEditableText
+        self.trackedElementIndex = trackedElementIndex
+    }
+}
+
 public protocol GUIActionRuntime: Sendable {
     func capture(
         approvedApplications: [ApplicationIdentity],
@@ -25,6 +57,10 @@ public protocol GUIActionRuntime: Sendable {
         baseStateID: UUID?,
         policy: ObservationPolicy
     ) async throws -> AccessibilitySnapshotResult
+    func rebindAccessibilityState(
+        context: WindowContext,
+        stateGeneration: UInt64
+    ) async -> AccessibilityStateContext?
     func executeElement(
         action: ActionV2,
         target: ElementTarget,
@@ -37,11 +73,23 @@ public protocol GUIActionRuntime: Sendable {
         stateGeneration: UInt64,
         context: WindowContext
     ) async throws
+    func prepareSettle(
+        context: WindowContext,
+        policy: ObservationPolicy,
+        action: ActionV2
+    ) async -> ActionSettlePreparation
     func settle(
         context: WindowContext,
         policy: ObservationPolicy,
+        action: ActionV2,
+        preparation: ActionSettlePreparation?,
         deadline: Date
-    ) async throws -> SettleResult
+    ) async throws -> ActionSettleOutcome
+    func waitForAccessibilityValue(
+        target: ElementTarget,
+        expectedValue: String,
+        deadline: Date
+    ) async throws -> Bool
     func execute(
         action: Action,
         sequence: UInt64,
@@ -65,7 +113,7 @@ public protocol GUIActionRuntime: Sendable {
         context: WindowContext
     ) async throws -> String
     func releasePressedState() async
-    func clearAccessibilityState() async
+    func clearAccessibilityState(applicationDigest: String?) async
 }
 
 public extension GUIActionRuntime {
@@ -122,12 +170,40 @@ public extension GUIActionRuntime {
     func settle(
         context _: WindowContext,
         policy _: ObservationPolicy,
+        action _: ActionV2,
+        preparation _: ActionSettlePreparation?,
         deadline _: Date
-    ) async throws -> SettleResult {
+    ) async throws -> ActionSettleOutcome {
         throw AccessibilityFailure.operationFailed
     }
 
-    func clearAccessibilityState() async {}
+    func prepareSettle(
+        context _: WindowContext,
+        policy _: ObservationPolicy,
+        action _: ActionV2
+    ) async -> ActionSettlePreparation {
+        ActionSettlePreparation(
+            baseline: nil,
+            pressTargetWasEditableText: false
+        )
+    }
+
+    func waitForAccessibilityValue(
+        target _: ElementTarget,
+        expectedValue _: String,
+        deadline _: Date
+    ) async throws -> Bool {
+        true
+    }
+
+    func clearAccessibilityState(applicationDigest _: String?) async {}
+
+    func rebindAccessibilityState(
+        context _: WindowContext,
+        stateGeneration _: UInt64
+    ) async -> AccessibilityStateContext? {
+        nil
+    }
 
     func readClipboardV2(
         sequence _: UInt64,
@@ -165,6 +241,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
+        try await captureEngine.activate(application: application)
         return try await captureEngine.capture(application: application)
     }
 
@@ -179,6 +256,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
+        try await captureEngine.activate(application: application)
         let dimensions = switch profile {
         case .compact: (960, 600)
         case .standard, .region: (1_280, 800)
@@ -199,6 +277,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
+        try await captureEngine.activate(application: application)
         return try await captureEngine.context(application: application)
     }
 
@@ -285,6 +364,18 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         )
     }
 
+    public func rebindAccessibilityState(
+        context: WindowContext,
+        stateGeneration: UInt64
+    ) async -> AccessibilityStateContext? {
+        await MainActor.run {
+            accessibility.rebindCurrent(
+                context: context,
+                stateGeneration: stateGeneration
+            )
+        }
+    }
+
     public func executeContextAction(
         action: Action,
         sequence: UInt64,
@@ -322,10 +413,15 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
     public func settle(
         context: WindowContext,
         policy: ObservationPolicy,
+        action: ActionV2,
+        preparation: ActionSettlePreparation?,
         deadline: Date
-    ) async throws -> SettleResult {
+    ) async throws -> ActionSettleOutcome {
         guard policy.settle != .none else {
-            return SettleResult(status: .notRequested, elapsedMilliseconds: 0)
+            return ActionSettleOutcome(
+                result: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
+                observedMeaningfulChange: false
+            )
         }
         if policy.settle == .fixed {
             let milliseconds = min(
@@ -333,38 +429,157 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
                 UInt32(max(0, deadline.timeIntervalSinceNow * 1_000))
             )
             try await Task.sleep(for: .milliseconds(milliseconds))
-            return SettleResult(status: .settled, elapsedMilliseconds: milliseconds)
+            return ActionSettleOutcome(
+                result: SettleResult(status: .settled, elapsedMilliseconds: milliseconds),
+                observedMeaningfulChange: false
+            )
         }
 
         let started = ContinuousClock.now
-        var prior: Int?
+        let pressTargetsEditableText = preparation?.pressTargetWasEditableText ?? false
+        let minimumStableMilliseconds = ActionSettleTiming.minimumStableMilliseconds(
+            for: action,
+            pressTargetsEditableText: pressTargetsEditableText
+        )
+        let requiredStableSamples = ActionSettleTiming.requiredStableSamples(
+            for: action,
+            pressTargetsEditableText: pressTargetsEditableText
+        )
+        let requiresMeaningfulChange = ActionSettleTiming.requiresMeaningfulChange(
+            for: action,
+            pressTargetsEditableText: pressTargetsEditableText
+        )
+        let noChangeGraceMilliseconds = ActionSettleTiming.noChangeGraceMilliseconds(
+            for: action,
+            pressTargetsEditableText: pressTargetsEditableText
+        )
+        let baseline: AccessibilityStabilityFingerprint? = if requiresMeaningfulChange {
+            if let preparation {
+                preparation.baseline
+            } else {
+                await MainActor.run {
+                    accessibility.currentStabilityFingerprint(context: context)
+                }
+            }
+        } else {
+            nil
+        }
+        var observedMeaningfulChange = !requiresMeaningfulChange || baseline == nil
+        var priorContent: Int?
         var stableSamples = 0
         repeat {
             let fingerprint = try await MainActor.run {
-                try accessibility.stabilityFingerprint(context: context, policy: policy)
+                try accessibility.stabilityFingerprint(
+                    context: context,
+                    policy: policy,
+                    trackingElementIndex: preparation?.trackedElementIndex
+                )
             }
-            if fingerprint == prior {
+            if let baseline {
+                let trackedElementDisappeared = baseline.trackedElementPresent == true
+                    && fingerprint.trackedElementPresent == false
+                let trackedElementChanged = baseline.trackedElementContent != nil
+                    && fingerprint.trackedElementContent != baseline.trackedElementContent
+                if fingerprint.meaningful != baseline.meaningful
+                    || trackedElementDisappeared
+                    || trackedElementChanged
+                {
+                    observedMeaningfulChange = true
+                }
+            }
+            if fingerprint.content == priorContent {
                 stableSamples += 1
                 let elapsed = elapsedMilliseconds(since: started)
-                // Dynamic web views can acknowledge an AXPress before their
-                // accessibility subtree begins updating. A short grace period
-                // avoids returning the unchanged pre-action tree as settled.
-                if stableSamples >= 3, elapsed >= 700 {
-                    return SettleResult(
-                        status: .settled,
-                        elapsedMilliseconds: elapsed
+                if ActionSettleTiming.canReturn(
+                    stableSamples: stableSamples,
+                    requiredStableSamples: requiredStableSamples,
+                    elapsedMilliseconds: elapsed,
+                    minimumStableMilliseconds: minimumStableMilliseconds,
+                    observedMeaningfulChange: observedMeaningfulChange,
+                    noChangeGraceMilliseconds: noChangeGraceMilliseconds
+                ) {
+                    return ActionSettleOutcome(
+                        result: SettleResult(
+                            status: .settled,
+                            elapsedMilliseconds: elapsed
+                        ),
+                        observedMeaningfulChange: observedMeaningfulChange,
+                        pressTargetWasEditableText: pressTargetsEditableText
                     )
                 }
             } else {
-                prior = fingerprint
+                priorContent = fingerprint.content
                 stableSamples = 0
             }
             try await Task.sleep(for: .milliseconds(100))
         } while Date() < deadline
-        return SettleResult(
-            status: .timeout,
-            elapsedMilliseconds: elapsedMilliseconds(since: started)
+        return ActionSettleOutcome(
+            result: SettleResult(
+                status: .timeout,
+                elapsedMilliseconds: elapsedMilliseconds(since: started)
+            ),
+            observedMeaningfulChange: observedMeaningfulChange,
+            pressTargetWasEditableText: pressTargetsEditableText
         )
+    }
+
+    public func prepareSettle(
+        context: WindowContext,
+        policy: ObservationPolicy,
+        action: ActionV2
+    ) async -> ActionSettlePreparation {
+        guard policy.settle == .auto else {
+            return ActionSettlePreparation(
+                baseline: nil,
+                pressTargetWasEditableText: false
+            )
+        }
+        let pressTargetsEditableText: Bool = if case let .press(target) = action {
+            await MainActor.run { accessibility.isEditableTextTarget(target) }
+        } else {
+            false
+        }
+        let trackedElementIndex: UInt32? = switch action {
+        case let .press(target), let .secondaryAction(target, _):
+            target.elementIndex
+        default:
+            nil
+        }
+        let requiresMeaningfulChange = ActionSettleTiming.requiresMeaningfulChange(
+            for: action,
+            pressTargetsEditableText: pressTargetsEditableText
+        )
+        let baseline: AccessibilityStabilityFingerprint? = requiresMeaningfulChange
+            ? await MainActor.run { () -> AccessibilityStabilityFingerprint? in
+                accessibility.currentStabilityFingerprint(
+                    context: context,
+                    trackingElementIndex: trackedElementIndex
+                )
+            }
+            : nil
+        return ActionSettlePreparation(
+            baseline: baseline,
+            pressTargetWasEditableText: pressTargetsEditableText,
+            trackedElementIndex: trackedElementIndex
+        )
+    }
+
+    public func waitForAccessibilityValue(
+        target: ElementTarget,
+        expectedValue: String,
+        deadline: Date
+    ) async throws -> Bool {
+        repeat {
+            if try await MainActor.run(body: {
+                try accessibility.valueMatches(expectedValue, target: target)
+            }) {
+                return true
+            }
+            let remainingMilliseconds = Int64(deadline.timeIntervalSinceNow * 1_000)
+            guard remainingMilliseconds > 0 else { return false }
+            try await Task.sleep(for: .milliseconds(min(100, remainingMilliseconds)))
+        } while Date() < deadline
+        return false
     }
 
     public func execute(
@@ -423,8 +638,14 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         await executor.releasePressedState()
     }
 
-    public func clearAccessibilityState() async {
-        await MainActor.run { accessibility.clear() }
+    public func clearAccessibilityState(applicationDigest: String?) async {
+        await MainActor.run {
+            if let applicationDigest {
+                accessibility.clear(applicationDigest: applicationDigest)
+            } else {
+                accessibility.clear()
+            }
+        }
     }
 
     private func elapsedMilliseconds(since start: ContinuousClock.Instant) -> UInt32 {
@@ -432,5 +653,89 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         let milliseconds = duration.components.seconds * 1_000
             + duration.components.attoseconds / 1_000_000_000_000_000
         return UInt32(clamping: milliseconds)
+    }
+}
+
+enum ActionSettleTiming {
+    static func minimumStableMilliseconds(
+        for action: ActionV2,
+        pressTargetsEditableText: Bool = false
+    ) -> UInt32 {
+        if isImmediateShortcut(action) { return 200 }
+        if pressTargetsEditableText { return 250 }
+        return mayNavigate(action, pressTargetsEditableText: false) ? 600 : 300
+    }
+
+    static func requiredStableSamples(
+        for action: ActionV2,
+        pressTargetsEditableText: Bool = false
+    ) -> Int {
+        if isImmediateShortcut(action) { return 1 }
+        if pressTargetsEditableText { return 2 }
+        return mayNavigate(action, pressTargetsEditableText: false) ? 6 : 2
+    }
+
+    static func requiresMeaningfulChange(
+        for action: ActionV2,
+        pressTargetsEditableText: Bool = false
+    ) -> Bool {
+        mayNavigate(action, pressTargetsEditableText: pressTargetsEditableText)
+    }
+
+    static func noChangeGraceMilliseconds(
+        for action: ActionV2,
+        pressTargetsEditableText: Bool = false
+    ) -> UInt32 {
+        mayNavigate(action, pressTargetsEditableText: pressTargetsEditableText) ? 2_000 : 0
+    }
+
+    static func canReturn(
+        stableSamples: Int,
+        requiredStableSamples: Int,
+        elapsedMilliseconds: UInt32,
+        minimumStableMilliseconds: UInt32,
+        observedMeaningfulChange: Bool,
+        noChangeGraceMilliseconds: UInt32
+    ) -> Bool {
+        stableSamples >= requiredStableSamples
+            && elapsedMilliseconds >= minimumStableMilliseconds
+            && (observedMeaningfulChange
+                || elapsedMilliseconds >= noChangeGraceMilliseconds)
+    }
+
+    static func mayNavigate(
+        _ action: ActionV2,
+        pressTargetsEditableText: Bool
+    ) -> Bool {
+        switch action {
+        case .press:
+            !pressTargetsEditableText
+        case .secondaryAction:
+            true
+        case let .coordinate(action):
+            switch action {
+            case .leftClick, .rightClick, .middleClick, .doubleClick, .tripleClick:
+                true
+            case let .key(key):
+                [
+                    "RETURN", "ENTER", "KP_ENTER", "ALT+LEFT", "ALT+RIGHT",
+                    "CMD+LEFT", "CMD+RIGHT", "SUPER+LEFT", "SUPER+RIGHT",
+                    "CMD+[", "CMD+]", "SUPER+[", "SUPER+]",
+                    "BROWSER_BACK", "BROWSER_FORWARD",
+                ].contains(key.uppercased())
+            default:
+                false
+            }
+        default:
+            false
+        }
+    }
+
+    private static func isImmediateShortcut(_ action: ActionV2) -> Bool {
+        guard case let .coordinate(.key(key)) = action else { return false }
+        return [
+            "CMD+A", "CMD+C", "CMD+X",
+            "SUPER+A", "SUPER+C", "SUPER+X",
+        ].contains(key.uppercased())
     }
 }

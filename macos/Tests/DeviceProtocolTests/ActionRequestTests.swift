@@ -47,6 +47,43 @@ import Testing
     #expect(response.observation?.nodes.first?.title == "Continue")
 }
 
+@Test func v2SetValueAcceptsAnEmptyStringForClearingEditableControls() throws {
+    let target = ElementTarget(
+        stateID: UUID(),
+        stateGeneration: 1,
+        applicationDigest: String(repeating: "a", count: 64),
+        windowID: 1,
+        displayFingerprint: "display",
+        elementIndex: 0
+    )
+
+    #expect(ActionV2.setValue(target: target, value: "").hasValidParameters)
+
+    let url = try #require(Bundle.module.url(
+        forResource: "action-request-v2-valid",
+        withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let data = try Data(contentsOf: url)
+    var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    object["action"] = [
+        "type": "set_value",
+        "target": [
+            "state_id": target.stateID.uuidString.lowercased(),
+            "state_generation": target.stateGeneration,
+            "application_digest": target.applicationDigest,
+            "window_id": target.windowID,
+            "display_fingerprint": target.displayFingerprint,
+            "element_index": target.elementIndex,
+        ],
+        "value": "",
+    ]
+    let decoded = try ActionRequestV2.decodeStrict(
+        JSONSerialization.data(withJSONObject: object)
+    )
+    #expect(decoded.action == .setValue(target: target, value: ""))
+}
+
 @Test func strictRequestDecoderRejectsUnknownFieldsAndNoncanonicalIdentifiers() throws {
     let url = try #require(Bundle.module.url(
         forResource: "action-request-valid",

@@ -1,7 +1,9 @@
 import DeviceIPC
 import Foundation
+import OSLog
 
 public final class GUIExecutorService: NSObject, GUIExecutorXPCProtocol, @unchecked Sendable {
+    private let logger = Logger(subsystem: "dev.agentremote.device", category: "executor")
     private let signerIdentity: XPCSignerIdentity
     private let controller: GUIExecutorSessionController
     private var brokerListener: NSXPCListener?
@@ -65,6 +67,7 @@ public final class GUIExecutorService: NSObject, GUIExecutorXPCProtocol, @unchec
                 let response = try await controller.performAction(data)
                 reply.resolve(data: response as NSData, error: nil)
             } catch {
+                logger.error("Executor action failed")
                 reply.resolve(data: nil, error: DeviceIPCFailure.invalidMessage.nsError)
             }
         }

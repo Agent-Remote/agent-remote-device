@@ -1,5 +1,5 @@
 import DeviceIPC
-import DeviceServices
+@testable import DeviceServices
 import Foundation
 import Network
 import Testing
@@ -110,6 +110,44 @@ func nestedTLSRelayCarriesActionsOnlyThroughOpaqueWebSocketBytes() async throws 
     proxyConnection.cancel()
     relay.cancel()
     relayTask.cancel()
+}
+
+@Test(.timeLimit(.minutes(1)))
+func relayDisconnectCancelsAnInFlightActionWithoutWaitingForItsReply() async throws {
+    let actionStarted = TestOneShot<Void>()
+    let actionCancelled = TestOneShot<Void>()
+    let disconnect = TestOneShot<Void>()
+    let bridgeTask = Task<Void, Error> {
+        try await disconnect.value()
+    }
+    let operation = Task {
+        try await NetworkBrokerNestedTLSRelay.raceActionAgainstRelayDisconnect(
+            Data("request".utf8),
+            bridgeTask: bridgeTask,
+            actionHandler: { _ in
+                await actionStarted.resolve(.success(()))
+                do {
+                    try await Task.sleep(for: .seconds(60))
+                    return Data("late".utf8)
+                } catch {
+                    await actionCancelled.resolve(.success(()))
+                    throw error
+                }
+            }
+        )
+    }
+
+    try await actionStarted.value()
+    await disconnect.resolve(
+        .failure(NetworkBrokerNestedTLSRelayFailure.connectionFailed)
+    )
+    do {
+        _ = try await operation.value
+        Issue.record("Relay disconnect unexpectedly returned an action response")
+    } catch let failure as NetworkBrokerNestedTLSRelayFailure {
+        #expect(failure == .connectionFailed)
+    }
+    try await actionCancelled.value()
 }
 
 private func makeProxyTLSConnection(

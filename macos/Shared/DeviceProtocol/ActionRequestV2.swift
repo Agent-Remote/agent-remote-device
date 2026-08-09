@@ -11,6 +11,9 @@ public let maximumAXTextPerNode: UInt16 = 160
 public let maximumAXTotalTextBytes: UInt32 = 16 * 1_024
 public let maximumAXVisibleRowsPerContainer: UInt8 = 20
 public let maximumSettleTimeoutMilliseconds: UInt32 = 5_000
+public let defaultAXNodes: UInt16 = 600
+public let defaultAXTotalTextBytes: UInt32 = 12 * 1_024
+public let defaultAXVisibleRowsPerContainer: UInt8 = 12
 
 public struct ActionRequestV2: Codable, Sendable, Equatable {
     public let version: UInt8
@@ -132,11 +135,11 @@ public struct ObservationPolicy: Codable, Sendable, Equatable {
 
     public init(
         mode: ObservationMode = .auto,
-        maxNodes: UInt16 = maximumAXNodes,
+        maxNodes: UInt16 = defaultAXNodes,
         maxDepth: UInt8 = maximumAXDepth,
         maxTextPerNode: UInt16 = maximumAXTextPerNode,
-        maxTotalTextBytes: UInt32 = maximumAXTotalTextBytes,
-        maxVisibleRowsPerContainer: UInt8 = maximumAXVisibleRowsPerContainer,
+        maxTotalTextBytes: UInt32 = defaultAXTotalTextBytes,
+        maxVisibleRowsPerContainer: UInt8 = defaultAXVisibleRowsPerContainer,
         settle: SettleMode = .auto,
         settleTimeoutMilliseconds: UInt32 = maximumSettleTimeoutMilliseconds,
         imageProfile: ImageProfile = .compact,
@@ -293,7 +296,7 @@ public enum ActionV2: Sendable, Equatable {
             action.hasValidParameters && Self.isCoordinateAction(action)
         case let .press(target): target.hasValidParameters
         case let .setValue(target, value):
-            target.hasValidParameters && !value.isEmpty && value.count <= 4_096
+            target.hasValidParameters && value.count <= 4_096
         case let .selectText(target, text, prefix, suffix, _):
             target.hasValidParameters
                 && Self.validBoundedText(text, maximumCharacters: 4_096)

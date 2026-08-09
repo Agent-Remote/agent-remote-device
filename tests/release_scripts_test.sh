@@ -8,6 +8,7 @@ packaged_xpc_verifier="$repo_root/scripts/verify-packaged-xpc.sh"
 development_script="$repo_root/scripts/build-development-app.sh"
 proxy_script="$repo_root/scripts/package-proxy-release.sh"
 prepare_version_script="$repo_root/scripts/prepare-version.sh"
+prepare_release_workflow="$repo_root/.github/workflows/prepare-release.yml"
 gui_executor_entitlements="$repo_root/macos/Entitlements/GUIExecutor.entitlements"
 
 expect_failure() {
@@ -126,6 +127,13 @@ if grep -Fq "$mock_root" "$mock_root/output/linux-amd64-glibc/SHA256SUMS"; then
   exit 1
 fi
 
+for ownership_flag in '--no-xattrs' '--owner=0' '--group=0' '--numeric-owner'; do
+  if ! grep -Fq -- "$ownership_flag" "$prepare_release_workflow"; then
+    echo "proxy release archive does not normalize ownership: $ownership_flag" >&2
+    exit 1
+  fi
+done
+
 for field in \
   AgentRemoteOutboundPolicyAttestorMachService \
   AgentRemoteOutboundPolicyAttestorPublicKey \
@@ -196,7 +204,9 @@ done
 for version_check in \
   'development app version does not match the Device package version' \
   'Set :CFBundleShortVersionString $version' \
-  'Set :CFBundleVersion $build_number'; do
+  'Set :CFBundleVersion $build_number' \
+  'AgentRemoteOutboundPolicyMode string application' \
+  'AgentRemoteCredentialMode string community-file'; do
   if ! grep -Fq "$version_check" "$development_script"; then
     echo "development build version binding is missing: $version_check" >&2
     exit 1

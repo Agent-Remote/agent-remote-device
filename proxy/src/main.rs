@@ -57,6 +57,7 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct ClaudeHookInput {
     hook_event_name: String,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,11 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err("notify mode does not accept transport paths".into());
         }
-        validate_hook_input(event)?;
+        let lifecycle_event = validate_hook_input(event)?;
         // Claude lifecycle hooks are non-blocking cleanup hints. The active
         // device lease may already be gone when Stop or SessionEnd runs, so a
         // delivery failure must not surface as a failed user turn.
-        let _ = notify_running_proxy(&args.lifecycle_socket, event.into()).await;
+        let _ = notify_running_proxy(&args.lifecycle_socket, lifecycle_event).await;
         return Ok(());
     }
 
@@ -161,7 +162,7 @@ fn disable_core_dumps() -> std::io::Result<()> {
     }
 }
 
-fn validate_hook_input(event: NotifyEvent) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_hook_input(event: NotifyEvent) -> Result<LifecycleEvent, Box<dyn std::error::Error>> {
     let mut input = Vec::new();
     std::io::stdin()
         .take(MAX_HOOK_INPUT_BYTES + 1)
@@ -172,16 +173,29 @@ fn validate_hook_input(event: NotifyEvent) -> Result<(), Box<dyn std::error::Err
     validate_hook_event(event, &input)
 }
 
-fn validate_hook_event(event: NotifyEvent, input: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_hook_event(
+    event: NotifyEvent,
+    input: &[u8],
+) -> Result<LifecycleEvent, Box<dyn std::error::Error>> {
     let hook: ClaudeHookInput = serde_json::from_slice(input)?;
-    let matches = match event {
-        NotifyEvent::TurnStop => matches!(hook.hook_event_name.as_str(), "Stop" | "StopFailure"),
-        NotifyEvent::SessionEnd => hook.hook_event_name == "SessionEnd",
-    };
-    if !matches {
-        return Err("Claude hook event does not match the managed notification".into());
+    match event {
+        NotifyEvent::TurnStop
+            if matches!(hook.hook_event_name.as_str(), "Stop" | "StopFailure") =>
+        {
+            Ok(LifecycleEvent::TurnStop)
+        }
+        NotifyEvent::SessionEnd if hook.hook_event_name == "SessionEnd" => {
+            // Claude emits SessionEnd(reason=clear) while keeping the process and
+            // its MCP servers alive. Preserve the approved device lease so the
+            // cleared conversation can resume it on the next tool call.
+            if hook.reason.as_deref() == Some("clear") {
+                Ok(LifecycleEvent::TurnStop)
+            } else {
+                Ok(LifecycleEvent::SessionEnd)
+            }
+        }
+        _ => Err("Claude hook event does not match the managed notification".into()),
     }
-    Ok(())
 }
 
 fn bind_lifecycle_socket(path: &Path) -> Result<UnixListener, Box<dyn std::error::Error>> {
@@ -271,20 +285,42 @@ mod tests {
 
     #[test]
     fn hook_event_must_match_the_fixed_notification() {
-        assert!(validate_hook_event(
-            NotifyEvent::TurnStop,
-            br#"{"hook_event_name":"Stop","untrusted":"ignored"}"#,
-        )
-        .is_ok());
+        assert_eq!(
+            validate_hook_event(
+                NotifyEvent::TurnStop,
+                br#"{"hook_event_name":"Stop","untrusted":"ignored"}"#,
+            )
+            .expect("stop hook"),
+            LifecycleEvent::TurnStop
+        );
         assert!(
             validate_hook_event(NotifyEvent::SessionEnd, br#"{"hook_event_name":"Stop"}"#,)
                 .is_err()
         );
-        assert!(validate_hook_event(
-            NotifyEvent::TurnStop,
-            br#"{"hook_event_name":"StopFailure"}"#,
-        )
-        .is_ok());
+        assert_eq!(
+            validate_hook_event(
+                NotifyEvent::TurnStop,
+                br#"{"hook_event_name":"StopFailure"}"#,
+            )
+            .expect("stop failure hook"),
+            LifecycleEvent::TurnStop
+        );
+        assert_eq!(
+            validate_hook_event(
+                NotifyEvent::SessionEnd,
+                br#"{"hook_event_name":"SessionEnd","reason":"clear"}"#,
+            )
+            .expect("clear hook"),
+            LifecycleEvent::TurnStop
+        );
+        assert_eq!(
+            validate_hook_event(
+                NotifyEvent::SessionEnd,
+                br#"{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#,
+            )
+            .expect("process exit hook"),
+            LifecycleEvent::SessionEnd
+        );
     }
 
     #[tokio::test]

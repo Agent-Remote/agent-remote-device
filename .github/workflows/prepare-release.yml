@@ -104,7 +104,8 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           archive="agent-remote-device-proxy-${LABEL}-${VERSION}.tar.gz"
-          tar -C "dist/device-proxies/${LABEL}" -czf "$archive" \
+          tar --no-xattrs --owner=0 --group=0 --numeric-owner \
+            -C "dist/device-proxies/${LABEL}" -czf "$archive" \
             agent-remote-device-proxy VERSION SHA256SUMS
           sha256sum "$archive" > "$archive.sha256"
       - name: Generate proxy SBOM

@@ -1,0 +1,46 @@
+import Darwin
+import Foundation
+import Security
+
+public enum RunningCodeIdentity {
+    public static func signingIdentifier(processID: pid_t) -> String? {
+        guard processID > 0 else { return nil }
+        let attributes = [
+            kSecGuestAttributePid as String: NSNumber(value: processID),
+        ] as CFDictionary
+        var code: SecCode?
+        guard SecCodeCopyGuestWithAttributes(
+            nil,
+            attributes,
+            SecCSFlags(),
+            &code
+        ) == errSecSuccess,
+            let code,
+            SecCodeCheckValidity(
+                code,
+                SecCSFlags(rawValue: kSecCSStrictValidate),
+                nil
+            ) == errSecSuccess
+        else {
+            return nil
+        }
+
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
+              let staticCode
+        else {
+            return nil
+        }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            staticCode,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &information
+        ) == errSecSuccess,
+            let values = information as? [String: Any]
+        else {
+            return nil
+        }
+        return values[kSecCodeInfoIdentifier as String] as? String
+    }
+}

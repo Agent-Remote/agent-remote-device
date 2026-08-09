@@ -12,6 +12,7 @@ public actor GUIExecutorSessionController {
     private var runtime: (any GUIActionRuntime)?
     private var latestCapture: CapturedWindow?
     private var latestWindowContext: WindowContext?
+    private var windowContextsByApplication: [String: WindowContext] = [:]
     private var turnPaused = false
     private var requiresFreshScreenshot = false
     private var lastCompletedRequest: Data?
@@ -47,6 +48,7 @@ public actor GUIExecutorSessionController {
         self.runtime = runtime
         latestCapture = nil
         latestWindowContext = nil
+        windowContextsByApplication.removeAll(keepingCapacity: false)
         turnPaused = false
         requiresFreshScreenshot = false
         clearReplayCache()
@@ -159,7 +161,8 @@ public actor GUIExecutorSessionController {
         await runtime.releasePressedState()
         latestCapture = nil
         latestWindowContext = nil
-        await runtime.clearAccessibilityState()
+        await runtime.clearAccessibilityState(applicationDigest: nil)
+        windowContextsByApplication.removeAll(keepingCapacity: false)
         turnPaused = true
         clearReplayCache()
     }
@@ -192,6 +195,7 @@ public actor GUIExecutorSessionController {
         runtime = nil
         latestCapture = nil
         latestWindowContext = nil
+        windowContextsByApplication.removeAll(keepingCapacity: false)
         turnPaused = false
         requiresFreshScreenshot = false
         clearReplayCache()
@@ -210,13 +214,14 @@ public actor GUIExecutorSessionController {
     private func failCurrentSession() async {
         if let runtime {
             await runtime.releasePressedState()
-            await runtime.clearAccessibilityState()
+            await runtime.clearAccessibilityState(applicationDigest: nil)
         }
         if let guardState {
             await guardState.failClosed()
         }
         latestCapture = nil
         latestWindowContext = nil
+        windowContextsByApplication.removeAll(keepingCapacity: false)
         turnPaused = false
         requiresFreshScreenshot = false
         clearReplayCache()
@@ -318,7 +323,7 @@ public actor GUIExecutorSessionController {
             do {
                 capture = try await runtime.capture(
                     approvedApplications: approvedApplications,
-                    targetApplication: nil
+                    targetApplication: latestCapture.application.bundleIdentifier
                 )
             } catch let failure as CaptureFailure {
                 requiresFreshScreenshot = true
@@ -401,7 +406,8 @@ public actor GUIExecutorSessionController {
             throw DeviceIPCFailure.invalidMessage
         }
 
-        let currentStateGeneration = await guardState.currentState?.stateGeneration ?? 0
+        let currentState = await guardState.currentState
+        let currentStateGeneration = currentState?.stateGeneration ?? 0
         let currentScreenshotGeneration = await guardState.currentScreenshot?.generation ?? 0
         guard request.context.currentStateGeneration == currentStateGeneration,
               request.context.currentScreenshotGeneration == currentScreenshotGeneration
@@ -419,13 +425,49 @@ public actor GUIExecutorSessionController {
         default: nil
         }
 
+        let isObservationOnly: Bool = if case .observe = request.action { true } else { false }
+        let elementApplicationDigest: String? = switch request.action {
+        case let .press(target),
+             let .setValue(target, _),
+             let .selectText(target, _, _, _, _),
+             let .scrollElement(target, _, _),
+             let .secondaryAction(target, _):
+            target.applicationDigest
+        default:
+            nil
+        }
+        let explicitlyRequestsImage = request.observation.mode == .screenshot
+            || request.observation.mode == .both
+        var prefetchedCapture: CapturedWindow?
+        var observationAuthorized = false
+
         var windowContext: WindowContext
         do {
-            if case .observe = request.action {
+            if isObservationOnly, explicitlyRequestsImage {
+                try await guardState.authorizeScreenshot(
+                    sequence: request.context.monotonicSequence
+                )
+                observationAuthorized = true
+                let profile = request.observation.imageProfile == .none
+                    ? ImageProfile.compact
+                    : request.observation.imageProfile
+                let capture = try await runtime.captureV2(
+                    approvedApplications: approvedApplications,
+                    targetApplication: targetApplication,
+                    profile: profile,
+                    region: request.observation.region
+                )
+                prefetchedCapture = capture
+                windowContext = capture.windowContext
+            } else if case .observe = request.action {
                 windowContext = try await runtime.windowContext(
                     approvedApplications: approvedApplications,
                     targetApplication: targetApplication
                 )
+            } else if let elementApplicationDigest,
+                      let elementContext = windowContextsByApplication[elementApplicationDigest]
+            {
+                windowContext = elementContext
             } else if let latestWindowContext {
                 windowContext = latestWindowContext
             } else {
@@ -442,18 +484,36 @@ public actor GUIExecutorSessionController {
                 message: failure.userMessage
             )
         }
-        if let prior = latestWindowContext, prior != windowContext {
+        if let latestWindowContext, latestWindowContext != windowContext {
             latestCapture = nil
-            await runtime.clearAccessibilityState()
+        }
+        let applicationDigest = windowContext.application.stableDigest
+        if let prior = windowContextsByApplication[applicationDigest],
+           !Self.sameAccessibilityIdentity(prior, windowContext)
+        {
+            await runtime.clearAccessibilityState(applicationDigest: applicationDigest)
+            await guardState.discardState(applicationDigest: applicationDigest)
+            windowContextsByApplication.removeValue(forKey: applicationDigest)
         }
 
+        let settlePreparation: ActionSettlePreparation? = if isObservationOnly {
+            nil
+        } else {
+            await runtime.prepareSettle(
+                context: windowContext,
+                policy: request.observation,
+                action: request.action
+            )
+        }
         var message = "Action completed."
         do {
             switch request.action {
             case .observe:
-                try await guardState.authorizeScreenshot(
-                    sequence: request.context.monotonicSequence
-                )
+                if !observationAuthorized {
+                    try await guardState.authorizeScreenshot(
+                        sequence: request.context.monotonicSequence
+                    )
+                }
             case let .coordinate(action):
                 if action.requiresModelVisibleScreenshot {
                     guard let latestCapture else {
@@ -507,6 +567,12 @@ public actor GUIExecutorSessionController {
                 code: failure.diagnosticCode,
                 message: failure.userMessage
             )
+        } catch let failure as CaptureFailure {
+            return try failureResponseV2(
+                request: request,
+                code: failure.diagnosticCode,
+                message: failure.userMessage
+            )
         } catch let failure as GuardFailure {
             if let diagnostic = recoverableGuardFailureV2(failure) {
                 return try failureResponseV2(
@@ -519,19 +585,50 @@ public actor GUIExecutorSessionController {
             throw failure
         }
 
-        let isObservationOnly: Bool = if case .observe = request.action { true } else { false }
+        if case .readClipboard = request.action {
+            guard let currentState else {
+                return try failureResponseV2(
+                    request: request,
+                    code: "fresh_observation_required",
+                    message: "A successful observation is required before reading the clipboard."
+                )
+            }
+            latestWindowContext = windowContext
+            let response = ActionResponseV2(
+                requestID: request.requestID,
+                monotonicSequence: request.context.monotonicSequence,
+                stateGeneration: currentState.stateGeneration,
+                screenshotGeneration: currentScreenshotGeneration,
+                stateID: currentState.stateID,
+                applicationDigest: currentState.applicationDigest,
+                windowID: currentState.windowID,
+                displayFingerprint: currentState.displayFingerprint,
+                baseStateID: nil,
+                status: .success,
+                message: message,
+                observation: nil,
+                settle: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
+                image: nil
+            )
+            return try JSONEncoder().encode(response)
+        }
+
         var observationBaseStateID = request.observation.mode == .axFull
             ? nil
             : request.context.baseStateID
+        let actionApplication = windowContext.application.bundleIdentifier
         if !isObservationOnly {
             do {
                 let refreshed = try await runtime.windowContext(
                     approvedApplications: approvedApplications,
-                    targetApplication: nil
+                    targetApplication: actionApplication
                 )
-                if refreshed != windowContext {
+                if !Self.sameAccessibilityIdentity(refreshed, windowContext) {
                     latestCapture = nil
-                    await runtime.clearAccessibilityState()
+                    let applicationDigest = windowContext.application.stableDigest
+                    await runtime.clearAccessibilityState(applicationDigest: applicationDigest)
+                    await guardState.discardState(applicationDigest: applicationDigest)
+                    windowContextsByApplication.removeValue(forKey: applicationDigest)
                     observationBaseStateID = nil
                 }
                 windowContext = refreshed
@@ -539,25 +636,34 @@ public actor GUIExecutorSessionController {
                 message += " Follow-up window refresh failed (\(failure.diagnosticCode))."
             }
         }
-        let settle: SettleResult
+        let settleOutcome: ActionSettleOutcome
         if isObservationOnly {
-            settle = SettleResult(status: .notRequested, elapsedMilliseconds: 0)
+            settleOutcome = ActionSettleOutcome(
+                result: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
+                observedMeaningfulChange: false
+            )
         } else {
             let requestedDeadline = Date().addingTimeInterval(
                 Double(request.observation.settleTimeoutMilliseconds) / 1_000
             )
             let deadline = min(requestedDeadline, request.leaseUntil)
             do {
-                settle = try await runtime.settle(
+                settleOutcome = try await runtime.settle(
                     context: windowContext,
                     policy: request.observation,
+                    action: request.action,
+                    preparation: settlePreparation,
                     deadline: deadline
                 )
             } catch {
-                settle = SettleResult(status: .timeout, elapsedMilliseconds: 0)
+                settleOutcome = ActionSettleOutcome(
+                    result: SettleResult(status: .timeout, elapsedMilliseconds: 0),
+                    observedMeaningfulChange: false
+                )
                 message += " Adaptive settle was unavailable."
             }
         }
+        let settle = settleOutcome.result
 
         var observation: AccessibilityObservation?
         var stateContext: AccessibilityStateContext?
@@ -569,6 +675,25 @@ public actor GUIExecutorSessionController {
         let wantsAX = switch request.observation.mode {
         case .axDiff, .axFull, .both, .auto: true
         case .none, .screenshot: false
+        }
+        if wantsAX, case let .setValue(target, expectedValue) = request.action {
+            let freshnessDeadline = min(
+                Date().addingTimeInterval(2),
+                request.leaseUntil
+            )
+            do {
+                if try await !runtime.waitForAccessibilityValue(
+                    target: target,
+                    expectedValue: expectedValue,
+                    deadline: freshnessDeadline
+                ) {
+                    message += " Expected accessibility value was not visible before the freshness deadline."
+                }
+            } catch let failure as AccessibilityFailure {
+                message += " Accessibility value freshness check failed (\(failure.diagnosticCode))."
+            } catch {
+                message += " Accessibility value freshness check was unavailable."
+            }
         }
         if wantsAX {
             do {
@@ -602,7 +727,28 @@ public actor GUIExecutorSessionController {
                         message += " Typed text was not visible in AX before the freshness deadline."
                     }
                 }
-                observation = result.observation
+                if Self.needsNavigationObservationRecovery(
+                    settleOutcome: settleOutcome,
+                    observation: result.observation,
+                    baseHadPageIdentity: result.baseHadPageIdentity,
+                    currentHasPageIdentity: result.currentHasPageIdentity,
+                    action: request.action
+                ) {
+                    let remainingMilliseconds = Int64(request.leaseUntil.timeIntervalSinceNow * 1_000)
+                    if remainingMilliseconds > 0 {
+                        try await Task.sleep(for: .milliseconds(min(100, remainingMilliseconds)))
+                    }
+                    result = try await runtime.observeAccessibility(
+                        context: windowContext,
+                        stateGeneration: nextStateGeneration,
+                        baseStateID: nil,
+                        policy: request.observation
+                    )
+                }
+                observation = Self.observationRequiringResetWhenReplacingModelBase(
+                    result.observation,
+                    modelBaseStateID: request.context.baseStateID
+                )
                 stateContext = result.context
             } catch let failure as AccessibilityFailure {
                 if request.observation.mode != .auto {
@@ -629,12 +775,17 @@ public actor GUIExecutorSessionController {
                 let profile = request.observation.imageProfile == .none
                     ? ImageProfile.compact
                     : request.observation.imageProfile
-                let capture = try await runtime.captureV2(
-                    approvedApplications: approvedApplications,
-                    targetApplication: nil,
-                    profile: profile,
-                    region: request.observation.region
-                )
+                let capture: CapturedWindow
+                if let prefetchedCapture {
+                    capture = prefetchedCapture
+                } else {
+                    capture = try await runtime.captureV2(
+                        approvedApplications: approvedApplications,
+                        targetApplication: actionApplication,
+                        profile: profile,
+                        region: request.observation.region
+                    )
+                }
                 screenshotGeneration = try incremented(currentScreenshotGeneration)
                 try await guardState.recordScreenshot(ScreenshotContext(
                     generation: screenshotGeneration,
@@ -676,6 +827,7 @@ public actor GUIExecutorSessionController {
         guard let stateContext else { throw DeviceIPCFailure.invalidMessage }
         try await guardState.recordState(stateContext)
         latestWindowContext = windowContext
+        windowContextsByApplication[stateContext.applicationDigest] = windowContext
         if isObservationOnly {
             try await guardState.accept(sequence: request.context.monotonicSequence)
         }
@@ -717,6 +869,59 @@ public actor GUIExecutorSessionController {
                 .compactMap { $0?.lowercased() }
                 .contains { value in needles.contains { value.contains($0) } }
         }
+    }
+
+    static func observationRequiringResetWhenReplacingModelBase(
+        _ observation: AccessibilityObservation,
+        modelBaseStateID: UUID?
+    ) -> AccessibilityObservation {
+        guard observation.kind == .full,
+              !observation.reset,
+              modelBaseStateID != nil
+        else { return observation }
+        return AccessibilityObservation(
+            kind: observation.kind,
+            reset: true,
+            truncated: observation.truncated,
+            nodes: observation.nodes,
+            removed: observation.removed
+        )
+    }
+
+    static func sameAccessibilityIdentity(_ left: WindowContext, _ right: WindowContext) -> Bool {
+        left.application == right.application
+            && left.processID == right.processID
+            && left.windowID == right.windowID
+            && left.displayFingerprint == right.displayFingerprint
+    }
+
+    static func needsNavigationObservationRecovery(
+        settleOutcome: ActionSettleOutcome,
+        observation: AccessibilityObservation,
+        baseHadPageIdentity: Bool,
+        currentHasPageIdentity: Bool,
+        action: ActionV2
+    ) -> Bool {
+        guard settleOutcome.observedMeaningfulChange,
+              observation.kind == .diff,
+              baseHadPageIdentity,
+              !currentHasPageIdentity,
+              actionMayNavigate(
+                  action,
+                  pressTargetWasEditableText: settleOutcome.pressTargetWasEditableText
+              )
+        else { return false }
+        return true
+    }
+
+    private static func actionMayNavigate(
+        _ action: ActionV2,
+        pressTargetWasEditableText: Bool
+    ) -> Bool {
+        ActionSettleTiming.mayNavigate(
+            action,
+            pressTargetsEditableText: pressTargetWasEditableText
+        )
     }
 
     private func requestVersion(in data: Data) throws -> UInt8 {

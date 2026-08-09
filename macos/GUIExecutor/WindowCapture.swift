@@ -156,6 +156,8 @@ public enum CaptureFailure: Error, Equatable, Sendable {
 
 public struct WindowCapture: Sendable {
     static let operationTimeout: Duration = .seconds(8)
+    private static let lightweightActivationAttempts = 20
+    private static let workspaceActivationAttempts = 80
 
     private let profile: CaptureProfile
     private let excludedBundleIdentifier: String
@@ -294,50 +296,58 @@ public struct WindowCapture: Sendable {
         guard application.bundleIdentifier != excludedBundleIdentifier else {
             throw CaptureFailure.applicationActivationRejected
         }
-        let isAlreadyFrontmost = await MainActor.run {
-            guard let frontmost = NSWorkspace.shared.frontmostApplication,
-                  frontmost.bundleIdentifier == application.bundleIdentifier,
-                  requiredProcessID == nil || frontmost.processIdentifier == requiredProcessID
-            else {
-                return false
-            }
-            return Self.signingIdentifier(for: frontmost) == application.signingIdentifier
-        }
-        if isAlreadyFrontmost { return }
-
-        let processID = try await Self.requestActivation(
+        let target = try await Self.activationTarget(
             application: application,
             requiredProcessID: requiredProcessID
         )
-        for attempt in 0 ..< 100 {
-            let isFrontmost = await MainActor.run {
-                NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
+        let isAlreadyFrontmost = await MainActor.run {
+            Self.isProcessFrontmost(target.processID)
+        }
+        if isAlreadyFrontmost { return }
+
+        await MainActor.run {
+            Self.requestProcessActivation(processID: target.processID)
+            if let bundleURL = target.bundleURL {
+                Self.requestWorkspaceActivation(at: bundleURL)
             }
-            if isFrontmost { return }
-            if attempt.isMultiple(of: 10) {
-                await MainActor.run {
-                    guard let application = NSRunningApplication(
-                        processIdentifier: processID
-                    ) else { return }
-                    _ = application.unhide()
-                    _ = application.activate(options: [.activateAllWindows])
-                    Self.raiseAccessibilityWindows(processID: processID)
-                }
+        }
+        if try await Self.waitUntilFrontmost(
+            processID: target.processID,
+            attempts: Self.lightweightActivationAttempts
+        ) {
+            return
+        }
+
+        if let bundleURL = target.bundleURL {
+            await MainActor.run {
+                Self.requestWorkspaceActivation(at: bundleURL)
             }
-            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        if try await Self.waitUntilFrontmost(
+            processID: target.processID,
+            attempts: Self.workspaceActivationAttempts
+        ) {
+            return
         }
         throw CaptureFailure.applicationActivationTimedOut
     }
 
+    private struct ActivationTarget: Sendable {
+        let processID: pid_t
+        let bundleURL: URL?
+    }
+
     @MainActor
-    private static func requestActivation(
+    private static func activationTarget(
         application: ApplicationIdentity,
         requiredProcessID: pid_t?
-    ) async throws -> pid_t {
+    ) throws -> ActivationTarget {
         let running = NSRunningApplication.runningApplications(
             withBundleIdentifier: application.bundleIdentifier
         ).filter {
-            requiredProcessID == nil || $0.processIdentifier == requiredProcessID
+            !$0.isTerminated
+                && (requiredProcessID == nil || $0.processIdentifier == requiredProcessID)
         }
         guard !running.isEmpty else {
             throw CaptureFailure.approvedApplicationNotRunning
@@ -347,28 +357,90 @@ public struct WindowCapture: Sendable {
         }) else {
             throw CaptureFailure.signingIdentifierMismatch
         }
-        _ = candidate.unhide()
-        _ = candidate.activate(options: [.activateAllWindows])
-        raiseAccessibilityWindows(processID: candidate.processIdentifier)
-        guard let bundleURL = candidate.bundleURL else {
-            throw CaptureFailure.applicationActivationRejected
+        return ActivationTarget(
+            processID: candidate.processIdentifier,
+            bundleURL: candidate.bundleURL
+        )
+    }
+
+    private static func waitUntilFrontmost(
+        processID: pid_t,
+        attempts: Int
+    ) async throws -> Bool {
+        for attempt in 0 ..< attempts {
+            let isFrontmost = await MainActor.run {
+                Self.isProcessFrontmost(processID)
+            }
+            if isFrontmost { return true }
+            if attempt > 0, attempt.isMultiple(of: 10) {
+                await MainActor.run {
+                    requestProcessActivation(processID: processID)
+                }
+            }
+            try await Task.sleep(for: .milliseconds(50))
         }
+        return false
+    }
+
+    @MainActor
+    private static func requestWorkspaceActivation(at bundleURL: URL) {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
-        let activated: NSRunningApplication
-        do {
-            activated = try await NSWorkspace.shared.openApplication(
-                at: bundleURL,
-                configuration: configuration
-            )
-        } catch {
-            throw CaptureFailure.applicationActivationRejected
+        NSWorkspace.shared.openApplication(
+            at: bundleURL,
+            configuration: configuration
+        ) { _, _ in }
+    }
+
+    @MainActor
+    static func isFrontmost(
+        application: ApplicationIdentity,
+        requiredProcessID: pid_t?
+    ) -> Bool {
+        let candidates = NSRunningApplication.runningApplications(
+            withBundleIdentifier: application.bundleIdentifier
+        ).filter {
+            !$0.isTerminated
+                && (requiredProcessID == nil || $0.processIdentifier == requiredProcessID)
+                && signingIdentifier(for: $0) == application.signingIdentifier
         }
-        guard activated.processIdentifier == candidate.processIdentifier else {
-            throw CaptureFailure.applicationActivationRejected
+        guard candidates.count == 1, let candidate = candidates.first else { return false }
+        return isProcessFrontmost(candidate.processIdentifier)
+    }
+
+    @MainActor
+    private static func isProcessFrontmost(_ processID: pid_t) -> Bool {
+        guard let application = NSRunningApplication(processIdentifier: processID),
+              !application.isTerminated
+        else {
+            return false
         }
-        return candidate.processIdentifier
+        // NSWorkspace's cached frontmost application can lag in an XPC service that
+        // has no NSApplication event loop. NSRunningApplication.isActive reflects the
+        // process activation state directly and avoids reporting a successful switch
+        // as a timeout.
+        return application.isActive
+            || NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
+    }
+
+    @MainActor
+    private static func requestProcessActivation(processID: pid_t) {
+        guard let application = NSRunningApplication(processIdentifier: processID) else { return }
+        _ = application.unhide()
+        _ = application.activate(options: [.activateAllWindows])
+        requestAccessibilityActivation(processID: processID)
+    }
+
+    @MainActor
+    private static func requestAccessibilityActivation(processID: pid_t) {
+        let accessibilityApplication = AXUIElementCreateApplication(processID)
+        _ = AXUIElementSetAttributeValue(
+            accessibilityApplication,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        raiseAccessibilityWindows(processID: processID)
     }
 
     private static func raiseAccessibilityWindows(processID: pid_t) {
@@ -467,30 +539,7 @@ public struct WindowCapture: Sendable {
     }
 
     private static func signingIdentifier(for application: NSRunningApplication) -> String? {
-        guard let bundleURL = application.bundleURL else { return nil }
-        var staticCode: SecStaticCode?
-        guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode) == errSecSuccess,
-              let staticCode
-        else {
-            return nil
-        }
-        let validationFlags = SecCSFlags(
-            rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures
-        )
-        guard SecStaticCodeCheckValidity(staticCode, validationFlags, nil) == errSecSuccess else {
-            return nil
-        }
-        var information: CFDictionary?
-        guard SecCodeCopySigningInformation(
-            staticCode,
-            SecCSFlags(rawValue: kSecCSSigningInformation),
-            &information
-        ) == errSecSuccess,
-            let values = information as? [String: Any]
-        else {
-            return nil
-        }
-        return values[kSecCodeInfoIdentifier as String] as? String
+        RunningCodeIdentity.signingIdentifier(processID: application.processIdentifier)
     }
 
     static func displayFingerprint(_ displays: [SCDisplay], selected: SCDisplay) -> String {

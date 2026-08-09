@@ -1,4 +1,5 @@
 import DeviceIPC
+import DeviceSecurity
 import Foundation
 
 public actor NetworkBrokerDiscoveryCoordinator {
@@ -7,6 +8,7 @@ public actor NetworkBrokerDiscoveryCoordinator {
     private let outboundPolicyChecker: any OutboundNetworkPolicyChecking
     private var pendingSession: ControlPlaneDeviceSession?
     private var activeSession: ControlPlaneDeviceSession?
+    private var rotatingBinding: DeviceSessionBinding?
 
     public init(
         credentialLoader: any NetworkBrokerCredentialLoading,
@@ -20,7 +22,7 @@ public actor NetworkBrokerDiscoveryCoordinator {
     }
 
     public func nextPendingSession(now: Date = Date()) async throws -> BrokerPendingSession? {
-        guard activeSession == nil else { return nil }
+        guard activeSession == nil, rotatingBinding == nil else { return nil }
         let credential = try credentialLoader.loadCredential(now: now)
         let client = try NetworkBrokerControlPlaneClient(
             credential: credential,
@@ -28,7 +30,7 @@ public actor NetworkBrokerDiscoveryCoordinator {
             now: now
         )
         let inbox = try await client.deviceInbox(now: now)
-        guard activeSession == nil else { return nil }
+        guard activeSession == nil, rotatingBinding == nil else { return nil }
         if let pendingSession,
            let refreshed = inbox.first(where: { $0.id == pendingSession.id })
         {
@@ -260,6 +262,67 @@ public actor NetworkBrokerDiscoveryCoordinator {
             binding: renewed.binding,
             leaseUntil: leaseUntil,
             approvals: configuration.approvals
+        )
+    }
+
+    public func rotate(
+        _ configuration: ExecutorSessionConfiguration,
+        now: Date = Date()
+    ) async throws -> ExecutorSessionConfiguration {
+        try configuration.validate(now: now)
+        guard let activeSession,
+              activeSession.binding == configuration.binding,
+              activeSession.leaseUntil == configuration.leaseUntil,
+              rotatingBinding == nil
+        else {
+            throw NetworkBrokerControlPlaneFailure.bindingMismatch
+        }
+        rotatingBinding = configuration.binding
+        defer {
+            if rotatingBinding == configuration.binding {
+                rotatingBinding = nil
+            }
+        }
+        let credential = try credentialLoader.loadCredential(now: now)
+        try await verifyOutboundPolicy(credential: credential, now: now)
+        let client = try NetworkBrokerControlPlaneClient(
+            credential: credential,
+            transport: transport,
+            now: now
+        )
+        let pending = try await client.abort(activeSession, reason: .disconnect, now: now)
+        self.activeSession = nil
+        let connected = try await client.markDeviceConnected(pending, now: now)
+        pendingSession = connected
+        let approvals = configuration.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: $0.controlLevel,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: connected.generation
+            )
+        }
+        let decision = BrokerApprovalDecision(
+            binding: connected.binding,
+            approvals: approvals,
+            result: .allowed
+        )
+        let renewed = try await approve(
+            connected,
+            decision: decision,
+            client: client,
+            now: now
+        )
+        guard let leaseUntil = renewed.leaseUntil else {
+            throw NetworkBrokerControlPlaneFailure.invalidResponse
+        }
+        pendingSession = nil
+        self.activeSession = renewed
+        return ExecutorSessionConfiguration(
+            binding: renewed.binding,
+            leaseUntil: leaseUntil,
+            approvals: approvals,
+            capabilities: configuration.capabilities
         )
     }
 

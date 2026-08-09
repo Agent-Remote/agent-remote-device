@@ -131,7 +131,23 @@ public final class ActionExecutor {
                 windowID: context.windowID,
                 application: context.application
             )
+            let requiresEditableFocus = if case .press = action {
+                accessibility.isEditableTextTarget(target)
+            } else {
+                false
+            }
             try accessibility.perform(action, target: target)
+            if requiresEditableFocus {
+                var focused = false
+                for _ in 0 ..< 10 {
+                    if try accessibility.focusEditableTextTarget(target) {
+                        focused = true
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(25))
+                }
+                guard focused else { throw AccessibilityFailure.operationFailed }
+            }
             try await guardState.accept(sequence: sequence)
         } catch {
             releasePressedState()
@@ -262,10 +278,10 @@ public final class ActionExecutor {
         _ context: WindowContext,
         requireExactFrame: Bool = false
     ) async throws -> String {
-        guard let frontmost = NSWorkspace.shared.frontmostApplication,
-              frontmost.processIdentifier == context.processID,
-              frontmost.bundleIdentifier == context.application.bundleIdentifier
-        else {
+        guard WindowCapture.isFrontmost(
+            application: context.application,
+            requiredProcessID: context.processID
+        ) else {
             throw ExecutionFailure.applicationChanged
         }
         let content = try await SCShareableContent.excludingDesktopWindows(
@@ -296,7 +312,7 @@ public final class ActionExecutor {
         case let .type(text):
             try typeText(text, processID: processID)
         case let .key(key):
-            try postKey(key)
+            try postKey(key, processID: processID)
         case let .holdKey(key, durationMilliseconds):
             let parsed = try KeyParser.parse(key)
             guard let down = CGEvent(
@@ -395,7 +411,7 @@ public final class ActionExecutor {
         case let .type(text):
             try typeText(text, processID: capture.processID)
         case let .key(key):
-            try postKey(key)
+            try postKey(key, processID: capture.processID)
         case let .holdKey(key, durationMilliseconds):
             let parsed = try KeyParser.parse(key)
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: true) else {
@@ -514,19 +530,95 @@ public final class ActionExecutor {
         } else {
             nil
         }
+        var labelValue: CFTypeRef?
+        let label: String? = if AXUIElementCopyAttributeValue(
+            focused,
+            kAXDescriptionAttribute as CFString,
+            &labelValue
+        ) == .success {
+            labelValue as? String
+        } else {
+            nil
+        }
+        var roleValue: CFTypeRef?
+        let role: String = if AXUIElementCopyAttributeValue(
+            focused,
+            kAXRoleAttribute as CFString,
+            &roleValue
+        ) == .success {
+            roleValue as? String ?? "AXUnknown"
+        } else {
+            "AXUnknown"
+        }
+        let normalizedPlaceholder = AccessibilityTextNormalization.placeholder(
+            placeholder,
+            value: current,
+            label: label,
+            role: role,
+            isSettable: settable.boolValue
+        )
+        let selectedRange = selectedTextRange(focused)
         return AXUIElementSetAttributeValue(
             focused,
             kAXValueAttribute as CFString,
-            Self.insertionValue(current: current, placeholder: placeholder, text: text) as CFString
+            Self.insertionValue(
+                current: current,
+                placeholder: normalizedPlaceholder,
+                text: text,
+                selectedRange: selectedRange
+            ) as CFString
         ) == .success
     }
 
-    static func insertionValue(current: String, placeholder: String?, text: String) -> String {
-        let base = current == placeholder ? "" : current
-        return base + text
+    private func selectedTextRange(_ element: AXUIElement) -> NSRange? {
+        var rawValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            &rawValue
+        ) == .success,
+            let rawValue,
+            CFGetTypeID(rawValue) == AXValueGetTypeID()
+        else {
+            return nil
+        }
+        let value = rawValue as! AXValue
+        guard AXValueGetType(value) == .cfRange else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(value, .cfRange, &range) else { return nil }
+        return NSRange(location: range.location, length: range.length)
     }
 
-    private func postKey(_ value: String) throws {
+    static func insertionValue(current: String, placeholder: String?, text: String) -> String {
+        insertionValue(
+            current: current,
+            placeholder: placeholder,
+            text: text,
+            selectedRange: nil
+        )
+    }
+
+    static func insertionValue(
+        current: String,
+        placeholder: String?,
+        text: String,
+        selectedRange: NSRange?
+    ) -> String {
+        let base = AccessibilityTextNormalization.value(
+            current,
+            placeholder: placeholder
+        ) ?? ""
+        guard let selectedRange else { return base + text }
+        let utf16Length = (base as NSString).length
+        guard selectedRange.location <= utf16Length,
+              selectedRange.length <= utf16Length - selectedRange.location
+        else {
+            return base + text
+        }
+        return (base as NSString).replacingCharacters(in: selectedRange, with: text)
+    }
+
+    private func postKey(_ value: String, processID: pid_t) throws {
         let parsed = try KeyParser.parse(value)
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: true),
               let up = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: false)
@@ -535,8 +627,8 @@ public final class ActionExecutor {
         }
         down.flags = parsed.flags
         up.flags = parsed.flags
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        down.postToPid(processID)
+        up.postToPid(processID)
     }
 }
 
@@ -554,7 +646,7 @@ enum KeyParser {
         var flags: CGEventFlags = []
         for modifier in components.dropLast() {
             switch modifier {
-            case "CMD", "COMMAND": flags.insert(.maskCommand)
+            case "CMD", "COMMAND", "SUPER": flags.insert(.maskCommand)
             case "CTRL", "CONTROL": flags.insert(.maskControl)
             case "ALT", "OPTION": flags.insert(.maskAlternate)
             case "SHIFT": flags.insert(.maskShift)

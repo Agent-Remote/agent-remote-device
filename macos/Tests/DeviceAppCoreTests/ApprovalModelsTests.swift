@@ -561,6 +561,40 @@ import Testing
 }
 
 @MainActor
+@Test func staleApprovalBindingAutomaticallyReturnsToSessionSelection() async throws {
+    let events = EventRecorder()
+    let model = DeviceAppModel(
+        visibilityController: RecordingVisibilityController(events: events),
+        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
+        permissionsGranted: { true }
+    )
+    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
+    let replacement = sessionCandidate(displayName: "Replacement")
+    model.presentApproval(try ApprovalPresentation(
+        generation: 1,
+        applications: [browser],
+        hiddenApplicationCount: 0
+    ))
+    model.applicationSelections = [browser.id]
+    model.onApprove = { _ in throw StaleSessionBindingError() }
+    model.onRefreshSessionCandidates = { [replacement] }
+
+    model.allowForSession()
+    for _ in 0 ..< 100 where model.state != .selectingSession
+        || model.isRefreshingSessionCandidates
+    {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    #expect(model.state == .selectingSession)
+    #expect(model.approvalPresentation == nil)
+    #expect(model.sessionCandidates == [replacement])
+    #expect(model.failureMessage == nil)
+    #expect(model.failureRecovery == nil)
+    #expect(events.values().contains("restore"))
+}
+
+@MainActor
 @Test func infrastructureFailureCanReconnectAndReturnToSessions() async throws {
     let model = DeviceAppModel(permissionsGranted: { true })
     model.onReconnect = { true }
@@ -757,6 +791,10 @@ private final class RecordingVisibilityController: WorkspaceVisibilityControllin
 
 private enum VisibilityTestFailure: Error {
     case restore
+}
+
+private struct StaleSessionBindingError: DeviceAppErrorCodeProviding {
+    let deviceErrorCode = "session_binding_changed"
 }
 
 @MainActor

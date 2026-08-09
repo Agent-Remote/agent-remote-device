@@ -60,11 +60,15 @@ enum LocalApplicationDiscovery {
                 withBundleIdentifier: approval.application.bundleIdentifier
             )
             return applications.first(where: { application in
-                signingIdentifier(for: application) == approval.application.signingIdentifier
-                    && (approval.application.bundleIdentifier.caseInsensitiveCompare(target)
+                guard approval.application.bundleIdentifier.caseInsensitiveCompare(target)
                         == .orderedSame
                         || application.localizedName?.caseInsensitiveCompare(target)
-                        == .orderedSame)
+                        == .orderedSame
+                else {
+                    return false
+                }
+                return signingIdentifier(for: application)
+                    == approval.application.signingIdentifier
             })
         }
         guard matches.count == 1, let application = matches.first,
@@ -72,7 +76,7 @@ enum LocalApplicationDiscovery {
         else {
             throw DeviceIPCFailure.invalidMessage
         }
-        requestActivation(application)
+        requestWorkspaceActivation(at: bundleURL)
         for attempt in 0 ..< 20 {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier
                 == application.processIdentifier
@@ -80,23 +84,13 @@ enum LocalApplicationDiscovery {
                 return
             }
             if attempt == 10 {
-                requestActivation(application)
+                requestAccessibilityActivation(application)
             }
             try await Task.sleep(for: .milliseconds(50))
         }
 
-        // Some applications ignore the lightweight activation request. Reopening the
-        // existing bundle is a bounded fallback, not the common switching path.
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        configuration.addsToRecentItems = false
-        let activated = try await NSWorkspace.shared.openApplication(
-            at: bundleURL,
-            configuration: configuration
-        )
-        guard activated.processIdentifier == application.processIdentifier else {
-            throw DeviceIPCFailure.serviceUnavailable
-        }
+        // Reissue the non-blocking workspace request before the longer fallback window.
+        requestWorkspaceActivation(at: bundleURL)
         for attempt in 0 ..< 80 {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier
                 == application.processIdentifier
@@ -104,7 +98,7 @@ enum LocalApplicationDiscovery {
                 return
             }
             if attempt.isMultiple(of: 10) {
-                requestActivation(application)
+                requestAccessibilityActivation(application)
             }
             try await Task.sleep(for: .milliseconds(50))
         }
@@ -112,9 +106,19 @@ enum LocalApplicationDiscovery {
     }
 
     @MainActor
-    private static func requestActivation(_ application: NSRunningApplication) {
+    private static func requestWorkspaceActivation(at bundleURL: URL) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        NSWorkspace.shared.openApplication(
+            at: bundleURL,
+            configuration: configuration
+        ) { _, _ in }
+    }
+
+    @MainActor
+    private static func requestAccessibilityActivation(_ application: NSRunningApplication) {
         _ = application.unhide()
-        _ = application.activate(options: [.activateAllWindows])
 
         let accessibilityApplication = AXUIElementCreateApplication(
             application.processIdentifier

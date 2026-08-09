@@ -138,11 +138,80 @@ impl Action {
 }
 
 fn valid_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= 64
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+' | b' ' | b'-'))
+    if key.is_empty() || key.len() > 64 {
+        return false;
+    }
+    let parts = key.split('+').collect::<Vec<_>>();
+    let Some((key_name, modifiers)) = parts.split_last() else {
+        return false;
+    };
+    if modifiers.iter().any(|modifier| {
+        !matches!(
+            modifier.to_ascii_uppercase().as_str(),
+            "CMD" | "COMMAND" | "SUPER" | "CTRL" | "CONTROL" | "ALT" | "OPTION" | "SHIFT"
+        )
+    }) {
+        return false;
+    }
+    matches!(
+        key_name.to_ascii_uppercase().as_str(),
+        "A" | "S"
+            | "D"
+            | "F"
+            | "H"
+            | "G"
+            | "Z"
+            | "X"
+            | "C"
+            | "V"
+            | "B"
+            | "Q"
+            | "W"
+            | "E"
+            | "R"
+            | "Y"
+            | "T"
+            | "1"
+            | "2"
+            | "3"
+            | "4"
+            | "6"
+            | "5"
+            | "="
+            | "9"
+            | "7"
+            | "-"
+            | "8"
+            | "0"
+            | "]"
+            | "O"
+            | "U"
+            | "["
+            | "I"
+            | "P"
+            | "L"
+            | "J"
+            | "'"
+            | "K"
+            | ";"
+            | "\\"
+            | ","
+            | "/"
+            | "N"
+            | "M"
+            | "."
+            | "TAB"
+            | "SPACE"
+            | "DELETE"
+            | "ESC"
+            | "ESCAPE"
+            | "RETURN"
+            | "ENTER"
+            | "LEFT"
+            | "RIGHT"
+            | "DOWN"
+            | "UP"
+    )
 }
 
 #[cfg(test)]
@@ -150,6 +219,18 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn key_validation_accepts_mac_parser_punctuation() {
+        for key in [
+            "CMD+[", "CMD+]", "CMD+\\", "CMD+'", "CMD+;", "CMD+,", "CMD+/", "CMD+.",
+        ] {
+            assert!(valid_key(key), "expected {key} to be accepted");
+        }
+        assert!(valid_key("SUPER+["));
+        assert!(!valid_key("CMD+`"));
+        assert!(!valid_key("not/a/key"));
+    }
 
     #[test]
     fn cross_language_valid_vector_decodes() {

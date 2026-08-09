@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -42,13 +42,21 @@ use crate::{
 const MAX_CONTEXT_BYTES: u64 = 16 * 1024;
 const MAX_BRIDGE_CONTROL_BYTES: usize = 4096;
 const BRIDGE_PROTOCOL_VERSION: u8 = 1;
-const MAX_ACTION_RESPONSE_WAIT: Duration = Duration::from_secs(30);
+// A generation rotation closes the old relay before the device publishes the
+// replacement context. The control-plane exchange is bounded, but can take
+// several seconds when the server is reconnecting both relay peers.
+const MAX_ACTION_RESPONSE_WAIT: Duration = Duration::from_secs(60);
 const LIFECYCLE_RESPONSE_WAIT: Duration = Duration::from_secs(15);
-const ACTION_CONTEXT_READY_WAIT: Duration = Duration::from_secs(180);
+const INITIAL_ACTION_CONTEXT_READY_WAIT: Duration = Duration::from_secs(60);
+// Keep the MCP call alive across a bounded generation-rotation window. Ten
+// seconds was shorter than the control-plane reconnect sequence and surfaced
+// transient rotation as a permanent `context open failed` error.
+const RECOVERY_ACTION_CONTEXT_READY_WAIT: Duration = Duration::from_secs(45);
 const BACKGROUND_CONTEXT_READY_WAIT: Duration = Duration::from_secs(10);
 const ACTION_LEASE_READY_WAIT: Duration = Duration::from_secs(15);
 const MIN_ACTION_LEASE_REMAINING: Duration = Duration::from_secs(30);
 const CONTEXT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_SAME_GENERATION_RECONNECTS: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -201,14 +209,15 @@ pub struct ActivatedUnixDeviceTransport {
     managed_context_path: Arc<Path>,
     bridge_socket_path: Arc<Path>,
     active: Mutex<Option<(ManagedContext, Arc<UnixDeviceTransport>)>>,
+    failed_generation: Mutex<Option<(Uuid, u64)>>,
 }
 
 #[derive(Debug)]
 struct TransportState {
     context: ManagedContext,
     state_id: Option<Uuid>,
-    model_ax_base_state_id: Option<Uuid>,
-    model_ax_base_context: Option<(String, u32, String)>,
+    state_context: Option<(String, u32, String)>,
+    model_ax_bases: BTreeMap<(String, u32, String), Uuid>,
     poisoned: bool,
     pending_request: Option<PendingRequest>,
     last_completed_response_binding: Option<ResponseBinding>,
@@ -355,6 +364,8 @@ pub enum TransportError {
     UnsafeContextFile,
     #[error("managed device control is not active")]
     NotActivated,
+    #[error("device relay generation did not rotate after the prior transport failure")]
+    GenerationRecoveryTimedOut,
     #[error("the active device session does not support token-efficient observations")]
     CapabilityUnavailable,
     #[error("managed context is invalid")]
@@ -365,6 +376,8 @@ pub enum TransportError {
     Poisoned,
     #[error("device response does not match the request binding")]
     ResponseBinding,
+    #[error("device response failed protocol validation: {0}")]
+    ResponseValidation(&'static str),
     #[error("device rejected the action: {0}")]
     DeviceRejected(String),
     #[error("device frame exceeds the protocol limit")]
@@ -403,14 +416,35 @@ pub enum TransportError {
     NestedTls(#[from] NestedTlsError),
 }
 
+impl TransportError {
+    /// Returns the stable MCP-facing error classification while retaining the
+    /// concrete transport diagnostic for logs and troubleshooting.
+    pub fn client_message(&self) -> String {
+        if matches!(
+            self,
+            Self::GenerationRecoveryTimedOut
+                | Self::Poisoned
+                | Self::OperationTimedOut
+                | Self::BridgeConnect(_)
+                | Self::BridgeHandshakeIo { .. }
+                | Self::TlsHandshakeIo(_)
+                | Self::ChannelIo { .. }
+        ) {
+            format!("transport_unavailable: {self}")
+        } else {
+            self.to_string()
+        }
+    }
+}
+
 impl UnixDeviceTransport {
     pub fn new(socket_path: &Path, context: ManagedContext) -> Self {
         Self {
             socket_path: Arc::from(socket_path),
             state: Mutex::new(TransportState {
                 state_id: None,
-                model_ax_base_state_id: None,
-                model_ax_base_context: None,
+                state_context: None,
+                model_ax_bases: BTreeMap::new(),
                 context,
                 poisoned: false,
                 pending_request: None,
@@ -619,6 +653,7 @@ impl ActivatedUnixDeviceTransport {
             managed_context_path: Arc::from(managed_context_path),
             bridge_socket_path: Arc::from(bridge_socket_path),
             active: Mutex::new(None),
+            failed_generation: Mutex::new(None),
         }
     }
 
@@ -664,6 +699,35 @@ impl ActivatedUnixDeviceTransport {
         *active = Some((context, Arc::clone(&transport)));
         Ok(transport)
     }
+
+    async fn action_context(&self) -> Result<ManagedContext, TransportError> {
+        let failed_generation = *self.failed_generation.lock().await;
+        let has_active = self.active.lock().await.is_some();
+        let context = load_action_context(
+            &self.managed_context_path,
+            action_context_ready_wait(has_active),
+            failed_generation,
+        )
+        .await?;
+        if failed_generation.is_some() {
+            let mut failed = self.failed_generation.lock().await;
+            if *failed == failed_generation {
+                *failed = None;
+            }
+        }
+        Ok(context)
+    }
+
+    async fn record_transport_failure(
+        &self,
+        context: &ManagedContext,
+        result: &Result<impl Sized, TransportError>,
+    ) {
+        if result.as_ref().is_err_and(replayable_exchange_error) {
+            *self.failed_generation.lock().await =
+                Some((context.device_session_id, context.generation));
+        }
+    }
 }
 
 async fn load_managed_context(
@@ -687,8 +751,23 @@ async fn load_managed_context(
     }
 }
 
-async fn load_action_context(path: &Path) -> Result<ManagedContext, TransportError> {
-    let mut context = load_managed_context(path, ACTION_CONTEXT_READY_WAIT).await?;
+async fn load_action_context(
+    path: &Path,
+    ready_wait: Duration,
+    failed_generation: Option<(Uuid, u64)>,
+) -> Result<ManagedContext, TransportError> {
+    let generation_deadline = Instant::now() + ready_wait;
+    let mut context = load_managed_context(path, ready_wait).await?;
+    while failed_generation
+        .is_some_and(|value| value == (context.device_session_id, context.generation))
+    {
+        let wait = generation_deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Err(TransportError::GenerationRecoveryTimedOut);
+        }
+        sleep(CONTEXT_RETRY_INTERVAL.min(wait)).await;
+        context = load_managed_context(path, wait).await?;
+    }
     let deadline = Instant::now() + ACTION_LEASE_READY_WAIT;
     loop {
         if action_lease_ready(&context, Utc::now()) {
@@ -699,7 +778,15 @@ async fn load_action_context(path: &Path) -> Result<ManagedContext, TransportErr
             return Err(TransportError::LeaseExpired);
         }
         sleep(CONTEXT_RETRY_INTERVAL.min(wait)).await;
-        context = ManagedContext::load(path)?;
+        context = load_managed_context(path, wait).await?;
+    }
+}
+
+fn action_context_ready_wait(has_active_transport: bool) -> Duration {
+    if has_active_transport {
+        RECOVERY_ACTION_CONTEXT_READY_WAIT
+    } else {
+        INITIAL_ACTION_CONTEXT_READY_WAIT
     }
 }
 
@@ -783,70 +870,71 @@ async fn exchange_payload_with_replay(
     max_attempt_wait: Duration,
     expected_binding: ResponseBinding,
 ) -> Result<(Vec<u8>, u16), ExchangeFailure> {
-    let first_wait =
-        remaining_exchange_wait(state, max_attempt_wait).map_err(|error| ExchangeFailure {
-            error,
-            request_started: false,
-        })?;
-    let mut first_phase = ExchangePhase::PreRequest;
-    let first_error = match timeout(
-        first_wait,
-        exchange_expected_payload(
-            socket_path,
-            state,
-            payload,
-            &mut first_phase,
-            expected_binding,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(response)) => return Ok((response, 0)),
-        Ok(Err(error)) if replayable_exchange_error(&error) => error,
-        Ok(Err(error)) => {
-            return Err(ExchangeFailure {
-                error,
-                request_started: matches!(first_phase, ExchangePhase::RequestStarted),
-            })
-        }
-        Err(_) => TransportError::OperationTimedOut,
-    };
+    let deadline = Instant::now() + max_attempt_wait;
+    let mut retry_count = 0_u16;
+    let mut request_started = false;
+    let mut first_error = None;
 
-    // The request may already have executed. Reconnect and replay the exact bytes so the
-    // device can return its cached response without repeating input.
-    state.connection = None;
-    let retry_wait = match remaining_exchange_wait(state, max_attempt_wait) {
-        Ok(wait) => wait,
-        Err(_) => {
+    loop {
+        let deadline_wait = deadline.saturating_duration_since(Instant::now());
+        let attempt_wait = match remaining_exchange_wait(state, deadline_wait) {
+            Ok(wait) => wait,
+            Err(error) => {
+                return Err(ExchangeFailure {
+                    error: first_error.unwrap_or(error),
+                    request_started,
+                })
+            }
+        };
+        if attempt_wait.is_zero() {
             return Err(ExchangeFailure {
-                error: first_error,
-                request_started: matches!(first_phase, ExchangePhase::RequestStarted),
-            })
+                error: first_error.unwrap_or(TransportError::OperationTimedOut),
+                request_started,
+            });
         }
-    };
-    let mut retry_phase = ExchangePhase::PreRequest;
-    let result = match timeout(
-        retry_wait,
-        exchange_expected_payload(
-            socket_path,
-            state,
-            payload,
-            &mut retry_phase,
-            expected_binding,
-        ),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(TransportError::OperationTimedOut),
-    };
-    result
-        .map(|response| (response, 1))
-        .map_err(|error| ExchangeFailure {
-            error,
-            request_started: matches!(first_phase, ExchangePhase::RequestStarted)
-                || matches!(retry_phase, ExchangePhase::RequestStarted),
-        })
+
+        let mut phase = ExchangePhase::PreRequest;
+        let result = match timeout(
+            attempt_wait,
+            exchange_expected_payload(socket_path, state, payload, &mut phase, expected_binding),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TransportError::OperationTimedOut),
+        };
+        request_started |= matches!(phase, ExchangePhase::RequestStarted);
+        match result {
+            Ok(response) => return Ok((response, retry_count)),
+            Err(error) if replayable_exchange_error(&error) => {
+                first_error.get_or_insert(error);
+                state.connection = None;
+            }
+            Err(error) => {
+                return Err(ExchangeFailure {
+                    error,
+                    request_started,
+                })
+            }
+        }
+
+        let retry_wait = deadline.saturating_duration_since(Instant::now());
+        if retry_wait.is_zero() {
+            return Err(ExchangeFailure {
+                error: first_error.unwrap_or(TransportError::OperationTimedOut),
+                request_started,
+            });
+        }
+        retry_count = retry_count.saturating_add(1);
+        if retry_count > MAX_SAME_GENERATION_RECONNECTS {
+            return Err(ExchangeFailure {
+                error: first_error.unwrap_or(TransportError::OperationTimedOut),
+                request_started,
+            });
+        }
+        let backoff = CONTEXT_RETRY_INTERVAL.saturating_mul(1_u32 << (retry_count - 1));
+        sleep(backoff.min(retry_wait)).await;
+    }
 }
 
 async fn exchange_expected_payload(
@@ -921,14 +1009,16 @@ fn replayable_exchange_error(error: &TransportError) -> bool {
 #[async_trait]
 impl DeviceTransport for ActivatedUnixDeviceTransport {
     async fn supports_v2(&self) -> Result<bool, TransportError> {
-        let context = load_action_context(&self.managed_context_path).await?;
+        let context = self.action_context().await?;
         Ok(supports_v2(&context.capabilities))
     }
 
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError> {
-        let context = load_action_context(&self.managed_context_path).await?;
-        let transport = self.transport_for_context(context).await?;
-        transport.execute(action).await
+        let context = self.action_context().await?;
+        let transport = self.transport_for_context(context.clone()).await?;
+        let result = transport.execute(action).await;
+        self.record_transport_failure(&context, &result).await;
+        result
     }
 
     async fn execute_v2(
@@ -936,9 +1026,11 @@ impl DeviceTransport for ActivatedUnixDeviceTransport {
         action: ActionV2,
         observation: ObservationPolicy,
     ) -> Result<DeviceResultV2, TransportError> {
-        let context = load_action_context(&self.managed_context_path).await?;
-        let transport = self.transport_for_context(context).await?;
-        transport.execute_v2(action, observation).await
+        let context = self.action_context().await?;
+        let transport = self.transport_for_context(context.clone()).await?;
+        let result = transport.execute_v2(action, observation).await;
+        self.record_transport_failure(&context, &result).await;
+        result
     }
 }
 
@@ -1027,6 +1119,38 @@ impl DeviceTransport for UnixDeviceTransport {
             poison(&mut state);
             return Err(TransportError::CounterExhausted);
         }
+        let element_base_state_id = match &action {
+            ActionV2::Press { target }
+            | ActionV2::SetValue { target, .. }
+            | ActionV2::SelectText { target, .. }
+            | ActionV2::ScrollElement { target, .. }
+            | ActionV2::SecondaryAction { target, .. } => Some(target.state_id),
+            _ => None,
+        };
+        let action_state_context = match &action {
+            ActionV2::Press { target }
+            | ActionV2::SetValue { target, .. }
+            | ActionV2::SelectText { target, .. }
+            | ActionV2::ScrollElement { target, .. }
+            | ActionV2::SecondaryAction { target, .. } => Some((
+                target.application_digest.clone(),
+                target.window_id,
+                target.display_fingerprint.clone(),
+            )),
+            ActionV2::Observe {
+                application: Some(_),
+            } => None,
+            _ => state.state_context.clone(),
+        };
+        let base_state_id = if matches!(observation.mode, ObservationMode::AxFull) {
+            None
+        } else {
+            element_base_state_id.or_else(|| {
+                action_state_context
+                    .as_ref()
+                    .and_then(|context| state.model_ax_bases.get(context).copied())
+            })
+        };
         let request = ActionRequestV2 {
             version: PROTOCOL_VERSION_V2,
             request_id: Uuid::new_v4(),
@@ -1041,11 +1165,7 @@ impl DeviceTransport for UnixDeviceTransport {
                 monotonic_sequence: state.context.next_sequence,
                 current_state_generation: state.context.current_state_generation,
                 current_screenshot_generation: state.context.current_screenshot_generation,
-                base_state_id: if matches!(observation.mode, ObservationMode::AxFull) {
-                    None
-                } else {
-                    state.model_ax_base_state_id
-                },
+                base_state_id,
             },
             lease_until: state.context.lease_until,
             observation,
@@ -1110,10 +1230,13 @@ fn apply_response_v2(
 ) -> Result<DeviceResultV2, TransportError> {
     if response.request_id != request.request_id
         || response.monotonic_sequence != request.context.monotonic_sequence
-        || !response.validate_payload(&request.observation)
     {
         poison(state);
         return Err(TransportError::ResponseBinding);
+    }
+    if let Err(reason) = response.validate_payload_reason(&request.observation) {
+        poison(state);
+        return Err(TransportError::ResponseValidation(reason));
     }
     state.last_completed_response_binding = Some(ResponseBinding {
         request_id: response.request_id,
@@ -1130,18 +1253,25 @@ fn apply_response_v2(
             || response.image.is_some()
         {
             poison(state);
-            return Err(TransportError::ResponseBinding);
+            return Err(TransportError::ResponseValidation(
+                "failed response contains state",
+            ));
         }
         return Err(TransportError::DeviceRejected(response.message));
     }
-    let expected_state_generation = request
-        .context
-        .current_state_generation
-        .checked_add(1)
-        .ok_or(TransportError::CounterExhausted)?;
+    let preserves_state = matches!(request.action, ActionV2::ReadClipboard);
+    let expected_state_generation = if preserves_state {
+        request.context.current_state_generation
+    } else {
+        request
+            .context
+            .current_state_generation
+            .checked_add(1)
+            .ok_or(TransportError::CounterExhausted)?
+    };
     let Some(state_id) = response.state_id else {
         poison(state);
-        return Err(TransportError::ResponseBinding);
+        return Err(TransportError::ResponseValidation("missing state_id"));
     };
     let (Some(application_digest), Some(window_id), Some(display_fingerprint)) = (
         response.application_digest.clone(),
@@ -1149,7 +1279,9 @@ fn apply_response_v2(
         response.display_fingerprint.clone(),
     ) else {
         poison(state);
-        return Err(TransportError::ResponseBinding);
+        return Err(TransportError::ResponseValidation(
+            "missing application or window context",
+        ));
     };
     if application_digest.len() != 64
         || !application_digest
@@ -1159,7 +1291,9 @@ fn apply_response_v2(
         || display_fingerprint.len() > 256
     {
         poison(state);
-        return Err(TransportError::ResponseBinding);
+        return Err(TransportError::ResponseValidation(
+            "invalid application or display context",
+        ));
     }
     let expected_screenshot_generation = if response.image.is_some() {
         request
@@ -1170,16 +1304,27 @@ fn apply_response_v2(
     } else {
         request.context.current_screenshot_generation
     };
-    if response.state_generation != expected_state_generation
-        || response.screenshot_generation != expected_screenshot_generation
-        || !valid_observation_binding(
-            response.observation.as_ref(),
-            response.base_state_id,
-            request.context.base_state_id,
-        )
-    {
+    if response.state_generation != expected_state_generation {
         poison(state);
-        return Err(TransportError::ResponseBinding);
+        return Err(TransportError::ResponseValidation("state generation"));
+    }
+    if preserves_state && state.state_id != Some(state_id) {
+        poison(state);
+        return Err(TransportError::ResponseValidation("preserved state id"));
+    }
+    if response.screenshot_generation != expected_screenshot_generation {
+        poison(state);
+        return Err(TransportError::ResponseValidation("screenshot generation"));
+    }
+    if !valid_observation_binding(
+        response.observation.as_ref(),
+        response.base_state_id,
+        request.context.base_state_id,
+    ) {
+        poison(state);
+        return Err(TransportError::ResponseValidation(
+            "accessibility base state",
+        ));
     }
     state.context.next_sequence += 1;
     state.context.current_state_generation = response.state_generation;
@@ -1190,12 +1335,9 @@ fn apply_response_v2(
         window_id,
         display_fingerprint.clone(),
     );
+    state.state_context = Some(response_context.clone());
     if response.observation.is_some() {
-        state.model_ax_base_state_id = Some(state_id);
-        state.model_ax_base_context = Some(response_context);
-    } else if state.model_ax_base_context.as_ref() != Some(&response_context) {
-        state.model_ax_base_state_id = None;
-        state.model_ax_base_context = None;
+        state.model_ax_bases.insert(response_context, state_id);
     }
     let screenshot = response.image.map(|image| ScreenshotV2 {
         base64_data: image.base64_data,
@@ -1556,6 +1698,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn action_context_waits_for_a_failed_generation_to_rotate() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("context.json");
+        let initial = test_context(4, Utc::now() + chrono::Duration::seconds(60));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create initial context");
+        serde_json::to_writer(&mut file, &initial).expect("write initial context");
+
+        let replacement_path = path.clone();
+        let mut rotated = initial.clone();
+        rotated.generation += 1;
+        let expected = rotated.clone();
+        let writer = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            let temporary = replacement_path.with_extension("next");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .expect("create rotated context");
+            serde_json::to_writer(&mut file, &rotated).expect("write rotated context");
+            std::fs::rename(temporary, replacement_path).expect("publish rotated context");
+        });
+
+        let loaded = load_action_context(
+            &path,
+            Duration::from_secs(1),
+            Some((initial.device_session_id, initial.generation)),
+        )
+        .await
+        .expect("rotated generation should become available");
+        assert_eq!(loaded, expected);
+        writer.await.expect("context writer");
+    }
+
+    #[tokio::test]
+    async fn action_context_tolerates_a_missing_file_during_generation_rotation() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("context.json");
+        let initial = test_context(4, Utc::now() + chrono::Duration::seconds(60));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create initial context");
+        serde_json::to_writer(&mut file, &initial).expect("write initial context");
+
+        let replacement_path = path.clone();
+        let mut rotated = initial.clone();
+        rotated.generation += 1;
+        let expected = rotated.clone();
+        let writer = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            std::fs::remove_file(&replacement_path).expect("remove old context");
+            sleep(Duration::from_millis(25)).await;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&replacement_path)
+                .expect("publish rotated context");
+            serde_json::to_writer(&mut file, &rotated).expect("write rotated context");
+        });
+
+        let loaded = load_action_context(
+            &path,
+            Duration::from_secs(1),
+            Some((initial.device_session_id, initial.generation)),
+        )
+        .await
+        .expect("temporary context absence should be absorbed by recovery");
+        assert_eq!(loaded, expected);
+        writer.await.expect("context writer");
+    }
+
+    #[tokio::test]
     async fn activated_transport_renews_without_resetting_action_state() {
         let directory = tempdir().expect("temp directory");
         let activated = ActivatedUnixDeviceTransport::new(
@@ -1663,6 +1887,28 @@ mod tests {
     }
 
     #[test]
+    fn transport_failures_have_a_stable_client_error_code() {
+        let error = TransportError::ChannelIo {
+            operation: "write length",
+            source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"),
+        };
+
+        assert_eq!(
+            error.client_message(),
+            "transport_unavailable: encrypted device channel write length failed: closed"
+        );
+        assert_eq!(
+            TransportError::GenerationRecoveryTimedOut.client_message(),
+            "transport_unavailable: device relay generation did not rotate after the prior transport failure"
+        );
+        assert_eq!(
+            TransportError::DeviceRejected("stale_state: observe again".to_owned())
+                .client_message(),
+            "device rejected the action: stale_state: observe again"
+        );
+    }
+
+    #[test]
     fn rejected_device_action_preserves_the_concrete_reason() {
         let error = TransportError::DeviceRejected(
             "screen_recording_permission_missing: grant access in System Settings".to_owned(),
@@ -1740,6 +1986,23 @@ mod tests {
     }
 
     #[test]
+    fn action_context_wait_is_shorter_after_activation() {
+        assert_eq!(
+            action_context_ready_wait(false),
+            INITIAL_ACTION_CONTEXT_READY_WAIT
+        );
+        assert_eq!(
+            action_context_ready_wait(true),
+            RECOVERY_ACTION_CONTEXT_READY_WAIT
+        );
+        assert!(
+            INITIAL_ACTION_CONTEXT_READY_WAIT + ACTION_LEASE_READY_WAIT + MAX_ACTION_RESPONSE_WAIT
+                < Duration::from_secs(180)
+        );
+        assert!(RECOVERY_ACTION_CONTEXT_READY_WAIT < INITIAL_ACTION_CONTEXT_READY_WAIT);
+    }
+
+    #[test]
     fn action_waits_for_a_lease_that_can_cover_transport_and_capture_work() {
         let now = Utc::now();
         let stale = test_context(1, now + chrono::Duration::seconds(29));
@@ -1750,7 +2013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_bridge_handshake_failures_allow_a_later_fresh_action() {
+    async fn repeated_bridge_handshake_failures_recover_within_the_same_action() {
         let directory = tempdir().expect("temp directory");
         let socket_path = directory.path().join("bridge.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind bridge socket");
@@ -1835,22 +2098,12 @@ mod tests {
         });
 
         let transport = UnixDeviceTransport::new(&socket_path, context);
-        assert!(matches!(
-            transport.execute(Action::Screenshot).await,
-            Err(TransportError::BridgeHandshakeIo { .. })
-        ));
-        {
-            let state = transport.state.lock().await;
-            assert!(!state.poisoned);
-            assert!(state.connection.is_none());
-            assert_eq!(state.context.next_sequence, 1);
-        }
-
         let result = transport
             .execute(Action::Screenshot)
             .await
-            .expect("fresh action after handshake failures");
+            .expect("same action should recover after handshake failures");
         assert_eq!(result.message, "recovered");
+        assert_eq!(result.retry_count, 2);
         let state = transport.state.lock().await;
         assert!(!state.poisoned);
         assert_eq!(state.context.next_sequence, 2);
@@ -1859,12 +2112,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_request_recovers_exact_replay_before_the_next_action() {
+    async fn ambiguous_request_recovers_exact_replay_within_the_same_action() {
         let directory = tempdir().expect("temp directory");
         let socket_path = directory.path().join("bridge.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind bridge socket");
         let context = test_context(11, Utc::now() + chrono::Duration::seconds(60));
         let server_context = context.clone();
+        let replacement_socket_path = socket_path.clone();
         let server = tokio::spawn(async move {
             let mut pending_request_id = None;
             for exporter_byte in [0x31, 0x32] {
@@ -1881,6 +2135,11 @@ mod tests {
                 drop(tls);
             }
 
+            drop(listener);
+            std::fs::remove_file(&replacement_socket_path).expect("remove old bridge socket");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let listener =
+                UnixListener::bind(&replacement_socket_path).expect("restore bridge socket");
             let mut tls = accept_test_tls(&listener, &server_context, 0x33).await;
             let recovered = read_framed_json(&mut tls).await;
             let recovered = &recovered["request"];
@@ -1917,22 +2176,18 @@ mod tests {
         });
 
         let transport = UnixDeviceTransport::new(&socket_path, context);
-        assert!(matches!(
-            transport.execute(Action::Screenshot).await,
-            Err(TransportError::ChannelIo { .. })
-        ));
-        {
-            let state = transport.state.lock().await;
-            assert!(!state.poisoned);
-            assert!(matches!(state.pending_request, Some(PendingRequest::V1(_))));
-            assert_eq!(state.context.next_sequence, 1);
-        }
-
         let result = transport
+            .execute(Action::Screenshot)
+            .await
+            .expect("exact replay should recover the original action");
+        assert_eq!(result.message, "pending recovered");
+        assert!(result.retry_count >= 2);
+
+        let next = transport
             .execute(Action::Wait { duration_ms: 1 })
             .await
-            .expect("fresh action after pending replay recovery");
-        assert_eq!(result.message, "next action completed");
+            .expect("fresh action after inline replay recovery");
+        assert_eq!(next.message, "next action completed");
         let state = transport.state.lock().await;
         assert!(!state.poisoned);
         assert!(state.pending_request.is_none());
@@ -2117,8 +2372,8 @@ mod tests {
         .collect();
         let server_context = context.clone();
         let state_id = Uuid::new_v4();
-        let state_id_after_none = Uuid::new_v4();
         let state_id_after_full = Uuid::new_v4();
+        let state_id_after_element = Uuid::new_v4();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept proxy");
             let hello: BridgeHello = read_bridge_control(&mut stream)
@@ -2220,14 +2475,14 @@ mod tests {
                 &serde_json::json!({
                     "request_id": second["request_id"],
                     "monotonic_sequence": 2,
-                    "state_generation": 2,
+                    "state_generation": 1,
                     "screenshot_generation": 0,
-                    "state_id": state_id_after_none,
+                    "state_id": state_id,
                     "application_digest": "a".repeat(64),
                     "window_id": 7,
                     "display_fingerprint": "display-layout",
                     "status": "success",
-                    "message": "Action completed.",
+                    "message": "clipboard text",
                     "settle": {"status": "not_requested", "elapsed_ms": 0}
                 }),
             )
@@ -2236,14 +2491,14 @@ mod tests {
             let third = read_framed_json(&mut tls).await;
             let third = &third["request"];
             assert_eq!(third["context"]["monotonic_sequence"], 3);
-            assert_eq!(third["context"]["current_state_generation"], 2);
+            assert_eq!(third["context"]["current_state_generation"], 1);
             assert_eq!(third["context"]["base_state_id"], state_id.to_string());
             write_framed_json(
                 &mut tls,
                 &serde_json::json!({
                     "request_id": third["request_id"],
                     "monotonic_sequence": 3,
-                    "state_generation": 2,
+                    "state_generation": 1,
                     "screenshot_generation": 0,
                     "status": "failed",
                     "message": "stale_element_target: observe again",
@@ -2255,7 +2510,7 @@ mod tests {
             let fourth = read_framed_json(&mut tls).await;
             let fourth = &fourth["request"];
             assert_eq!(fourth["context"]["monotonic_sequence"], 3);
-            assert_eq!(fourth["context"]["current_state_generation"], 2);
+            assert_eq!(fourth["context"]["current_state_generation"], 1);
             assert_eq!(fourth["context"]["base_state_id"], serde_json::Value::Null);
             assert_eq!(fourth["observation"]["mode"], "ax_full");
             write_framed_json(
@@ -2263,7 +2518,7 @@ mod tests {
                 &serde_json::json!({
                     "request_id": fourth["request_id"],
                     "monotonic_sequence": 3,
-                    "state_generation": 3,
+                    "state_generation": 2,
                     "screenshot_generation": 0,
                     "state_id": state_id_after_full,
                     "application_digest": "a".repeat(64),
@@ -2284,6 +2539,42 @@ mod tests {
                 }),
             )
             .await;
+
+            let fifth = read_framed_json(&mut tls).await;
+            let fifth = &fifth["request"];
+            assert_eq!(fifth["context"]["monotonic_sequence"], 4);
+            assert_eq!(fifth["context"]["current_state_generation"], 2);
+            assert_eq!(
+                fifth["context"]["base_state_id"],
+                state_id_after_full.to_string()
+            );
+            assert_eq!(fifth["action"]["type"], "press");
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": fifth["request_id"],
+                    "monotonic_sequence": 4,
+                    "state_generation": 3,
+                    "screenshot_generation": 0,
+                    "state_id": state_id_after_element,
+                    "application_digest": "b".repeat(64),
+                    "window_id": 8,
+                    "display_fingerprint": "other-display",
+                    "base_state_id": state_id_after_full,
+                    "status": "success",
+                    "message": "Action completed.",
+                    "observation": {
+                        "kind": "diff",
+                        "reset": false,
+                        "truncated": false,
+                        "nodes": [],
+                        "removed": []
+                    },
+                    "settle": {"status": "settled", "elapsed_ms": 10},
+                    "image": null
+                }),
+            )
+            .await;
         });
 
         let transport = UnixDeviceTransport::new(&socket_path, context);
@@ -2298,9 +2589,9 @@ mod tests {
         assert_eq!(first.state_generation, 1);
         assert_eq!(first.screenshot_generation, 0);
 
-        let after_none = transport
+        let after_clipboard = transport
             .execute_v2(
-                ActionV2::Observe { application: None },
+                ActionV2::ReadClipboard,
                 ObservationPolicy {
                     mode: ObservationMode::None,
                     settle: crate::protocol_v2::SettleMode::None,
@@ -2310,9 +2601,10 @@ mod tests {
                 },
             )
             .await
-            .expect("none observation");
-        assert_eq!(after_none.state_id, state_id_after_none);
-        assert!(after_none.observation.is_none());
+            .expect("clipboard read");
+        assert_eq!(after_clipboard.state_id, state_id);
+        assert_eq!(after_clipboard.state_generation, 1);
+        assert!(after_clipboard.observation.is_none());
 
         let error = transport
             .execute_v2(
@@ -2325,9 +2617,15 @@ mod tests {
         let state = transport.state.lock().await;
         assert!(!state.poisoned);
         assert_eq!(state.context.next_sequence, 3);
-        assert_eq!(state.context.current_state_generation, 2);
+        assert_eq!(state.context.current_state_generation, 1);
         assert_eq!(state.context.current_screenshot_generation, 0);
-        assert_eq!(state.model_ax_base_state_id, Some(state_id));
+        assert_eq!(
+            state
+                .state_context
+                .as_ref()
+                .and_then(|context| state.model_ax_bases.get(context).copied()),
+            Some(state_id)
+        );
         drop(state);
 
         let after_full = transport
@@ -2344,11 +2642,36 @@ mod tests {
             .await
             .expect("explicit full observation");
         assert_eq!(after_full.state_id, state_id_after_full);
-        assert_eq!(after_full.state_generation, 3);
+        assert_eq!(after_full.state_generation, 2);
         let state = transport.state.lock().await;
         assert_eq!(state.context.next_sequence, 4);
-        assert_eq!(state.model_ax_base_state_id, Some(state_id_after_full));
+        assert_eq!(
+            state
+                .state_context
+                .as_ref()
+                .and_then(|context| state.model_ax_bases.get(context).copied()),
+            Some(state_id_after_full)
+        );
         drop(state);
+
+        let after_element = transport
+            .execute_v2(
+                ActionV2::Press {
+                    target: crate::protocol_v2::ElementTarget {
+                        state_id: state_id_after_full,
+                        state_generation: 2,
+                        application_digest: "b".repeat(64),
+                        window_id: 8,
+                        display_fingerprint: "other-display".to_owned(),
+                        element_index: 0,
+                    },
+                },
+                ObservationPolicy::default(),
+            )
+            .await
+            .expect("element action uses its bound state as the diff base");
+        assert_eq!(after_element.state_id, state_id_after_element);
+        assert_eq!(after_element.base_state_id, Some(state_id_after_full));
         server.await.expect("bridge server");
     }
 

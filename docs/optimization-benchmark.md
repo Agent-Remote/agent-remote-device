@@ -1,7 +1,9 @@
 # Computer Use optimization benchmark
 
 The managed proxy writes one bounded, owner-only, zero-content JSONL event per
-tool operation to `/tmp/agent-remote-device-optimization.jsonl`. The Node fixes
+device operation to `/tmp/agent-remote-device-optimization.jsonl`. A compact MCP
+tool such as `input_text` can intentionally emit several device operations, so
+the JSONL event count is not an MCP tool-call count. The Node fixes
 this path in managed MCP configuration. The file stops accepting events at 16
 MiB and is never uploaded by the proxy.
 
@@ -11,6 +13,14 @@ action and settle durations, image/fallback/stale booleans, retry count, and
 manual-recovery status. They cannot contain AX text, title, value, URL, frame
 coordinates, screenshots, input, clipboard data, state IDs, window titles, or
 reversible content hashes.
+
+The `action` field distinguishes keyboard, text, scroll, wait, drag, pointer
+coordinate, and AX element operations. `coordinate` therefore means an actual
+pointer action, while `coordinate_fallback` is true only when the action required
+a model-visible screenshot. `ax_bytes` is the serialized AX observation size,
+including JSON structure; the observation policy's `max_total_text_bytes` limits
+only the combined AX text fields. `bridge_bytes` is transport payload volume, not
+model-token usage.
 
 ## Fixed scenarios
 
@@ -34,6 +44,9 @@ fixed. The corpus must include:
 7. Encounter a secure field and verify user hand-off.
 8. Exercise canvas or AX-incomplete content and its coordinate fallback.
 9. Move and resize the window, change displays, and resume after a turn stop.
+10. Open and close same-page browser UI such as the Chrome find bar and a safe
+    infobar; record both `elapsed_ms` and full-versus-diff selection for each
+    direction.
 
 Do not use real credentials, payments, private messages, personal files, or
 production accounts in benchmark tasks.
@@ -64,8 +77,11 @@ reduction from bridge-byte reduction.
 
 The recommended target requires at least 70% fewer model-visible images, action
 p95 at or below 1 second, settle p95 at or below 5 seconds, coordinate fallback
-below 20%, and no call-success regression. These cost targets never override the
-zero wrong-target requirement, confirmation policy, or production release gates.
+below 20%, no redundant full state for a same-context local UI add/remove, and no
+call-success regression. A full state is not redundant after an explicit full
+request, lost base, application/window/display change, or confirmed page-identity
+replacement. These cost targets never override the zero wrong-target requirement,
+confirmation policy, or production release gates.
 
 ## Skill and tool-selection regression
 

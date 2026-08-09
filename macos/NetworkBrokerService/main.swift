@@ -77,6 +77,11 @@ private let service = NetworkBrokerService(pendingSessionProvider: {
         throw DeviceIPCFailure.serviceUnavailable
     }
     return try await discovery.renew(configuration)
+}, rotationProvider: { configuration in
+    guard let discovery else {
+        throw DeviceIPCFailure.serviceUnavailable
+    }
+    return try await discovery.rotate(configuration)
 })
 private let delegate = AuthenticatedXPCListenerDelegate(
     exportedInterface: NSXPCInterface(with: NetworkBrokerXPCProtocol.self),

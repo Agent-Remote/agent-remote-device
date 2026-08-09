@@ -81,6 +81,7 @@ public actor SessionGuard {
 
     private var leaseUntil: Date?
     private var approvals: [String: LocalApproval] = [:]
+    private var statesByApplication: [String: AccessibilityStateContext] = [:]
 
     public init(generation: UInt64 = 1, nextSequence: UInt64 = 1) {
         state = .pendingDevice
@@ -145,6 +146,11 @@ public actor SessionGuard {
             throw GuardFailure.approvalMissing
         }
         currentState = context
+        statesByApplication[context.applicationDigest] = context
+    }
+
+    public func discardState(applicationDigest: String) {
+        statesByApplication.removeValue(forKey: applicationDigest)
     }
 
     public func authorizeScreenshot(sequence: UInt64, now: Date = Date()) throws {
@@ -210,7 +216,7 @@ public actor SessionGuard {
         guard action.hasValidParameters, target.hasValidParameters else {
             throw GuardFailure.invalidParameters
         }
-        guard let state = currentState, state.matches(target) else {
+        guard let state = statesByApplication[target.applicationDigest], state.matches(target) else {
             throw GuardFailure.staleState
         }
         guard state.displayFingerprint == displayFingerprint else {
@@ -313,6 +319,7 @@ public actor SessionGuard {
         approvals.removeAll(keepingCapacity: false)
         currentScreenshot = nil
         currentState = nil
+        statesByApplication.removeAll(keepingCapacity: false)
         leaseUntil = nil
         state = .pendingDevice
     }
@@ -321,6 +328,7 @@ public actor SessionGuard {
         approvals.removeAll(keepingCapacity: false)
         currentScreenshot = nil
         currentState = nil
+        statesByApplication.removeAll(keepingCapacity: false)
         leaseUntil = nil
         state = .failed
     }
@@ -332,6 +340,7 @@ public actor SessionGuard {
             self.leaseUntil = nil
             currentScreenshot = nil
             currentState = nil
+            statesByApplication.removeAll(keepingCapacity: false)
             throw GuardFailure.leaseExpired
         }
     }

@@ -16,6 +16,9 @@ pub const MAX_AX_TEXT_PER_NODE: u16 = 160;
 pub const MAX_AX_TOTAL_TEXT_BYTES: u32 = 16 * 1024;
 pub const MAX_AX_VISIBLE_ROWS_PER_CONTAINER: u8 = 20;
 pub const MAX_SETTLE_TIMEOUT_MS: u32 = 5_000;
+pub const DEFAULT_AX_NODES: u16 = 600;
+pub const DEFAULT_AX_TOTAL_TEXT_BYTES: u32 = 12 * 1024;
+pub const DEFAULT_AX_VISIBLE_ROWS_PER_CONTAINER: u8 = 12;
 pub const MAX_RESPONSE_MESSAGE_CHARACTERS: usize = 4_096;
 pub const MAX_AX_ROLE_CHARACTERS: usize = 80;
 pub const MAX_AX_ACTIONS_PER_NODE: usize = 16;
@@ -111,11 +114,11 @@ impl Default for ObservationPolicy {
     fn default() -> Self {
         Self {
             mode: ObservationMode::Auto,
-            max_nodes: MAX_AX_NODES,
+            max_nodes: DEFAULT_AX_NODES,
             max_depth: MAX_AX_DEPTH,
             max_text_per_node: MAX_AX_TEXT_PER_NODE,
-            max_total_text_bytes: MAX_AX_TOTAL_TEXT_BYTES,
-            max_visible_rows_per_container: MAX_AX_VISIBLE_ROWS_PER_CONTAINER,
+            max_total_text_bytes: DEFAULT_AX_TOTAL_TEXT_BYTES,
+            max_visible_rows_per_container: DEFAULT_AX_VISIBLE_ROWS_PER_CONTAINER,
             settle: SettleMode::Auto,
             settle_timeout_ms: MAX_SETTLE_TIMEOUT_MS,
             image_profile: ImageProfile::Compact,
@@ -179,9 +182,7 @@ impl ActionV2 {
                 is_coordinate_action(action) && action.validate_parameters()
             }
             Self::Press { target } => target.validate(),
-            Self::SetValue { target, value } => {
-                target.validate() && !value.is_empty() && value.chars().count() <= 4_096
-            }
+            Self::SetValue { target, value } => target.validate() && value.chars().count() <= 4_096,
             Self::SelectText {
                 target,
                 text,
@@ -291,19 +292,26 @@ pub struct ActionResponseV2 {
 
 impl ActionResponseV2 {
     pub fn validate_payload(&self, policy: &ObservationPolicy) -> bool {
-        !self.message.is_empty()
-            && self.message.chars().count() <= MAX_RESPONSE_MESSAGE_CHARACTERS
-            && self.settle.elapsed_ms <= MAX_SETTLE_TIMEOUT_MS
-            && self
-                .observation
-                .as_ref()
-                .map(|value| value.validate(policy))
-                .unwrap_or(true)
-            && self
-                .image
-                .as_ref()
-                .map(|value| value.validate(policy))
-                .unwrap_or(true)
+        self.validate_payload_reason(policy).is_ok()
+    }
+
+    pub fn validate_payload_reason(&self, policy: &ObservationPolicy) -> Result<(), &'static str> {
+        if self.message.is_empty() {
+            return Err("response_message_empty");
+        }
+        if self.message.chars().count() > MAX_RESPONSE_MESSAGE_CHARACTERS {
+            return Err("response_message_length");
+        }
+        if self.settle.elapsed_ms > MAX_SETTLE_TIMEOUT_MS {
+            return Err("settle_elapsed");
+        }
+        if let Some(observation) = &self.observation {
+            observation.validate_reason(policy)?;
+        }
+        if let Some(image) = &self.image {
+            image.validate_reason(policy)?;
+        }
+        Ok(())
     }
 }
 
@@ -325,39 +333,68 @@ pub struct AccessibilityObservation {
 }
 
 impl AccessibilityObservation {
-    fn validate(&self, policy: &ObservationPolicy) -> bool {
-        if self.nodes.len() > usize::from(policy.max_nodes)
-            || self.removed.len() > usize::from(policy.max_nodes)
-            || (matches!(self.kind, AccessibilityObservationKind::Full) && !self.removed.is_empty())
-        {
-            return false;
+    fn validate_reason(&self, policy: &ObservationPolicy) -> Result<(), &'static str> {
+        if self.nodes.len() > usize::from(policy.max_nodes) {
+            return Err("ax_node_count");
+        }
+        if self.removed.len() > usize::from(policy.max_nodes) {
+            return Err("ax_removed_count");
+        }
+        if matches!(self.kind, AccessibilityObservationKind::Full) && !self.removed.is_empty() {
+            return Err("ax_full_has_removed");
         }
 
         let mut indexes = BTreeSet::new();
         let mut removed = BTreeSet::new();
         let mut text_bytes = 0_usize;
         for node in &self.nodes {
-            if node.index >= u32::from(policy.max_nodes)
-                || !indexes.insert(node.index)
-                || node.depth > policy.max_depth
-                || node
-                    .parent_index
-                    .is_some_and(|index| index >= u32::from(policy.max_nodes))
-                || node.role.is_empty()
-                || node.role.chars().count() > MAX_AX_ROLE_CHARACTERS
-                || node.actions.len() > MAX_AX_ACTIONS_PER_NODE
-                || node.actions.iter().any(|action| {
-                    action.is_empty()
-                        || action.chars().count() > MAX_AX_ACTION_CHARACTERS
-                        || action.chars().any(char::is_control)
-                })
-                || node.frame.is_some_and(|frame| frame[2] < 0 || frame[3] < 0)
+            if node.index >= u32::from(policy.max_nodes) {
+                return Err("ax_node_index");
+            }
+            if !indexes.insert(node.index) {
+                return Err("ax_duplicate_index");
+            }
+            if node.depth > policy.max_depth {
+                return Err("ax_node_depth");
+            }
+            if node
+                .parent_index
+                .is_some_and(|index| index >= u32::from(policy.max_nodes))
             {
-                return false;
+                return Err("ax_parent_index");
+            }
+            if node.role.is_empty() {
+                return Err("ax_role_empty");
+            }
+            if node.role.chars().count() > MAX_AX_ROLE_CHARACTERS {
+                return Err("ax_role_length");
+            }
+            if node.actions.len() > MAX_AX_ACTIONS_PER_NODE {
+                return Err("ax_action_count");
+            }
+            if node.actions.iter().any(|action| action.is_empty()) {
+                return Err("ax_action_empty");
+            }
+            if node
+                .actions
+                .iter()
+                .any(|action| action.chars().count() > MAX_AX_ACTION_CHARACTERS)
+            {
+                return Err("ax_action_length");
+            }
+            if node
+                .actions
+                .iter()
+                .any(|action| action.chars().any(char::is_control))
+            {
+                return Err("ax_action_control_character");
+            }
+            if node.frame.is_some_and(|frame| frame[2] < 0 || frame[3] < 0) {
+                return Err("ax_frame");
             }
             text_bytes = match text_bytes.checked_add(node.role.len()) {
                 Some(total) => total,
-                None => return false,
+                None => return Err("ax_total_text_overflow"),
             };
             for value in [
                 node.title.as_deref(),
@@ -370,32 +407,35 @@ impl AccessibilityObservation {
             .flatten()
             {
                 if value.chars().count() > usize::from(policy.max_text_per_node) {
-                    return false;
+                    return Err("ax_node_text_length");
                 }
                 text_bytes = match text_bytes.checked_add(value.len()) {
                     Some(total) => total,
-                    None => return false,
+                    None => return Err("ax_total_text_overflow"),
                 };
             }
             for action in &node.actions {
                 text_bytes = match text_bytes.checked_add(action.len()) {
                     Some(total) => total,
-                    None => return false,
+                    None => return Err("ax_total_text_overflow"),
                 };
             }
         }
         if text_bytes > policy.max_total_text_bytes as usize {
-            return false;
+            return Err("ax_total_text_bytes");
         }
         for index in &self.removed {
-            if *index >= u32::from(policy.max_nodes)
-                || indexes.contains(index)
-                || !removed.insert(*index)
-            {
-                return false;
+            if *index >= u32::from(policy.max_nodes) {
+                return Err("ax_removed_index");
+            }
+            if indexes.contains(index) {
+                return Err("ax_removed_present");
+            }
+            if !removed.insert(*index) {
+                return Err("ax_duplicate_removed");
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -449,20 +489,33 @@ pub struct ImagePayloadV2 {
 }
 
 impl ImagePayloadV2 {
-    fn validate(&self, policy: &ObservationPolicy) -> bool {
+    fn validate_reason(&self, policy: &ObservationPolicy) -> Result<(), &'static str> {
         let expected_profile = match policy.image_profile {
             ImageProfile::None => ImageProfile::Compact,
             profile => profile,
         };
-        self.profile == expected_profile
-            && !matches!(self.profile, ImageProfile::None)
-            && self.pixel_width > 0
-            && self.pixel_height > 0
-            && self.pixel_width <= 4_096
-            && self.pixel_height <= 4_096
-            && u32::from(self.pixel_width) * u32::from(self.pixel_height) <= 4_000_000
-            && matches!(self.mime_type.as_str(), "image/png" | "image/jpeg")
-            && !self.base64_data.is_empty()
+        if self.profile != expected_profile {
+            return Err("image_profile");
+        }
+        if matches!(self.profile, ImageProfile::None) {
+            return Err("image_profile_none");
+        }
+        if self.pixel_width == 0 || self.pixel_height == 0 {
+            return Err("image_empty_dimensions");
+        }
+        if self.pixel_width > 4_096 || self.pixel_height > 4_096 {
+            return Err("image_dimensions");
+        }
+        if u32::from(self.pixel_width) * u32::from(self.pixel_height) > 4_000_000 {
+            return Err("image_pixel_count");
+        }
+        if !matches!(self.mime_type.as_str(), "image/png" | "image/jpeg") {
+            return Err("image_mime_type");
+        }
+        if self.base64_data.is_empty() {
+            return Err("image_data_empty");
+        }
+        Ok(())
     }
 }
 
@@ -526,6 +579,22 @@ mod tests {
     }
 
     #[test]
+    fn set_value_accepts_an_empty_string_for_clearing_editable_controls() {
+        let action = ActionV2::SetValue {
+            target: ElementTarget {
+                state_id: Uuid::new_v4(),
+                state_generation: 1,
+                application_digest: "a".repeat(64),
+                window_id: 1,
+                display_fingerprint: "display".to_owned(),
+                element_index: 0,
+            },
+            value: String::new(),
+        };
+        assert!(action.validate_parameters());
+    }
+
+    #[test]
     fn response_payload_rejects_oversized_or_ambiguous_ax_state() {
         let policy = ObservationPolicy {
             max_nodes: 2,
@@ -572,5 +641,9 @@ mod tests {
             image: None,
         };
         assert!(!response.validate_payload(&policy));
+        assert_eq!(
+            response.validate_payload_reason(&policy),
+            Err("ax_removed_present")
+        );
     }
 }

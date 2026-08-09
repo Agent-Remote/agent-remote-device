@@ -33,7 +33,7 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
     private let rawConnection: NWConnection
     private let secureConnection: NWConnection
     private let websocket: any NetworkBrokerRelayWebSocket
-    private let bridgeTask: Task<Void, Never>
+    private let bridgeTask: Task<Void, Error>
     private let binding: DeviceSessionBinding
 
     public static func establish(
@@ -86,12 +86,13 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
             let port = try await listenerReady.value()
             let rawConnection = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
             try await startAndWait(rawConnection, queue: queue)
-            let bridgeTask = Task {
+            let bridgeTask = Task<Void, Error> {
                 do {
                     try await bridge(rawConnection, websocket: websocket)
                 } catch {
                     rawConnection.cancel()
                     websocket.cancel()
+                    throw NetworkBrokerNestedTLSRelayFailure.connectionFailed
                 }
             }
             let secureConnection = try await acceptedConnection.value()
@@ -121,7 +122,7 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
         rawConnection: NWConnection,
         secureConnection: NWConnection,
         websocket: any NetworkBrokerRelayWebSocket,
-        bridgeTask: Task<Void, Never>,
+        bridgeTask: Task<Void, Error>,
         binding: DeviceSessionBinding
     ) {
         self.listener = listener
@@ -154,7 +155,11 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
                     requestID: requestID,
                     payload: requestData
                 ).encoded()
-                response = try await actionHandler(envelope)
+                response = try await Self.raceActionAgainstRelayDisconnect(
+                    envelope,
+                    bridgeTask: bridgeTask,
+                    actionHandler: actionHandler
+                )
                 shouldEnd = false
             case let .lifecycle(request):
                 try await lifecycleHandler(request.event)
@@ -180,6 +185,40 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
         rawConnection.cancel()
         listener.cancel()
         websocket.cancel()
+    }
+
+    static func raceActionAgainstRelayDisconnect(
+        _ request: Data,
+        bridgeTask: Task<Void, Error>,
+        actionHandler: @escaping ActionHandler
+    ) async throws -> Data {
+        let result = RelayOneShot<Data>()
+        let actionTask = Task {
+            do {
+                await result.resolve(.success(try await actionHandler(request)))
+            } catch {
+                await result.resolve(.failure(error))
+            }
+        }
+        let disconnectTask = Task {
+            do {
+                try await bridgeTask.value
+            } catch {}
+            await result.resolve(
+                .failure(NetworkBrokerNestedTLSRelayFailure.connectionFailed)
+            )
+        }
+        return try await withTaskCancellationHandler {
+            defer {
+                actionTask.cancel()
+                disconnectTask.cancel()
+            }
+            return try await result.value()
+        } onCancel: {
+            actionTask.cancel()
+            disconnectTask.cancel()
+            Task { await result.resolve(.failure(CancellationError())) }
+        }
     }
 }
 

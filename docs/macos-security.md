@@ -41,11 +41,19 @@ cleanup, while the machine lock remains held across the paused turn interval.
 All safety-critical Broker calls to the Executor and Approval UI have a local
 15-second reply deadline and cancellation handling. A connected XPC peer that
 stops replying therefore fails closed in the same way as an invalidated peer.
-Relay failure, identity rotation, or Executor loss asks the still-connected
-Approval UI to end the current generation and restore applications before the
-control-plane abort. Cleanup errors leave the UI in an explicit failed state;
-they never suppress control-plane revocation. A replacement generation requires
-a new local approval even when the device-session identifier is unchanged.
+An invalid relay frame or Executor loss asks the still-connected Approval UI to
+end the current generation and restore applications before the control-plane
+abort. A plain relay transport disconnect instead cancels any in-flight handler,
+fails the old Executor guard, and rotates to a fresh generation with the exact
+same approved applications. Unknown-status actions are never replayed across
+that boundary.
+Cleanup errors leave the UI in an explicit failed state; they never suppress
+control-plane revocation. Scheduled identity rotation is narrower: it waits for
+in-flight work, advances the authenticated control-plane generation, and rebinds
+only the exact prior application identities, control levels, and clipboard flags
+within the unchanged device-session expiry. It does not prompt again or widen
+authorization. Any mismatch or incomplete rotation falls back to the normal
+fail-closed cleanup path.
 
 An allowed approval and relay activation each require a fresh, short-lived Ed25519 proof from the
 fixed privileged outbound-policy attestor. The proof binds the signed Broker identity and exact
@@ -68,8 +76,10 @@ enablement still requires the signed-installation and release evidence gates in
 this document.
 
 The snapshot renderer applies hard node, depth, per-node text, total text, and
-visible-row budgets before XPC serialization. It emits only normalized fields
-needed for UI decisions. Secure text values, password contents, invisible
+visible-row budgets before XPC serialization. Exhausting the text budget removes
+later text values without stopping structural traversal, and a fixed quarter of
+that budget remains reserved for editable or actionable controls. It emits only
+normalized fields needed for UI decisions. Secure text values, password contents, invisible
 sensitive values, and unbounded browser WebArea descendants are redacted or
 elided. Browser WebArea/list traversal prefers visible children and merges
 `AXChildren`, `AXRows`, `AXContents`, and best-effort `AXVisibleChildren` without
@@ -80,15 +90,18 @@ performance telemetry.
 
 Full/diff state is scoped to one complete device binding, active generation,
 approved application digest, selected window ID, display fingerprint, and state
-generation. A turn pause, generation rotation, application/window/display change,
-lost diff base, or Executor restart clears the AX cache and all element mappings.
-The next observation returns a bounded full state with an explicit reset marker.
+generation. The Executor retains at most one current mapping per approved
+application. Switching between approved applications preserves each application's
+latest model-visible mapping; a new state or window/display change replaces only
+that application's mapping. A turn pause, generation rotation, or Executor restart
+clears every mapping. A lost diff base returns a bounded full state with an
+explicit reset marker.
 
 ## State-bound element execution
 
-An element index is not a stable identifier. The Executor accepts it only with a
-device-generated current `state_id` and `state_generation`, then resolves it in the
-current in-memory snapshot. Before an AX action, it repeats the same live
+An element index is not a stable identifier. The Executor accepts it only with the
+device-generated latest `state_id` and `state_generation` for that application,
+then resolves it in the matching in-memory snapshot. Before an AX action, it repeats the same live
 application, process, window, display, lease, sequence, approval, and control-level
 checks used for coordinate actions and verifies that the element exposes the exact
 requested action.
@@ -112,7 +125,8 @@ capture occurs only for explicit screenshot, both-mode, visual fallback, or regi
 inspection responses.
 
 Adaptive settling is bounded by the remaining lease and action deadline. It may
-sample AX busy/loading state and bounded normalized tree hashes, but it cannot read
+sample AX busy/loading state, bounded normalized tree hashes, and `AXWebArea`
+title/URL page identity already authorized for model-visible AX state, but it cannot read
 browser profiles, cookies, DOM debugging endpoints, local files, or another
 application. Two stable samples after a debounce interval are required for
 `settled`; timeout returns the newest safe state with an explicit timeout status.

@@ -341,7 +341,14 @@ public final class DeviceAppModel: ObservableObject {
                 safetyMonitor = nil
                 do {
                     try visibilityController.restoreApplications()
-                    transitionToFailure(error, recovery: .sessionSelection)
+                    if errorCode(error) == "session_binding_changed" {
+                        clearSessionContext()
+                        completionMessage = nil
+                        state = .selectingSession
+                        refreshSessionCandidates()
+                    } else {
+                        transitionToFailure(error, recovery: .sessionSelection)
+                    }
                 } catch {
                     failClosed(
                         message: userFacingDescription(error),
