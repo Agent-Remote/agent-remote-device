@@ -40,6 +40,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     private let actionReplyTimeout: Duration
     private let renewalRetryDelaySeconds: TimeInterval
     private let renewalRecoveryWindowSeconds: TimeInterval
+    private let automaticTerminationHandler: @Sendable (Bool) -> Void
     private var executorConnection: NSXPCConnection?
     private var relay: (any NetworkBrokerRelayRunning)?
     private var relayTask: Task<Void, Never>?
@@ -54,6 +55,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     private var pendingActivation: (binding: DeviceSessionBinding, identifier: UUID)?
     private var approvalUI: ApprovalUIXPCProtocol?
     private var turnPaused = false
+    private var automaticTerminationDisabled = false
 
     public init(
         executorOverride: GUIExecutorXPCProtocol? = nil,
@@ -92,7 +94,18 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         xpcReplyTimeout: Duration = .seconds(15),
         actionReplyTimeout: Duration = .seconds(60),
         renewalRetryDelaySeconds: TimeInterval = 1,
-        renewalRecoveryWindowSeconds: TimeInterval = 5
+        renewalRecoveryWindowSeconds: TimeInterval = 5,
+        automaticTerminationHandler: @escaping @Sendable (Bool) -> Void = { disabled in
+            if disabled {
+                ProcessInfo.processInfo.disableAutomaticTermination(
+                    "Active Agent Remote device control"
+                )
+            } else {
+                ProcessInfo.processInfo.enableAutomaticTermination(
+                    "Active Agent Remote device control"
+                )
+            }
+        }
     ) {
         self.executorOverride = executorOverride
         self.pendingSessionProvider = pendingSessionProvider
@@ -111,6 +124,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         self.actionReplyTimeout = actionReplyTimeout
         self.renewalRetryDelaySeconds = renewalRetryDelaySeconds
         self.renewalRecoveryWindowSeconds = max(1, renewalRecoveryWindowSeconds)
+        self.automaticTerminationHandler = automaticTerminationHandler
     }
 
     deinit {
@@ -119,6 +133,9 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         rotationTask?.cancel()
         relay?.cancel()
         executorConnection?.invalidate()
+        if automaticTerminationDisabled {
+            automaticTerminationHandler(false)
+        }
     }
 
     public func pollPendingSession(reply: @escaping (NSData?, NSError?) -> Void) {
@@ -409,18 +426,22 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
             reply.resolve(DeviceIPCFailure.invalidMessage.nsError)
             return
         }
-        guard cancelRelay(matching: abortRequest.binding) else {
+        guard let currentBinding = cancelRelay(matching: abortRequest.binding) else {
             reply.resolve(DeviceIPCFailure.invalidMessage.nsError)
             return
         }
+        let currentRequest = BrokerAbortRequest(
+            binding: currentBinding,
+            reason: abortRequest.reason
+        )
         Task {
             try? await stopExecutor(
-                abortRequest.binding,
+                currentBinding,
                 reason: abortRequest.reason,
-                encodedRequest: requestData
+                encodedRequest: currentBinding == abortRequest.binding ? requestData : nil
             )
             do {
-                _ = try await abortProvider(abortRequest)
+                _ = try await abortProvider(currentRequest)
                 reply.resolve(nil)
             } catch {
                 reply.resolve(DeviceIPCFailure.serviceUnavailable.nsError)
@@ -440,14 +461,18 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
             reply.resolve(DeviceIPCFailure.invalidMessage.nsError)
             return
         }
-        guard cancelRelay(matching: endRequest.binding) else {
+        guard let currentBinding = cancelRelay(matching: endRequest.binding) else {
             reply.resolve(DeviceIPCFailure.invalidMessage.nsError)
             return
         }
+        let currentRequest = BrokerEndRequest(binding: currentBinding)
         Task {
-            try? await endExecutor(endRequest.binding, encodedRequest: requestData)
+            try? await endExecutor(
+                currentBinding,
+                encodedRequest: currentBinding == endRequest.binding ? requestData : nil
+            )
             do {
-                try await endProvider(endRequest)
+                try await endProvider(currentRequest)
                 reply.resolve(nil)
             } catch {
                 reply.resolve(DeviceIPCFailure.serviceUnavailable.nsError)
@@ -491,6 +516,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         relayActionActivityVersion &+= 1
         relayRenewalInFlight = false
         turnPaused = false
+        disableAutomaticTerminationLocked()
         lock.unlock()
         let lockAcquirer = RelayLockAcquirer(provider: lockProvider)
         let task = Task { [weak self, weak relay] in
@@ -530,7 +556,11 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                         )
                     }
                 )
-                self?.completeRelay(relay)
+                // A peer can close its WebSocket with a normal close code without
+                // sending session_end. That still disconnects the generation and
+                // must rotate; otherwise renewal stops while the control-plane
+                // session remains active until its lease expires.
+                await self?.rotateAfterRelayDisconnect(configuration, relay: relay)
             } catch {
                 guard !Task.isCancelled else { return }
                 self?.logger.error("Relay failed")
@@ -696,6 +726,26 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                     notifyApprovalUI: true
                 )
             }
+            enableAutomaticTerminationIfIdle()
+        }
+    }
+
+    private func disableAutomaticTerminationLocked() {
+        guard !automaticTerminationDisabled else { return }
+        automaticTerminationDisabled = true
+        automaticTerminationHandler(true)
+    }
+
+    private func enableAutomaticTerminationLocked() {
+        guard automaticTerminationDisabled else { return }
+        automaticTerminationDisabled = false
+        automaticTerminationHandler(false)
+    }
+
+    private func enableAutomaticTerminationIfIdle() {
+        lock.withLock {
+            guard relay == nil, pendingActivation == nil else { return }
+            enableAutomaticTerminationLocked()
         }
     }
 
@@ -903,10 +953,12 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                     guard self.beginRelayRenewal(relay: relay) else { return }
                     do {
                         configuration = try await self.renewControlPlaneWithRetry(configuration)
+                        try Task.checkCancellation()
                         try await self.renewExecutorWithRetry(
                             configuration,
                             currentLeaseUntil: executorLeaseUntil
                         )
+                        try Task.checkCancellation()
                     } catch {
                         self.finishRelayRenewal(configuration, relay: relay)
                         throw error
@@ -1334,6 +1386,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         relayRenewalInFlight = false
         pendingActivation = nil
         turnPaused = false
+        enableAutomaticTerminationLocked()
         lock.unlock()
         task?.cancel()
         renewalTask?.cancel()
@@ -1342,16 +1395,20 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         return binding
     }
 
-    private func cancelRelay(matching expectedBinding: DeviceSessionBinding) -> Bool {
+    private func cancelRelay(
+        matching expectedBinding: DeviceSessionBinding
+    ) -> DeviceSessionBinding? {
         lock.lock()
-        if let relayBinding, relayBinding != expectedBinding {
+        let currentBinding = relayBinding ?? pendingActivation?.binding
+        if let currentBinding,
+           currentBinding != expectedBinding,
+           !(expectedBinding.generation < currentBinding.generation
+               && expectedBinding.matchesSessionIdentity(currentBinding))
+        {
             lock.unlock()
-            return false
+            return nil
         }
-        if let pendingActivation, pendingActivation.binding != expectedBinding {
-            lock.unlock()
-            return false
-        }
+        let resolvedBinding = currentBinding ?? expectedBinding
         let relay = relay
         let task = relayTask
         let renewalTask = renewalTask
@@ -1367,12 +1424,13 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         relayRenewalInFlight = false
         pendingActivation = nil
         turnPaused = false
+        enableAutomaticTerminationLocked()
         lock.unlock()
         task?.cancel()
         renewalTask?.cancel()
         rotationTask?.cancel()
         relay?.cancel()
-        return true
+        return resolvedBinding
     }
 
     private func cancelRelay(ifCurrent expectedRelay: any NetworkBrokerRelayRunning) -> Bool {
@@ -1394,6 +1452,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         relayActionsInFlight = 0
         relayRenewalInFlight = false
         turnPaused = false
+        enableAutomaticTerminationLocked()
         lock.unlock()
         task?.cancel()
         renewalTask?.cancel()
@@ -1486,6 +1545,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         relayRenewalInFlight = false
         pendingActivation = nil
         turnPaused = false
+        enableAutomaticTerminationLocked()
         lock.unlock()
         connection?.invalidate()
         task?.cancel()

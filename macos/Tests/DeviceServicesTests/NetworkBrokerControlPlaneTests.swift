@@ -126,6 +126,63 @@ private actor RotationRaceHTTPTransport: NetworkBrokerHTTPTransport {
     func recordedRequests() -> [URLRequest] { requests }
 }
 
+private actor RenewalRotationRaceHTTPTransport: NetworkBrokerHTTPTransport {
+    private var responses: [String: [(Data, Int)]]
+    private var requests: [URLRequest] = []
+    private let firstRenewalStarted = AsyncTestGate()
+    private let releaseFirstRenewal = AsyncTestGate()
+    private var renewalCount = 0
+
+    init(responses: [String: [(Data, Int)]]) {
+        self.responses = responses
+    }
+
+    func send(
+        _ request: URLRequest,
+        maximumResponseBytes _: Int
+    ) async throws -> (Data, HTTPURLResponse) {
+        requests.append(request)
+        let path = try #require(request.url?.path)
+        let route = try #require(Self.route(for: path))
+        var queued = try #require(responses[route])
+        let (data, status) = queued.removeFirst()
+        responses[route] = queued
+        if route == "renew" {
+            renewalCount += 1
+            if renewalCount == 1 {
+                await firstRenewalStarted.open()
+                await releaseFirstRenewal.wait()
+            }
+        }
+        let response = try #require(HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        ))
+        return (data, response)
+    }
+
+    func waitUntilFirstRenewalStarts() async {
+        await firstRenewalStarted.wait()
+    }
+
+    func resumeFirstRenewal() async {
+        await releaseFirstRenewal.open()
+    }
+
+    func recordedRequests() -> [URLRequest] { requests }
+
+    private static func route(for path: String) -> String? {
+        if path.hasSuffix("/device-inbox") { return "inbox" }
+        if path.hasSuffix("/device-connected") { return "device-connected" }
+        if path.hasSuffix("/approve") { return "approve" }
+        if path.hasSuffix("/abort") { return "abort" }
+        if path.hasSuffix("/renew") { return "renew" }
+        return nil
+    }
+}
+
 private let controlPlaneDeviceID = "2cb933ce-b922-4ed7-b479-6ded90f09d2d"
 private let controlPlaneToken = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
 
@@ -499,6 +556,40 @@ private func relayMaterialJSON(
     #expect(stopBody as? [String: String] == ["reason": "session_end"])
 }
 
+@Test func stopAcceptsServerTimestampRecordedAfterRequestStarted() async throws {
+    let requestTime = Date(timeIntervalSince1970: 4_000_000_000)
+    let responseTime = requestTime.addingTimeInterval(1)
+    let serverStopTime = responseTime.addingTimeInterval(1)
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let stopped = sessionJSON(
+        status: "stopped",
+        generation: 2,
+        stoppedAt: "\"\(formatter.string(from: serverStopTime))\"",
+        stopReason: "\"session_end\""
+    )
+    let transport = RecordingHTTPTransport(responses: [
+        (Data("{\"data\":{\"items\":[\(active)]},\"request_id\":null}".utf8), 200),
+        (Data("{\"data\":\(stopped),\"request_id\":null}".utf8), 200),
+    ])
+    let client = try NetworkBrokerControlPlaneClient(
+        credential: brokerCredential(),
+        transport: transport,
+        nowProvider: { responseTime },
+        now: requestTime
+    )
+    let session = try #require(try await client.deviceInbox(now: requestTime).first)
+
+    let terminal = try await client.stop(session, now: requestTime)
+
+    #expect(terminal.status == .stopped)
+    #expect(terminal.stoppedAt == serverStopTime)
+}
+
 @Test func controlPlaneRejectsOutOfRangeAndExhaustedGenerationsBeforeMutation() async throws {
     let maximumActive = UInt64(Int64.max) - 1
     let outOfRange = sessionJSON(generation: UInt64(Int64.max) + 1)
@@ -762,6 +853,72 @@ private func relayMaterialJSON(
     #expect(await transport.recordedRequests().count == 3)
 }
 
+@Test func discoveryReconnectsPendingGenerationAfterRelayFailureAbort() async throws {
+    let pending = sessionJSON(status: "pending_device")
+    let connected = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let rotatedPending = sessionJSON(status: "pending_device", generation: 2)
+    let rotatedConnected = sessionJSON(status: "pending_user_approval", generation: 2)
+    let inbox = { (session: String) in
+        Data("{\"data\":{\"items\":[\(session)]},\"request_id\":null}".utf8)
+    }
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = RecordingHTTPTransport(responses: [
+        (inbox(pending), 200),
+        (response(connected), 200),
+        (response(active), 200),
+        (response(rotatedPending), 200),
+        (inbox(rotatedPending), 200),
+        (response(rotatedConnected), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let discovered = try #require(try await coordinator.nextPendingSession(now: now))
+    let configuration = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: discovered.binding,
+            approvals: [LocalApproval(
+                application: ApplicationIdentity(
+                    bundleIdentifier: "com.google.Chrome",
+                    signingIdentifier: "com.google.Chrome"
+                ),
+                controlLevel: .fullControl,
+                clipboardAllowed: true,
+                generation: 1
+            )],
+            result: .allowed
+        ),
+        now: now
+    ))
+
+    let aborted = try await coordinator.abort(
+        BrokerAbortRequest(binding: configuration.binding, reason: .disconnect),
+        now: now
+    )
+    let recovered = try #require(try await coordinator.nextPendingSession(now: now))
+
+    #expect(aborted.binding.generation == 2)
+    #expect(recovered.binding.generation == 2)
+    let requests = await transport.recordedRequests()
+    #expect(requests.map(\.url?.path) == [
+        "/api/v1/device-sessions/device-inbox",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/device-connected",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/approve",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/abort",
+        "/api/v1/device-sessions/device-inbox",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/device-connected",
+    ])
+}
+
 @Test func discoveryRotatesAnActiveGenerationWithoutNewUserApproval() async throws {
     let pending = sessionJSON(status: "pending_device")
     let connected = sessionJSON(status: "pending_user_approval")
@@ -896,6 +1053,85 @@ private func relayMaterialJSON(
     #expect(requests.count == 6)
     #expect(requests.filter { $0.url?.path.hasSuffix("/device-inbox") == true }.count == 1)
     #expect(requests.filter { $0.url?.path.hasSuffix("/device-connected") == true }.count == 2)
+}
+
+@Test func staleSlowRenewalCannotOverwriteARotatedGeneration() async throws {
+    let pending = sessionJSON(status: "pending_device")
+    let connected = sessionJSON(status: "pending_user_approval")
+    let active = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let staleRenewed = sessionJSON(
+        status: "active",
+        leaseUntil: "\"2099-12-30T23:59:10Z\""
+    )
+    let rotatedPending = sessionJSON(status: "pending_device", generation: 2)
+    let rotatedConnected = sessionJSON(status: "pending_user_approval", generation: 2)
+    let rotatedActive = sessionJSON(
+        status: "active",
+        generation: 2,
+        leaseUntil: "\"2099-12-30T23:59:30Z\""
+    )
+    let rotatedRenewed = sessionJSON(
+        status: "active",
+        generation: 2,
+        leaseUntil: "\"2099-12-30T23:59:40Z\""
+    )
+    let inbox = { (session: String) in
+        Data("{\"data\":{\"items\":[\(session)]},\"request_id\":null}".utf8)
+    }
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = RenewalRotationRaceHTTPTransport(responses: [
+        "inbox": [(inbox(pending), 200)],
+        "device-connected": [(response(connected), 200), (response(rotatedConnected), 200)],
+        "approve": [(response(active), 200), (response(rotatedActive), 200)],
+        "abort": [(response(rotatedPending), 200)],
+        "renew": [(response(staleRenewed), 200), (response(rotatedRenewed), 200)],
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+    let discovered = try #require(try await coordinator.nextPendingSession(now: now))
+    let configuration = try #require(try await coordinator.approve(
+        BrokerApprovalDecision(
+            binding: discovered.binding,
+            approvals: [LocalApproval(
+                application: ApplicationIdentity(
+                    bundleIdentifier: "com.google.Chrome",
+                    signingIdentifier: "com.google.Chrome"
+                ),
+                controlLevel: .fullControl,
+                clipboardAllowed: true,
+                generation: 1
+            )],
+            result: .allowed
+        ),
+        now: now
+    ))
+
+    let staleRenewal = Task { try await coordinator.renew(configuration, now: now) }
+    await transport.waitUntilFirstRenewalStarts()
+    let rotated = try await coordinator.rotate(configuration, now: now)
+    #expect(rotated.binding.generation == 2)
+    await transport.resumeFirstRenewal()
+    do {
+        _ = try await staleRenewal.value
+        Issue.record("stale generation renewal unexpectedly succeeded")
+    } catch let failure as NetworkBrokerControlPlaneFailure {
+        #expect(failure == .bindingMismatch)
+    }
+
+    let renewedRotation = try await coordinator.renew(rotated, now: now)
+    #expect(renewedRotation.binding.generation == 2)
+    #expect(renewedRotation.leaseUntil > rotated.leaseUntil)
+    let requests = await transport.recordedRequests()
+    #expect(requests.filter { $0.url?.path.hasSuffix("/renew") == true }.count == 2)
 }
 
 @Test func discoveryRotatesAnActiveGenerationAfterBrokerRestart() async throws {

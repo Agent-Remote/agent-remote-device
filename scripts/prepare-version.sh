@@ -45,6 +45,18 @@ if count != 1:
     raise SystemExit("proxy lockfile version was not updated exactly once")
 lock_path.write_text(updated, encoding="utf-8")
 
+fuzz_lock_path = Path("fuzz/Cargo.lock")
+fuzz_lock = fuzz_lock_path.read_text(encoding="utf-8")
+updated, count = re.subn(
+    r'(?s)(\[\[package\]\]\nname = "agent-remote-device-proxy"\nversion = ")[^"]+("\n)',
+    rf'\g<1>{version}\2',
+    fuzz_lock,
+    count=1,
+)
+if count != 1:
+    raise SystemExit("fuzz proxy lockfile version was not updated exactly once")
+fuzz_lock_path.write_text(updated, encoding="utf-8")
+
 readme_path = Path("README.md")
 readme = readme_path.read_text(encoding="utf-8")
 readme = re.sub(
@@ -60,6 +72,13 @@ resolved=$(cargo metadata --format-version=1 --no-deps | python3 -c \
   'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "agent-remote-device-proxy"))')
 if [ "$resolved" != "$version" ]; then
   echo "prepared Rust package version does not match requested version" >&2
+  exit 1
+fi
+
+fuzz_resolved=$(cargo metadata --manifest-path fuzz/Cargo.toml --format-version=1 --locked | python3 -c \
+  'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "agent-remote-device-proxy"))')
+if [ "$fuzz_resolved" != "$version" ]; then
+  echo "prepared fuzz proxy version does not match requested version" >&2
   exit 1
 fi
 

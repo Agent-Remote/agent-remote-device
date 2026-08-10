@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
     path::Path,
     sync::Arc,
     time::Duration,
@@ -48,6 +48,10 @@ const BRIDGE_PROTOCOL_VERSION: u8 = 1;
 const MAX_ACTION_RESPONSE_WAIT: Duration = Duration::from_secs(60);
 const LIFECYCLE_RESPONSE_WAIT: Duration = Duration::from_secs(15);
 const INITIAL_ACTION_CONTEXT_READY_WAIT: Duration = Duration::from_secs(60);
+// A bridge socket proves that Node activation is live while an absent context
+// means local approval is still converging. Keep the same MCP call open for a
+// bounded additional window instead of spending another model tool call.
+const PENDING_ACTIVATION_CONTEXT_READY_WAIT: Duration = Duration::from_secs(120);
 // Keep the MCP call alive across a bounded generation-rotation window. Ten
 // seconds was shorter than the control-plane reconnect sequence and surfaced
 // transient rotation as a permanent `context open failed` error.
@@ -703,12 +707,22 @@ impl ActivatedUnixDeviceTransport {
     async fn action_context(&self) -> Result<ManagedContext, TransportError> {
         let failed_generation = *self.failed_generation.lock().await;
         let has_active = self.active.lock().await.is_some();
-        let context = load_action_context(
-            &self.managed_context_path,
-            action_context_ready_wait(has_active),
-            failed_generation,
-        )
-        .await?;
+        let context = if has_active {
+            load_action_context(
+                &self.managed_context_path,
+                RECOVERY_ACTION_CONTEXT_READY_WAIT,
+                failed_generation,
+            )
+            .await?
+        } else {
+            load_initial_action_context(
+                &self.managed_context_path,
+                &self.bridge_socket_path,
+                INITIAL_ACTION_CONTEXT_READY_WAIT,
+                PENDING_ACTIVATION_CONTEXT_READY_WAIT,
+            )
+            .await?
+        };
         if failed_generation.is_some() {
             let mut failed = self.failed_generation.lock().await;
             if *failed == failed_generation {
@@ -782,12 +796,22 @@ async fn load_action_context(
     }
 }
 
-fn action_context_ready_wait(has_active_transport: bool) -> Duration {
-    if has_active_transport {
-        RECOVERY_ACTION_CONTEXT_READY_WAIT
-    } else {
-        INITIAL_ACTION_CONTEXT_READY_WAIT
+async fn load_initial_action_context(
+    context_path: &Path,
+    bridge_socket_path: &Path,
+    initial_wait: Duration,
+    pending_activation_wait: Duration,
+) -> Result<ManagedContext, TransportError> {
+    match load_action_context(context_path, initial_wait, None).await {
+        Err(TransportError::NotActivated) if bridge_activation_pending(bridge_socket_path) => {
+            load_action_context(context_path, pending_activation_wait, None).await
+        }
+        result => result,
     }
+}
+
+fn bridge_activation_pending(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
 }
 
 fn action_lease_ready(context: &ManagedContext, now: DateTime<Utc>) -> bool {
@@ -1226,7 +1250,7 @@ fn apply_response_v1(
 fn apply_response_v2(
     state: &mut TransportState,
     request: &ActionRequestV2,
-    response: ActionResponseV2,
+    mut response: ActionResponseV2,
 ) -> Result<DeviceResultV2, TransportError> {
     if response.request_id != request.request_id
         || response.monotonic_sequence != request.context.monotonic_sequence
@@ -1234,6 +1258,11 @@ fn apply_response_v2(
         poison(state);
         return Err(TransportError::ResponseBinding);
     }
+    // AX action names are OS-provided metadata. Some system applications emit
+    // custom names containing control characters; those names cannot be safely
+    // invoked or represented in the model-visible protocol, so discard them
+    // without invalidating the otherwise bound response.
+    response.discard_unsafe_ax_actions();
     if let Err(reason) = response.validate_payload_reason(&request.observation) {
         poison(state);
         return Err(TransportError::ResponseValidation(reason));
@@ -1698,6 +1727,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_action_context_extends_wait_for_live_bridge_activation() {
+        let directory = tempdir().expect("temp directory");
+        let context_path = directory.path().join("context.json");
+        let bridge_path = directory.path().join("bridge.sock");
+        let _listener = tokio::net::UnixListener::bind(&bridge_path).expect("bind bridge socket");
+        let context = test_context(1, Utc::now() + chrono::Duration::seconds(60));
+        let writer_path = context_path.clone();
+        let writer_context = context.clone();
+        let writer = tokio::spawn(async move {
+            sleep(Duration::from_millis(40)).await;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&writer_path)
+                .expect("create context");
+            serde_json::to_writer(&mut file, &writer_context).expect("write context");
+        });
+
+        let loaded = load_initial_action_context(
+            &context_path,
+            &bridge_path,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("live activation should extend the initial readiness wait");
+        assert_eq!(loaded, context);
+        writer.await.expect("context writer");
+    }
+
+    #[tokio::test]
+    async fn initial_action_context_does_not_extend_wait_without_live_bridge() {
+        let directory = tempdir().expect("temp directory");
+        let context_path = directory.path().join("missing-context.json");
+        let bridge_path = directory.path().join("bridge.sock");
+        std::fs::write(&bridge_path, b"not a socket").expect("write regular bridge file");
+
+        assert!(matches!(
+            load_initial_action_context(
+                &context_path,
+                &bridge_path,
+                Duration::from_millis(10),
+                Duration::from_millis(100),
+            )
+            .await,
+            Err(TransportError::NotActivated)
+        ));
+    }
+
+    #[tokio::test]
     async fn action_context_waits_for_a_failed_generation_to_rotate() {
         let directory = tempdir().expect("temp directory");
         let path = directory.path().join("context.json");
@@ -1986,18 +2066,13 @@ mod tests {
     }
 
     #[test]
-    fn action_context_wait_is_shorter_after_activation() {
-        assert_eq!(
-            action_context_ready_wait(false),
-            INITIAL_ACTION_CONTEXT_READY_WAIT
-        );
-        assert_eq!(
-            action_context_ready_wait(true),
-            RECOVERY_ACTION_CONTEXT_READY_WAIT
-        );
+    fn action_context_waits_are_bounded_by_activation_state() {
         assert!(
-            INITIAL_ACTION_CONTEXT_READY_WAIT + ACTION_LEASE_READY_WAIT + MAX_ACTION_RESPONSE_WAIT
-                < Duration::from_secs(180)
+            INITIAL_ACTION_CONTEXT_READY_WAIT
+                + PENDING_ACTIVATION_CONTEXT_READY_WAIT
+                + ACTION_LEASE_READY_WAIT
+                + MAX_ACTION_RESPONSE_WAIT
+                < Duration::from_secs(256)
         );
         assert!(RECOVERY_ACTION_CONTEXT_READY_WAIT < INITIAL_ACTION_CONTEXT_READY_WAIT);
     }

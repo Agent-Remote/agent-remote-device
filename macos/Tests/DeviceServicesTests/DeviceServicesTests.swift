@@ -784,6 +784,21 @@ import Testing
     #expect(ActionSettleTiming.minimumStableMilliseconds(
         for: .setValue(target: target, value: "text")
     ) == 300)
+    for actionName in ["AXScrollToVisible", "AXShowMenu"] {
+        let action = ActionV2.secondaryAction(target: target, actionName: actionName)
+        #expect(ActionSettleTiming.minimumStableMilliseconds(for: action) == 300)
+        #expect(ActionSettleTiming.requiredStableSamples(for: action) == 2)
+        #expect(!ActionSettleTiming.requiresMeaningfulChange(for: action))
+        #expect(ActionSettleTiming.noChangeGraceMilliseconds(for: action) == 0)
+    }
+    let unknownSecondaryAction = ActionV2.secondaryAction(
+        target: target,
+        actionName: "AXFutureNavigationAction"
+    )
+    #expect(ActionSettleTiming.minimumStableMilliseconds(for: unknownSecondaryAction) == 600)
+    #expect(ActionSettleTiming.requiredStableSamples(for: unknownSecondaryAction) == 6)
+    #expect(ActionSettleTiming.requiresMeaningfulChange(for: unknownSecondaryAction))
+    #expect(ActionSettleTiming.noChangeGraceMilliseconds(for: unknownSecondaryAction) == 2_000)
     #expect(ActionSettleTiming.requiredStableSamples(for: .press(target)) == 6)
     #expect(ActionSettleTiming.requiredStableSamples(
         for: .setValue(target: target, value: "text")
@@ -2225,7 +2240,7 @@ import Testing
     #expect(approvalError == nil)
     await completed.wait()
     #expect(approvalUI.activationCount() == 0)
-    weak var releasedBroker = broker
+    weak let releasedBroker = broker
     broker = nil
     for _ in 0 ..< 100 where releasedBroker != nil {
         try await Task.sleep(for: .milliseconds(1))
@@ -2966,9 +2981,14 @@ import Testing
     let rotationRecorder = ConfigurationRecorder()
     let relayAttempts = RelayAttemptRecorder()
     let replacementRelayCancellation = CancellationRecorder()
+    let automaticTerminationRecorder = AutomaticTerminationRecorder()
+    let lifecycleRecorder = LifecycleRecorder()
     let broker = NetworkBrokerService(
         executorOverride: executor,
         approvalProvider: { _ in session },
+        endProvider: { request in
+            await lifecycleRecorder.recordEnd(request)
+        },
         relayProvider: { configuration in
             let attempt = await relayAttempts.record(configuration)
             if attempt == 1 {
@@ -2981,6 +3001,9 @@ import Testing
             let next = rotatedConfiguration(previous)
             await rotationRecorder.record(next)
             return next
+        },
+        automaticTerminationHandler: { disabled in
+            automaticTerminationRecorder.record(disabled)
         }
     )
     broker.installApprovalUI(approvalUI)
@@ -3006,7 +3029,92 @@ import Testing
         session.binding.generation,
         session.binding.generation + 1,
     ])
+    #expect(automaticTerminationRecorder.values == [true])
     #expect(approvalUI.recordedEvents().isEmpty)
+
+    let staleEnd = try envelope(payload: JSONEncoder().encode(
+        BrokerEndRequest(binding: session.binding)
+    )).encoded() as NSData
+    let endError = await withCheckedContinuation { continuation in
+        broker.endSession(staleEnd) { continuation.resume(returning: $0?.code) }
+    }
+
+    #expect(endError == nil)
+    #expect(await lifecycleRecorder.endRequest?.binding == rotated.binding)
+    let executorEndEnvelope = try DeviceIPCEnvelope.decode(
+        Data(referencing: try #require(executor.ended))
+    )
+    let executorEnd = try DeviceIPCDecoder.decode(
+        BrokerEndRequest.self,
+        from: executorEndEnvelope.payload
+    )
+    #expect(executorEnd.binding == rotated.binding)
+    #expect(replacementRelayCancellation.wasCancelled)
+    #expect(automaticTerminationRecorder.values == [true, false])
+}
+
+@Test func cleanRelayDisconnectRotatesWithoutApplyingAnInFlightOldRenewal() async throws {
+    let executor = ExecutorStub(stopFails: true)
+    let approvalUI = ApprovalUIStub()
+    let session = configuration(leaseUntil: Date().addingTimeInterval(2))
+    let renewalStarted = AsyncEventRecorder()
+    let releaseRenewal = AsyncEventRecorder()
+    let rotationRecorder = ConfigurationRecorder()
+    let relayAttempts = RelayAttemptRecorder()
+    let replacementRelayCancellation = CancellationRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { _ in session },
+        relayProvider: { configuration in
+            let attempt = await relayAttempts.record(configuration)
+            if attempt == 1 {
+                return CleanDisconnectAfterEventRelay(event: renewalStarted)
+            }
+            return HoldingRelay(cancellationRecorder: replacementRelayCancellation)
+        },
+        lockProvider: { _ in },
+        renewProvider: { previous in
+            await renewalStarted.record()
+            await releaseRenewal.wait()
+            return ExecutorSessionConfiguration(
+                binding: previous.binding,
+                leaseUntil: Date().addingTimeInterval(60),
+                approvals: previous.approvals,
+                capabilities: previous.capabilities
+            )
+        },
+        rotationProvider: { previous in
+            let next = rotatedConfiguration(previous)
+            await rotationRecorder.record(next)
+            return next
+        }
+    )
+    broker.installApprovalUI(approvalUI)
+    let decision = BrokerApprovalDecision(
+        binding: session.binding,
+        approvals: session.approvals,
+        result: .allowed
+    )
+    let request = try envelope(payload: JSONEncoder().encode(decision)).encoded() as NSData
+    let approvalError = await withCheckedContinuation { continuation in
+        broker.approveSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(approvalError == nil)
+    let rotated = await rotationRecorder.waitForFirst()
+    #expect(rotated.binding.generation == session.binding.generation + 1)
+    await releaseRenewal.record()
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(executor.renewalCount() == 0)
+    #expect(executor.sessionUpdateCount() == 2)
+    #expect(await relayAttempts.generations == [
+        session.binding.generation,
+        session.binding.generation + 1,
+    ])
+    #expect(approvalUI.recordedEvents().isEmpty)
+    broker.approvalUIConnectionInvalidated()
 }
 
 @Test func relayIdentityRotationWaitsForAnInFlightAction() async throws {
@@ -3514,6 +3622,23 @@ private final class TransportDisconnectRelay: NetworkBrokerRelayRunning, @unchec
     func cancel() {}
 }
 
+private final class CleanDisconnectAfterEventRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
+    private let event: AsyncEventRecorder
+
+    init(event: AsyncEventRecorder) {
+        self.event = event
+    }
+
+    func run(
+        actionHandler _: @escaping @Sendable (Data) async throws -> Data,
+        lifecycleHandler _: @escaping @Sendable (RemoteLifecycleEvent) async throws -> Void
+    ) async throws {
+        await event.wait()
+    }
+
+    func cancel() {}
+}
+
 private final class HoldingRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
     private let cancellationRecorder: CancellationRecorder
 
@@ -3543,6 +3668,19 @@ private final class CancellationRecorder: @unchecked Sendable {
 
     func record() {
         lock.withLock { cancelled = true }
+    }
+}
+
+private final class AutomaticTerminationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedValues: [Bool] = []
+
+    var values: [Bool] {
+        lock.withLock { recordedValues }
+    }
+
+    func record(_ disabled: Bool) {
+        lock.withLock { recordedValues.append(disabled) }
     }
 }
 

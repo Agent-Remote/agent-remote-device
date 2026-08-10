@@ -307,9 +307,9 @@ public struct WindowCapture: Sendable {
 
         await MainActor.run {
             Self.requestProcessActivation(processID: target.processID)
-            if let bundleURL = target.bundleURL {
-                Self.requestWorkspaceActivation(at: bundleURL)
-            }
+        }
+        if let bundleURL = target.bundleURL {
+            await Self.requestWorkspaceActivation(at: bundleURL)
         }
         if try await Self.waitUntilFrontmost(
             processID: target.processID,
@@ -319,9 +319,7 @@ public struct WindowCapture: Sendable {
         }
 
         if let bundleURL = target.bundleURL {
-            await MainActor.run {
-                Self.requestWorkspaceActivation(at: bundleURL)
-            }
+            await Self.requestWorkspaceActivation(at: bundleURL)
         }
 
         if try await Self.waitUntilFrontmost(
@@ -383,14 +381,14 @@ public struct WindowCapture: Sendable {
     }
 
     @MainActor
-    private static func requestWorkspaceActivation(at bundleURL: URL) {
+    private static func requestWorkspaceActivation(at bundleURL: URL) async {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
-        NSWorkspace.shared.openApplication(
+        _ = try? await NSWorkspace.shared.openApplication(
             at: bundleURL,
             configuration: configuration
-        ) { _, _ in }
+        )
     }
 
     @MainActor

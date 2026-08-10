@@ -57,6 +57,15 @@ public struct DeviceSessionBinding: Codable, Equatable, Sendable {
             && platform == context.platform
             && generation == context.generation
     }
+
+    public func matchesSessionIdentity(_ other: DeviceSessionBinding) -> Bool {
+        userID == other.userID
+            && deviceID == other.deviceID
+            && toolSessionID == other.toolSessionID
+            && deviceSessionID == other.deviceSessionID
+            && nodeID == other.nodeID
+            && platform == other.platform
+    }
 }
 
 public struct BrokerPendingSession: Codable, Equatable, Sendable {

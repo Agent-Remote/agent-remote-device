@@ -64,6 +64,7 @@ jobs:
       - run: bash tests/release_scripts_test.sh
       - run: ruby tests/localization_catalog_test.rb
       - run: ruby tests/logging_privacy_contract_test.rb
+      - run: ruby tests/swift_concurrency_contract_test.rb
       - run: ruby tests/isolation_evidence_verifier_test.rb
       - name: Run Swift tests with coverage
         run: swift test --enable-code-coverage

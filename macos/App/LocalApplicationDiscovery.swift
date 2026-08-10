@@ -60,11 +60,11 @@ enum LocalApplicationDiscovery {
                 withBundleIdentifier: approval.application.bundleIdentifier
             )
             return applications.first(where: { application in
-                guard approval.application.bundleIdentifier.caseInsensitiveCompare(target)
-                        == .orderedSame
-                        || application.localizedName?.caseInsensitiveCompare(target)
-                        == .orderedSame
-                else {
+                guard ApplicationTargetMatching.matches(
+                    target: target,
+                    bundleIdentifier: approval.application.bundleIdentifier,
+                    displayNames: [application.localizedName].compactMap { $0 }
+                ) else {
                     return false
                 }
                 return signingIdentifier(for: application)
@@ -76,7 +76,7 @@ enum LocalApplicationDiscovery {
         else {
             throw DeviceIPCFailure.invalidMessage
         }
-        requestWorkspaceActivation(at: bundleURL)
+        await requestWorkspaceActivation(at: bundleURL)
         for attempt in 0 ..< 20 {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier
                 == application.processIdentifier
@@ -90,7 +90,7 @@ enum LocalApplicationDiscovery {
         }
 
         // Reissue the non-blocking workspace request before the longer fallback window.
-        requestWorkspaceActivation(at: bundleURL)
+        await requestWorkspaceActivation(at: bundleURL)
         for attempt in 0 ..< 80 {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier
                 == application.processIdentifier
@@ -106,14 +106,14 @@ enum LocalApplicationDiscovery {
     }
 
     @MainActor
-    private static func requestWorkspaceActivation(at bundleURL: URL) {
+    private static func requestWorkspaceActivation(at bundleURL: URL) async {
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.addsToRecentItems = false
-        NSWorkspace.shared.openApplication(
+        _ = try? await NSWorkspace.shared.openApplication(
             at: bundleURL,
             configuration: configuration
-        ) { _, _ in }
+        )
     }
 
     @MainActor

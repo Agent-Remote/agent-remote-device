@@ -3,6 +3,37 @@ import Foundation
 @testable import GUIExecutor
 import Testing
 
+@Test func accessibilityActionsExcludeProtocolUnsafeSystemMetadata() {
+    #expect(AccessibilityTraversal.protocolSafeActions([
+        "AXPress",
+        "AXShowMenu",
+        "AXCustom\nAction",
+        "AXCustom\u{0000}Action",
+        "",
+        String(repeating: "A", count: 129),
+    ]) == ["AXPress", "AXShowMenu"])
+}
+
+@MainActor
+@Test func editableFocusFallsBackToPressOnlyForNativeAppleApplications() {
+    #expect(AccessibilityRuntime.shouldFallbackEditableTextFocusToPress(
+        applicationBundleIdentifier: "com.apple.Maps",
+        actions: ["AXPress", "AXShowMenu"]
+    ))
+    #expect(!AccessibilityRuntime.shouldFallbackEditableTextFocusToPress(
+        applicationBundleIdentifier: "com.apple.Maps",
+        actions: ["AXShowMenu"]
+    ))
+    #expect(!AccessibilityRuntime.shouldFallbackEditableTextFocusToPress(
+        applicationBundleIdentifier: "com.google.Chrome",
+        actions: ["AXPress"]
+    ))
+    #expect(!AccessibilityRuntime.shouldFallbackEditableTextFocusToPress(
+        applicationBundleIdentifier: nil,
+        actions: ["AXPress"]
+    ))
+}
+
 @MainActor
 @Test func accessibilityValueFreshnessTreatsMissingEmptyValueAsCleared() {
     #expect(AccessibilityRuntime.valueMatches(nil, expectedValue: ""))

@@ -138,14 +138,22 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
         lifecycleHandler: @escaping @Sendable (RemoteLifecycleEvent) async throws -> Void
     ) async throws {
         while true {
-            let header = try await receiveExact(4, from: secureConnection)
+            let header = try await Self.raceOperationAgainstRelayDisconnect(
+                bridgeTask: bridgeTask
+            ) { [secureConnection] in
+                try await receiveExact(4, from: secureConnection)
+            }
             let length = header.withUnsafeBytes { bytes -> UInt32 in
                 bytes.loadUnaligned(as: UInt32.self).bigEndian
             }
             guard length > 0, length <= UInt32(maximumFrameBytes) else {
                 throw NetworkBrokerNestedTLSRelayFailure.invalidFrame
             }
-            let framedData = try await receiveExact(Int(length), from: secureConnection)
+            let framedData = try await Self.raceOperationAgainstRelayDisconnect(
+                bridgeTask: bridgeTask
+            ) { [secureConnection] in
+                try await receiveExact(Int(length), from: secureConnection)
+            }
             let framedRequest = try strictFramedRequest(framedData, binding: binding)
             let response: Data
             let shouldEnd: Bool
@@ -174,7 +182,10 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
             var responseLength = UInt32(response.count).bigEndian
             var framedResponse = Data(bytes: &responseLength, count: 4)
             framedResponse.append(response)
-            try await send(framedResponse, over: secureConnection)
+            try await Self.raceOperationAgainstRelayDisconnect(bridgeTask: bridgeTask) {
+                [secureConnection, framedResponse] in
+                try await send(framedResponse, over: secureConnection)
+            }
             if shouldEnd { return }
         }
     }
@@ -192,10 +203,19 @@ public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unch
         bridgeTask: Task<Void, Error>,
         actionHandler: @escaping ActionHandler
     ) async throws -> Data {
-        let result = RelayOneShot<Data>()
+        try await raceOperationAgainstRelayDisconnect(bridgeTask: bridgeTask) {
+            try await actionHandler(request)
+        }
+    }
+
+    private static func raceOperationAgainstRelayDisconnect<Value: Sendable>(
+        bridgeTask: Task<Void, Error>,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let result = RelayOneShot<Value>()
         let actionTask = Task {
             do {
-                await result.resolve(.success(try await actionHandler(request)))
+                await result.resolve(.success(try await operation()))
             } catch {
                 await result.resolve(.failure(error))
             }
@@ -321,18 +341,30 @@ private func bridge(
 ) async throws {
     try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask {
-            while true {
-                let data = try await receiveChunk(
-                    from: rawConnection,
-                    maximumLength: NetworkBrokerNestedTLSRelay.transportChunkBytes
-                )
-                try await websocket.send(data)
+            do {
+                while true {
+                    let data = try await receiveChunk(
+                        from: rawConnection,
+                        maximumLength: NetworkBrokerNestedTLSRelay.transportChunkBytes
+                    )
+                    try await websocket.send(data)
+                }
+            } catch {
+                rawConnection.cancel()
+                websocket.cancel()
+                throw error
             }
         }
         group.addTask {
-            while true {
-                let data = try await websocket.receive()
-                try await send(data, over: rawConnection)
+            do {
+                while true {
+                    let data = try await websocket.receive()
+                    try await send(data, over: rawConnection)
+                }
+            } catch {
+                rawConnection.cancel()
+                websocket.cancel()
+                throw error
             }
         }
         _ = try await group.next()

@@ -150,6 +150,64 @@ func relayDisconnectCancelsAnInFlightActionWithoutWaitingForItsReply() async thr
     try await actionCancelled.value()
 }
 
+@Test(.timeLimit(.minutes(1)))
+func idleRelayReturnsConnectionFailureWhenItsWebSocketDisconnects() async throws {
+    let deviceIdentity = try NestedTLSGenerationIdentity.generate()
+    let proxyIdentity = try NestedTLSGenerationIdentity.generate()
+    let context = String(repeating: "cd", count: 32)
+    let generation: UInt64 = 8
+    let binding = DeviceSessionBinding(
+        userID: UUID(uuidString: "30000000-0000-4000-8000-000000000001")!,
+        deviceID: UUID(uuidString: "30000000-0000-4000-8000-000000000002")!,
+        toolSessionID: UUID(uuidString: "30000000-0000-4000-8000-000000000003")!,
+        deviceSessionID: UUID(uuidString: "30000000-0000-4000-8000-000000000004")!,
+        nodeID: UUID(uuidString: "30000000-0000-4000-8000-000000000005")!,
+        platform: .macos,
+        generation: generation
+    )
+    let deviceMaterial = try NestedTLSGenerationMaterial(
+        generation: generation,
+        expectedPeerSPKISHA256Hex: proxyIdentity.spkiSHA256,
+        exporterContextHex: context
+    )
+    let proxyMaterial = try NestedTLSGenerationMaterial(
+        generation: generation,
+        expectedPeerSPKISHA256Hex: deviceIdentity.spkiSHA256,
+        exporterContextHex: context
+    )
+    let deviceInbox = MemoryWebSocketInbox()
+    let proxyInbox = MemoryWebSocketInbox()
+    let deviceWebSocket = MemoryWebSocket(inbox: deviceInbox, peerInbox: proxyInbox)
+    let proxyWebSocket = MemoryWebSocket(inbox: proxyInbox, peerInbox: deviceInbox)
+
+    async let establishedRelay = NetworkBrokerNestedTLSRelay.establish(
+        identity: deviceIdentity,
+        material: deviceMaterial,
+        binding: binding,
+        websocket: deviceWebSocket
+    )
+    let proxyConnection = try await makeProxyTLSConnection(
+        identity: proxyIdentity,
+        material: proxyMaterial,
+        websocket: proxyWebSocket
+    )
+    try await confirmProxy(proxyConnection, material: proxyMaterial, binding: binding)
+    let relay = try await establishedRelay
+    let relayTask = Task {
+        try await relay.run(actionHandler: { _ in Data() }, lifecycleHandler: { _ in })
+    }
+
+    await deviceInbox.close()
+    do {
+        try await relayTask.value
+        Issue.record("Disconnected idle relay unexpectedly returned successfully")
+    } catch let failure as NetworkBrokerNestedTLSRelayFailure {
+        #expect(failure == .connectionFailed)
+    }
+    proxyConnection.cancel()
+    relay.cancel()
+}
+
 private func makeProxyTLSConnection(
     identity: NestedTLSGenerationIdentity,
     material: NestedTLSGenerationMaterial,

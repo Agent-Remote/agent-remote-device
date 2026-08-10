@@ -59,6 +59,26 @@ import DeviceSecurity
     #expect(value.matches(v1))
     #expect(value.matches(v2))
     #expect(!binding(generation: 8).matches(v2))
+    let nextGeneration = DeviceSessionBinding(
+        userID: value.userID,
+        deviceID: value.deviceID,
+        toolSessionID: value.toolSessionID,
+        deviceSessionID: value.deviceSessionID,
+        nodeID: value.nodeID,
+        platform: value.platform,
+        generation: 8
+    )
+    #expect(value.matchesSessionIdentity(nextGeneration))
+    let differentSession = DeviceSessionBinding(
+        userID: value.userID,
+        deviceID: value.deviceID,
+        toolSessionID: value.toolSessionID,
+        deviceSessionID: UUID(),
+        nodeID: value.nodeID,
+        platform: value.platform,
+        generation: value.generation
+    )
+    #expect(!value.matchesSessionIdentity(differentSession))
 }
 
 @Test func ipcDecoderRejectsDuplicateAndUnknownFieldsAtEveryLevel() throws {

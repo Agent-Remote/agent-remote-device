@@ -458,9 +458,14 @@ final class DeviceBrokerClient: @unchecked Sendable {
     private func receiveRuntimeEvent(_ event: BrokerRuntimeEvent) async throws {
         try event.validate()
         let values = lock.withLock { (activeBinding, runtimeEventHandler) }
-        guard values.0 == event.binding, let handler = values.1 else {
+        guard let activeBinding = values.0,
+              event.binding.generation >= activeBinding.generation,
+              event.binding.matchesSessionIdentity(activeBinding),
+              let handler = values.1
+        else {
             throw DeviceBrokerClientFailure.bindingMismatch
         }
+        setActiveBinding(event.binding)
         try await handler(event.kind)
         if event.kind == .sessionEnded {
             setActiveBinding(nil)
@@ -471,9 +476,13 @@ final class DeviceBrokerClient: @unchecked Sendable {
         _ request: BrokerApplicationActivationRequest
     ) async throws {
         try request.validate()
-        guard lock.withLock({ activeBinding }) == request.binding else {
+        guard let activeBinding = lock.withLock({ activeBinding }),
+              request.binding.generation >= activeBinding.generation,
+              request.binding.matchesSessionIdentity(activeBinding)
+        else {
             throw DeviceBrokerClientFailure.bindingMismatch
         }
+        setActiveBinding(request.binding)
         try await LocalApplicationDiscovery.activate(
             target: request.targetApplication,
             approvals: request.approvals

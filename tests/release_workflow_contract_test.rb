@@ -15,6 +15,9 @@ raise "version preparation does not create an immutable tag" unless prepare_comm
 raise "version preparation does not dispatch the protected release" unless prepare_commands.include?("prepare-release.yml")
 prepare_script = File.read(File.join(repository_root, "scripts/prepare-version.sh"))
 raise "version preparation does not update Cargo.lock" unless prepare_script.include?('lock_path = Path("Cargo.lock")')
+raise "version preparation does not update fuzz/Cargo.lock" unless prepare_script.include?('fuzz_lock_path = Path("fuzz/Cargo.lock")')
+raise "version preparation does not verify locked fuzz metadata" unless prepare_script.include?("--manifest-path fuzz/Cargo.toml --format-version=1 --locked")
+raise "version preparation does not commit fuzz/Cargo.lock" unless prepare_commands.include?("git add Cargo.toml Cargo.lock fuzz/Cargo.lock README.md")
 
 rust_steps = ci.dig("jobs", "rust", "steps")
 raise "CI Rust job is missing" unless rust_steps

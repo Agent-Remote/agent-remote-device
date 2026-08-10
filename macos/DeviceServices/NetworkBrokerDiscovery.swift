@@ -34,14 +34,28 @@ public actor NetworkBrokerDiscoveryCoordinator {
         if let pendingSession,
            let refreshed = inbox.first(where: { $0.id == pendingSession.id })
         {
-            guard refreshed.binding == pendingSession.binding,
-                  refreshed.status == .pendingUserApproval
-            else {
+            guard refreshed.binding == pendingSession.binding else {
                 self.pendingSession = nil
                 throw NetworkBrokerControlPlaneFailure.bindingMismatch
             }
-            self.pendingSession = refreshed
-            return BrokerPendingSession(binding: refreshed.binding, expiresAt: refreshed.expiresAt)
+            switch refreshed.status {
+            case .pendingDevice:
+                let connected = try await client.markDeviceConnected(refreshed, now: now)
+                self.pendingSession = connected
+                return BrokerPendingSession(
+                    binding: connected.binding,
+                    expiresAt: connected.expiresAt
+                )
+            case .pendingUserApproval:
+                self.pendingSession = refreshed
+                return BrokerPendingSession(
+                    binding: refreshed.binding,
+                    expiresAt: refreshed.expiresAt
+                )
+            default:
+                self.pendingSession = nil
+                throw NetworkBrokerControlPlaneFailure.bindingMismatch
+            }
         }
 
         self.pendingSession = nil
@@ -248,12 +262,22 @@ public actor NetworkBrokerDiscoveryCoordinator {
     ) async throws -> ExecutorSessionConfiguration {
         guard let activeSession,
               activeSession.binding == configuration.binding,
-              activeSession.leaseUntil == configuration.leaseUntil
+              activeSession.leaseUntil == configuration.leaseUntil,
+              rotatingBinding == nil
         else {
             throw NetworkBrokerControlPlaneFailure.bindingMismatch
         }
         let client = try makeClient(now: now)
         let renewed = try await client.renew(activeSession, now: now)
+        // The actor is reentrant while the HTTP request is in flight. A relay
+        // disconnect may rotate the generation during that await, so an old
+        // renewal response must never overwrite the replacement session.
+        guard rotatingBinding == nil,
+              self.activeSession == activeSession,
+              renewed.binding == activeSession.binding
+        else {
+            throw NetworkBrokerControlPlaneFailure.bindingMismatch
+        }
         guard let leaseUntil = renewed.leaseUntil else {
             throw NetworkBrokerControlPlaneFailure.invalidResponse
         }

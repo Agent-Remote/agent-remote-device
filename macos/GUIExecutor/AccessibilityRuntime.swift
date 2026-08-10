@@ -148,6 +148,16 @@ public final class AccessibilityRuntime {
         isEditableTextRole(role, settable: settable)
     }
 
+    static func shouldFallbackEditableTextFocusToPress(
+        applicationBundleIdentifier: String?,
+        actions: [String]
+    ) -> Bool {
+        guard actions.contains(kAXPressAction as String),
+              let applicationBundleIdentifier
+        else { return false }
+        return applicationBundleIdentifier.lowercased().hasPrefix("com.apple.")
+    }
+
     public func rebindCurrent(
         context window: WindowContext,
         stateGeneration: UInt64
@@ -250,9 +260,17 @@ public final class AccessibilityRuntime {
             // Chromium and Electron may expose AXPress on editable nodes even
             // though the requested operation is only focus. Calling AXPress can
             // block the target application's AX IPC, so focus the field directly.
+            // Some native Apple search fields reject AXFocused while exposing a
+            // working AXPress; use that fallback only for Apple-owned apps.
             if Self.shouldFocusEditableTextDirectly(role: node.role, settable: node.settable) {
-                guard try focusEditableTextTarget(target) else {
-                    throw AccessibilityFailure.operationFailed
+                if try !focusEditableTextTarget(target) {
+                    guard Self.shouldFallbackEditableTextFocusToPress(
+                        applicationBundleIdentifier: bundleIdentifier(of: element),
+                        actions: node.actions
+                    ) else {
+                        throw AccessibilityFailure.operationFailed
+                    }
+                    try performNamedAction(kAXPressAction as String, on: element)
                 }
             } else {
                 try performNamedAction(kAXPressAction as String, on: element)
@@ -313,6 +331,12 @@ public final class AccessibilityRuntime {
             CFGetTypeID(rawFocused) == AXUIElementGetTypeID()
         else { return false }
         return CFEqual(rawFocused, element)
+    }
+
+    private func bundleIdentifier(of element: AXUIElement) -> String? {
+        var processID: pid_t = 0
+        guard AXUIElementGetPid(element, &processID) == .success else { return nil }
+        return NSRunningApplication(processIdentifier: processID)?.bundleIdentifier
     }
 
     public func valueMatches(_ expectedValue: String, target: ElementTarget) throws -> Bool {
@@ -957,7 +981,9 @@ private struct BoundedAXRenderer {
         _ = AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable)
         var actionValues: CFArray?
         _ = AXUIElementCopyActionNames(element, &actionValues)
-        let rawActions = (actionValues as? [String]) ?? []
+        let rawActions = AccessibilityTraversal.protocolSafeActions(
+            (actionValues as? [String]) ?? []
+        )
         let exposedActions = AccessibilityTraversal.exposedActions(
             rawActions,
             role: rawRole
@@ -1329,6 +1355,16 @@ enum AccessibilityTraversal {
     private static let lowValueStructuralActions = [
         "AXShowMenu", "AXScrollToVisible",
     ]
+
+    static func protocolSafeActions(_ actions: [String]) -> [String] {
+        actions.filter { action in
+            !action.isEmpty
+                && action.count <= 128
+                && action.unicodeScalars.allSatisfy {
+                    !CharacterSet.controlCharacters.contains($0)
+                }
+        }
+    }
 
     static func shouldVisitStandardQueue(
         preferredQueueBurstCount: Int,

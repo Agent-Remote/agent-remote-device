@@ -5,6 +5,7 @@ import Foundation
 
 private let maximumControlPlaneResponseBytes = 256 * 1_024
 private let maximumInboxItems = 32
+private let maximumControlPlaneClockSkewSeconds: TimeInterval = 5
 
 public enum ControlPlaneSessionStatus: String, Codable, Sendable {
     case pendingDevice = "pending_device"
@@ -164,15 +165,18 @@ public final class BoundedNetworkBrokerHTTPTransport: NSObject, NetworkBrokerHTT
 public struct NetworkBrokerControlPlaneClient: Sendable {
     private let credential: NetworkBrokerCredential
     private let transport: any NetworkBrokerHTTPTransport
+    private let nowProvider: @Sendable () -> Date
 
     public init(
         credential: NetworkBrokerCredential,
         transport: any NetworkBrokerHTTPTransport = BoundedNetworkBrokerHTTPTransport(),
+        nowProvider: @escaping @Sendable () -> Date = { Date() },
         now: Date = Date()
     ) throws {
         try credential.validate(now: now)
         self.credential = credential
         self.transport = transport
+        self.nowProvider = nowProvider
     }
 
     public func deviceInbox(now: Date = Date()) async throws -> [ControlPlaneDeviceSession] {
@@ -627,7 +631,11 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
         try validateSessionObject(item)
         let envelope = try decoder().decode(DeviceSessionEnvelope.self, from: data)
         if allowTerminal {
-            try validateTerminal(envelope.data, now: now)
+            // The server records stopped_at after the request begins and its
+            // clock can be slightly ahead. Keep that tolerance small and bound.
+            let responseTime = max(now, nowProvider())
+                .addingTimeInterval(maximumControlPlaneClockSkewSeconds)
+            try validateTerminal(envelope.data, now: responseTime)
         } else {
             try validate(envelope.data, now: now)
         }

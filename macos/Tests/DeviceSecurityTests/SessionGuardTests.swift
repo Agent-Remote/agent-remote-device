@@ -2,6 +2,36 @@ import DeviceProtocol
 import Darwin
 import Foundation
 import Testing
+
+@Test func applicationTargetsMatchExactLocalizedAndBundleDerivedNames() {
+    #expect(ApplicationTargetMatching.matches(
+        target: "com.apple.ActivityMonitor",
+        bundleIdentifier: "com.apple.ActivityMonitor"
+    ))
+    #expect(ApplicationTargetMatching.matches(
+        target: "Activity Monitor",
+        bundleIdentifier: "com.apple.ActivityMonitor",
+        displayNames: ["活动监视器"]
+    ))
+    #expect(ApplicationTargetMatching.matches(
+        target: "活动监视器",
+        bundleIdentifier: "com.apple.ActivityMonitor",
+        displayNames: ["活动监视器"]
+    ))
+    #expect(ApplicationTargetMatching.matches(
+        target: "App Store",
+        bundleIdentifier: "com.apple.AppStore"
+    ))
+    #expect(!ApplicationTargetMatching.matches(
+        target: "Calculator",
+        bundleIdentifier: "com.apple.ActivityMonitor",
+        displayNames: ["活动监视器"]
+    ))
+    #expect(!ApplicationTargetMatching.matches(
+        target: "---",
+        bundleIdentifier: "com.apple.ActivityMonitor"
+    ))
+}
 @testable import DeviceSecurity
 
 @Test func runningCodeIdentityValidatesTheBoundLiveProcess() {

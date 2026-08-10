@@ -291,6 +291,19 @@ pub struct ActionResponseV2 {
 }
 
 impl ActionResponseV2 {
+    pub fn discard_unsafe_ax_actions(&mut self) {
+        let Some(observation) = &mut self.observation else {
+            return;
+        };
+        for node in &mut observation.nodes {
+            node.actions.retain(|action| {
+                !action.is_empty()
+                    && action.chars().count() <= MAX_AX_ACTION_CHARACTERS
+                    && !action.chars().any(char::is_control)
+            });
+        }
+    }
+
     pub fn validate_payload(&self, policy: &ObservationPolicy) -> bool {
         self.validate_payload_reason(policy).is_ok()
     }
@@ -644,6 +657,31 @@ mod tests {
         assert_eq!(
             response.validate_payload_reason(&policy),
             Err("ax_removed_present")
+        );
+    }
+
+    #[test]
+    fn discards_protocol_unsafe_ax_actions_without_dropping_the_node() {
+        let raw = include_str!("../../protocol/test-vectors/action-response-v2-valid.json");
+        let mut response: ActionResponseV2 =
+            serde_json::from_str(raw).expect("valid v2 response fixture");
+        let node = &mut response.observation.as_mut().expect("observation").nodes[0];
+        node.actions = vec![
+            "AXPress".to_owned(),
+            "AXCustom\nAction".to_owned(),
+            "".to_owned(),
+            "A".repeat(MAX_AX_ACTION_CHARACTERS + 1),
+        ];
+
+        assert_eq!(
+            response.validate_payload_reason(&ObservationPolicy::default()),
+            Err("ax_action_empty")
+        );
+        response.discard_unsafe_ax_actions();
+        assert!(response.validate_payload(&ObservationPolicy::default()));
+        assert_eq!(
+            response.observation.expect("observation").nodes[0].actions,
+            vec!["AXPress"]
         );
     }
 }

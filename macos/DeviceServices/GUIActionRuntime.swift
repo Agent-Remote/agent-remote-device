@@ -292,16 +292,14 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         if let targetApplication {
             candidates = await MainActor.run {
                 approvedApplications.filter { application in
-                    if application.bundleIdentifier.caseInsensitiveCompare(targetApplication)
-                        == .orderedSame
-                    {
-                        return true
-                    }
-                    return NSRunningApplication.runningApplications(
+                    let displayNames = NSRunningApplication.runningApplications(
                         withBundleIdentifier: application.bundleIdentifier
-                    ).contains {
-                        $0.localizedName?.caseInsensitiveCompare(targetApplication) == .orderedSame
-                    }
+                    ).compactMap(\.localizedName)
+                    return ApplicationTargetMatching.matches(
+                        target: targetApplication,
+                        bundleIdentifier: application.bundleIdentifier,
+                        displayNames: displayNames
+                    )
                 }
             }
         } else {
@@ -710,8 +708,8 @@ enum ActionSettleTiming {
         switch action {
         case .press:
             !pressTargetsEditableText
-        case .secondaryAction:
-            true
+        case let .secondaryAction(_, actionName):
+            !["AXScrollToVisible", "AXShowMenu"].contains(actionName)
         case let .coordinate(action):
             switch action {
             case .leftClick, .rightClick, .middleClick, .doubleClick, .tripleClick:
