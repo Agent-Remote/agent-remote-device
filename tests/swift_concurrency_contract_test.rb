@@ -16,3 +16,10 @@ activation_sources.each do |relative|
     abort("#{relative} must not use an actor-isolated NSWorkspace completion handler")
   end
 end
+
+Dir.glob(File.join(root, "macos/**/*.swift")).each do |path|
+  source = File.read(path)
+  next unless source.match?(/\bweak\s+let\b/)
+
+  abort("#{path.delete_prefix("#{root}/")} must not use weak let because release Swift requires weak var")
+end

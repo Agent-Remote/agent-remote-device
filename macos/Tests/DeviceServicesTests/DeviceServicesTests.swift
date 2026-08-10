@@ -2240,12 +2240,12 @@ import Testing
     #expect(approvalError == nil)
     await completed.wait()
     #expect(approvalUI.activationCount() == 0)
-    weak let releasedBroker = broker
+    let releasedBroker = WeakReference(broker)
     broker = nil
-    for _ in 0 ..< 100 where releasedBroker != nil {
+    for _ in 0 ..< 100 where releasedBroker.value != nil {
         try await Task.sleep(for: .milliseconds(1))
     }
-    #expect(releasedBroker == nil)
+    #expect(releasedBroker.value == nil)
 }
 
 @Test func networkBrokerActivatesTheSelectedApplicationForLegacyActions() async throws {
@@ -3681,6 +3681,14 @@ private final class AutomaticTerminationRecorder: @unchecked Sendable {
 
     func record(_ disabled: Bool) {
         lock.withLock { recordedValues.append(disabled) }
+    }
+}
+
+private final class WeakReference<Value: AnyObject> {
+    weak var value: Value?
+
+    init(_ value: Value?) {
+        self.value = value
     }
 }
 
