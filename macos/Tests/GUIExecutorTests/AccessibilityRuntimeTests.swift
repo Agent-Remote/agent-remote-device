@@ -465,6 +465,15 @@ import Testing
     #expect(superAlias == command)
 }
 
+@Test func keyParserAcceptsPageNavigationAliases() throws {
+    #expect(try KeyParser.parse("Page Up").keyCode == 116)
+    #expect(try KeyParser.parse("PageUp").keyCode == 116)
+    #expect(try KeyParser.parse("Page Down").keyCode == 121)
+    #expect(try KeyParser.parse("PageDown").keyCode == 121)
+    #expect(try KeyParser.parse("Home").keyCode == 115)
+    #expect(try KeyParser.parse("End").keyCode == 119)
+}
+
 @Test func accessibilityVisibilityRejectsHiddenAndOffWindowContent() {
     let window = CGRect(x: 100, y: 100, width: 800, height: 600)
 

@@ -201,6 +201,9 @@ pub struct ActParameters {
     pub delta_y: Option<i32>,
     /// type=left_click_drag or type=hold_key only.
     pub duration_ms: Option<u32>,
+    /// Optional adaptive-settle deadline. Omit for the normal 5000 ms maximum;
+    /// a short value is useful for explicitly exercising finite timeout recovery.
+    pub settle_timeout_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -247,6 +250,12 @@ pub enum ScrollDirectionParameter {
 
 impl ActParameters {
     fn validate_shape(&self) -> bool {
+        if self
+            .settle_timeout_ms
+            .is_some_and(|value| !(1..=crate::protocol_v2::MAX_SETTLE_TIMEOUT_MS).contains(&value))
+        {
+            return false;
+        }
         let no_element_fields = self.element_index.is_none()
             && self.state_id.is_none()
             && self.state_generation.is_none()
@@ -1122,7 +1131,7 @@ impl DeviceMcp {
     }
 
     #[tool(
-        description = "Act on the latest observed Mac UI. Element forms: press={state_id,state_generation,element_index}; set_value adds value; clear_value uses the same three fields; select_text requires non-empty text and may add prefix, suffix, or selection_type; scroll_element adds direction; secondary_action adds action_name. Use an element form only when the latest node exposes the required AX action; scroll_element needs the matching AXScroll...ByPage action, otherwise use bounded context scroll. Use press, not left_click, for an AX element. Context forms never take state or element fields: key={key}; type={text}; left_click/right_click/middle_click/double_click/triple_click/mouse_move={coordinate}; left_click_drag={start,end,duration_ms?}; scroll={delta_x,delta_y,coordinate?}; wait={duration_ms}. Key uses macOS names and + modifiers, for example cmd+Left, cmd+[, cmd+a, or Return. Coordinates require a latest model-visible screenshot. A successful result already contains the next AX diff"
+        description = "Act on the latest observed Mac UI. Element forms: press={state_id,state_generation,element_index}; set_value adds value; clear_value uses the same three fields; select_text requires non-empty text and may add prefix, suffix, or selection_type; scroll_element adds direction; secondary_action adds action_name. Use an element form only when the latest node exposes the required AX action; scroll_element needs the matching AXScroll...ByPage action, otherwise use bounded context scroll. Use press, not left_click, for an AX element. Context forms never take state or element fields: key={key}; type={text}; left_click/right_click/middle_click/double_click/triple_click/mouse_move={coordinate}; left_click_drag={start,end,duration_ms?}; scroll={delta_x,delta_y,coordinate?}; wait={duration_ms}. Key uses macOS names and + modifiers, for example cmd+Left, Page Down, Home, cmd+a, or Return. Coordinates require a latest model-visible screenshot. A successful result already contains the next AX diff. settle_timeout_ms is optional and should only be shortened for bounded timeout-path testing"
     )]
     async fn act(
         &self,
@@ -1136,6 +1145,7 @@ impl DeviceMcp {
             .supports_v2()
             .await
             .map_err(|error| error.client_message())?;
+        let settle_timeout_ms = params.settle_timeout_ms;
         let action = match params.kind {
             ActKind::Press => ActionV2::Press {
                 target: self
@@ -1290,7 +1300,11 @@ impl DeviceMcp {
             }
             return Err("element actions require the negotiated ax_state_v2 capability".to_owned());
         }
-        self.dispatch_v2(action, ObservationPolicy::default()).await
+        let mut observation = ObservationPolicy::default();
+        if let Some(settle_timeout_ms) = settle_timeout_ms {
+            observation.settle_timeout_ms = settle_timeout_ms;
+        }
+        self.dispatch_v2(action, observation).await
     }
 
     #[tool(
@@ -1713,6 +1727,7 @@ mod tests {
             serde_json::json!({"type": "left_mouse_up"}),
             serde_json::json!({"type": "type", "text": "hello"}),
             serde_json::json!({"type": "key", "key": "RETURN"}),
+            serde_json::json!({"type": "key", "key": "Page Down", "settle_timeout_ms": 1}),
             serde_json::json!({"type": "hold_key", "key": "SHIFT", "duration_ms": 250}),
             serde_json::json!({"type": "scroll", "delta_x": 0, "delta_y": 400, "coordinate": [10, 20]}),
             serde_json::json!({"type": "wait", "duration_ms": 250}),
@@ -1730,6 +1745,16 @@ mod tests {
         }))
         .expect("known fields");
         assert!(!invalid.validate_shape());
+
+        for settle_timeout_ms in [0, crate::protocol_v2::MAX_SETTLE_TIMEOUT_MS + 1] {
+            let invalid_timeout: ActParameters = serde_json::from_value(serde_json::json!({
+                "type": "key",
+                "key": "RETURN",
+                "settle_timeout_ms": settle_timeout_ms
+            }))
+            .expect("known fields");
+            assert!(!invalid_timeout.validate_shape());
+        }
 
         let missing_text: ActParameters = serde_json::from_value(serde_json::json!({
             "type": "select_text",

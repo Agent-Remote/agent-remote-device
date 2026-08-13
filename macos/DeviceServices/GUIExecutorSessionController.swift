@@ -18,13 +18,33 @@ public actor GUIExecutorSessionController {
     private var lastCompletedRequest: Data?
     private var lastCompletedResponse: Data?
     private let runtimeFactory: RuntimeFactory
+    private let automaticTerminationHandler: @Sendable (Bool) -> Void
+    private var automaticTerminationDisabled = false
 
     public init(
         runtimeFactory: @escaping RuntimeFactory = { guardState in
             await LiveGUIActionRuntime.make(guardState: guardState)
+        },
+        automaticTerminationHandler: @escaping @Sendable (Bool) -> Void = { disabled in
+            if disabled {
+                ProcessInfo.processInfo.disableAutomaticTermination(
+                    "Active Agent Remote GUI execution"
+                )
+            } else {
+                ProcessInfo.processInfo.enableAutomaticTermination(
+                    "Active Agent Remote GUI execution"
+                )
+            }
         }
     ) {
         self.runtimeFactory = runtimeFactory
+        self.automaticTerminationHandler = automaticTerminationHandler
+    }
+
+    deinit {
+        if automaticTerminationDisabled {
+            automaticTerminationHandler(false)
+        }
     }
 
     public func updateSession(_ data: Data) async throws {
@@ -52,6 +72,7 @@ public actor GUIExecutorSessionController {
         turnPaused = false
         requiresFreshScreenshot = false
         clearReplayCache()
+        disableAutomaticTerminationIfNeeded()
     }
 
     public func performAction(_ data: Data) async throws -> Data {
@@ -225,6 +246,19 @@ public actor GUIExecutorSessionController {
         turnPaused = false
         requiresFreshScreenshot = false
         clearReplayCache()
+        enableAutomaticTerminationIfNeeded()
+    }
+
+    private func disableAutomaticTerminationIfNeeded() {
+        guard !automaticTerminationDisabled else { return }
+        automaticTerminationDisabled = true
+        automaticTerminationHandler(true)
+    }
+
+    private func enableAutomaticTerminationIfNeeded() {
+        guard automaticTerminationDisabled else { return }
+        automaticTerminationDisabled = false
+        automaticTerminationHandler(false)
     }
 
     private func clearReplayCache() {

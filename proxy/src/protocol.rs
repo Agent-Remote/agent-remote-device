@@ -153,8 +153,9 @@ fn valid_key(key: &str) -> bool {
     }) {
         return false;
     }
+    let normalized_key_name = normalize_key_name(key_name);
     matches!(
-        key_name.to_ascii_uppercase().as_str(),
+        normalized_key_name.as_str(),
         "A" | "S"
             | "D"
             | "F"
@@ -211,7 +212,20 @@ fn valid_key(key: &str) -> bool {
             | "RIGHT"
             | "DOWN"
             | "UP"
+            | "PAGEUP"
+            | "PAGEDOWN"
+            | "HOME"
+            | "END"
     )
+}
+
+fn normalize_key_name(key_name: &str) -> String {
+    let uppercased = key_name.to_ascii_uppercase();
+    match uppercased.as_str() {
+        "PAGE UP" | "PAGE_UP" | "PAGE-UP" => "PAGEUP".to_owned(),
+        "PAGE DOWN" | "PAGE_DOWN" | "PAGE-DOWN" => "PAGEDOWN".to_owned(),
+        _ => uppercased,
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +242,9 @@ mod tests {
             assert!(valid_key(key), "expected {key} to be accepted");
         }
         assert!(valid_key("SUPER+["));
+        for key in ["Page Up", "PageUp", "Page Down", "PageDown", "Home", "End"] {
+            assert!(valid_key(key), "expected {key} to be accepted");
+        }
         assert!(!valid_key("CMD+`"));
         assert!(!valid_key("not/a/key"));
     }

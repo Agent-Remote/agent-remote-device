@@ -144,7 +144,7 @@ public enum Action: Sendable, Equatable {
     private static func isValidKey(_ key: String) -> Bool {
         !key.isEmpty && key.utf8.count <= 64 && key.utf8.allSatisfy {
             ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
-                || $0 == 32 || $0 == 43 || $0 == 45 || $0 == 95
+                || [32, 39, 43, 44, 45, 46, 59, 61, 91, 92, 93, 95].contains($0)
         }
     }
 }

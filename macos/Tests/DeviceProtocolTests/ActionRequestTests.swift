@@ -162,3 +162,9 @@ import Testing
         try decoder.decode(Action.self, from: Data(#"{"type":"key","key":"CMD/DELETE"}"#.utf8))
     }
 }
+@Test func pageNavigationKeyAliasesPassProtocolValidation() {
+    for key in ["Page Up", "PageUp", "Page Down", "PageDown", "Home", "End"] {
+        #expect(Action.key(key).hasValidParameters)
+    }
+    #expect(Action.key("CMD+[").hasValidParameters)
+}

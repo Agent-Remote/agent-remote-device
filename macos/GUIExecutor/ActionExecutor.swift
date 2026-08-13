@@ -136,7 +136,22 @@ public final class ActionExecutor {
             } else {
                 false
             }
-            try accessibility.perform(action, target: target)
+            var actionError: Error?
+            for attempt in 0 ..< (requiresEditableFocus ? 12 : 1) {
+                do {
+                    try accessibility.perform(action, target: target)
+                    actionError = nil
+                    break
+                } catch let error as AccessibilityFailure where
+                    requiresEditableFocus && error == .operationFailed
+                {
+                    actionError = error
+                    if attempt < 11 {
+                        try await Task.sleep(for: .milliseconds(50))
+                    }
+                }
+            }
+            if let actionError { throw actionError }
             if requiresEditableFocus {
                 var focused = false
                 for _ in 0 ..< 10 {
@@ -640,7 +655,9 @@ struct ParsedKey: Equatable {
 enum KeyParser {
     static func parse(_ value: String) throws -> ParsedKey {
         let components = value.uppercased().split(separator: "+").map(String.init)
-        guard let keyName = components.last, let keyCode = keyCodes[keyName] else {
+        guard let rawKeyName = components.last,
+              let keyCode = keyCodes[normalizedKeyName(rawKeyName)]
+        else {
             throw ExecutionFailure.unsupportedKey
         }
         var flags: CGEventFlags = []
@@ -656,6 +673,14 @@ enum KeyParser {
         return ParsedKey(keyCode: keyCode, flags: flags)
     }
 
+    private static func normalizedKeyName(_ value: String) -> String {
+        switch value {
+        case "PAGE UP", "PAGE_UP", "PAGE-UP": "PAGEUP"
+        case "PAGE DOWN", "PAGE_DOWN", "PAGE-DOWN": "PAGEDOWN"
+        default: value
+        }
+    }
+
     private static let keyCodes: [String: CGKeyCode] = [
         "A": 0, "S": 1, "D": 2, "F": 3, "H": 4, "G": 5, "Z": 6, "X": 7,
         "C": 8, "V": 9, "B": 11, "Q": 12, "W": 13, "E": 14, "R": 15,
@@ -666,6 +691,7 @@ enum KeyParser {
         "N": 45, "M": 46, ".": 47, "TAB": 48, "SPACE": 49, "DELETE": 51,
         "ESC": 53, "ESCAPE": 53, "RETURN": 36, "ENTER": 36,
         "LEFT": 123, "RIGHT": 124, "DOWN": 125, "UP": 126,
+        "PAGEUP": 116, "PAGEDOWN": 121, "HOME": 115, "END": 119,
     ]
 }
 

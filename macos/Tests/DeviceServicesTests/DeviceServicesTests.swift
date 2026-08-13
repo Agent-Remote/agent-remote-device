@@ -1212,27 +1212,64 @@ import Testing
 
 @Test func executorSessionControllerActivatesStopsAndEndsOneBoundSession() async throws {
     let recorder = RuntimeRecorder()
-    let controller = GUIExecutorSessionController { guardState in
-        RuntimeStub(guardState: guardState, recorder: recorder)
-    }
+    let automaticTerminationRecorder = AutomaticTerminationRecorder()
+    let controller = GUIExecutorSessionController(
+        runtimeFactory: { guardState in
+            RuntimeStub(guardState: guardState, recorder: recorder)
+        },
+        automaticTerminationHandler: { disabled in
+            automaticTerminationRecorder.record(disabled)
+        }
+    )
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
     let update = try envelope(payload: JSONEncoder().encode(session)).encoded()
 
     try await controller.updateSession(update)
     #expect(await controller.hasActiveSession())
     #expect(await controller.currentState() == .active)
+    #expect(automaticTerminationRecorder.values == [true])
+
+    try await controller.renewSession(update)
+    #expect(automaticTerminationRecorder.values == [true])
 
     let stop = try envelope(payload: JSONEncoder().encode(
         BrokerAbortRequest(binding: session.binding, reason: .escape)
     )).encoded()
     try await controller.stopCurrentAction(stop)
     #expect(await controller.currentState() == .failed)
+    #expect(automaticTerminationRecorder.values == [true, false])
+
+    try await controller.updateSession(update)
+    #expect(automaticTerminationRecorder.values == [true, false, true])
 
     let end = try envelope(payload: JSONEncoder().encode(
         BrokerEndRequest(binding: session.binding)
     )).encoded()
     try await controller.endSession(end)
     #expect(await controller.currentState() == nil)
+    #expect(automaticTerminationRecorder.values == [true, false, true, false])
+}
+
+@Test func executorSessionControllerReleasesAutomaticTerminationOnDeinit() async throws {
+    let recorder = RuntimeRecorder()
+    let automaticTerminationRecorder = AutomaticTerminationRecorder()
+    var controller: GUIExecutorSessionController? = GUIExecutorSessionController(
+        runtimeFactory: { guardState in
+            RuntimeStub(guardState: guardState, recorder: recorder)
+        },
+        automaticTerminationHandler: { disabled in
+            automaticTerminationRecorder.record(disabled)
+        }
+    )
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller?.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+    #expect(automaticTerminationRecorder.values == [true])
+
+    controller = nil
+
+    #expect(automaticTerminationRecorder.values == [true, false])
 }
 
 @Test func executorReturnsAConcreteCaptureFailureInsteadOfDroppingTheRelay() async throws {
