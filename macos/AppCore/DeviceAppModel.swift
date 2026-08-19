@@ -116,14 +116,7 @@ public final class DeviceAppModel: ObservableObject {
         failureRecovery = nil
         completionMessage = nil
         permissions.refresh()
-        let approvedIdentifiers = Set(
-            presentation.applications.map { $0.application.bundleIdentifier }
-        )
-        approvalPresentation = presentation.updatingHiddenApplicationCount(
-            visibilityController.unapprovedApplicationCount(
-                approvedBundleIdentifiers: approvedIdentifiers
-            )
-        )
+        approvalPresentation = presentation
         applicationSelections = []
         clipboardSelections = []
         controlLevelSelections = Dictionary(uniqueKeysWithValues: presentation.applications.map {
@@ -315,9 +308,6 @@ public final class DeviceAppModel: ObservableObject {
         let operation = beginAsyncOperation()
         Task {
             do {
-                try visibilityController.hideUnapprovedApplications(
-                    approvedBundleIdentifiers: approvedBundleIdentifiers
-                )
                 try startSafetyMonitoring()
                 try await onApprove(approvals)
                 guard isCurrentOperation(operation), state == .activating else {
@@ -499,9 +489,6 @@ public final class DeviceAppModel: ObservableObject {
                 throw DeviceAppFailure.invalidRuntimeTransition
             }
             do {
-                try visibilityController.hideUnapprovedApplications(
-                    approvedBundleIdentifiers: approvedBundleIdentifiers
-                )
                 try startSafetyMonitoring()
                 state = .active
             } catch {

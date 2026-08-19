@@ -113,6 +113,7 @@ public protocol GUIActionRuntime: Sendable {
         context: WindowContext
     ) async throws -> String
     func releasePressedState() async
+    func restoreUserFocus() async
     func clearAccessibilityState(applicationDigest: String?) async
 }
 
@@ -198,6 +199,8 @@ public extension GUIActionRuntime {
 
     func clearAccessibilityState(applicationDigest _: String?) async {}
 
+    func restoreUserFocus() async {}
+
     func rebindAccessibilityState(
         context _: WindowContext,
         stateGeneration _: UInt64
@@ -220,6 +223,8 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
     )
     private let executor: ActionExecutor
     private let accessibility: AccessibilityRuntime
+    private var userFocusProcessID: pid_t?
+    private var activatedProcessIDs: Set<pid_t> = []
 
     private init(executor: ActionExecutor, accessibility: AccessibilityRuntime) {
         self.executor = executor
@@ -241,7 +246,6 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
-        try await captureEngine.activate(application: application)
         return try await captureEngine.capture(application: application)
     }
 
@@ -256,7 +260,6 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
-        try await captureEngine.activate(application: application)
         let dimensions = switch profile {
         case .compact: (960, 600)
         case .standard, .region: (1_280, 800)
@@ -277,7 +280,6 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
-        try await captureEngine.activate(application: application)
         return try await captureEngine.context(application: application)
     }
 
@@ -349,7 +351,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         sequence: UInt64,
         context: WindowContext
     ) async throws {
-        try await captureEngine.activate(
+        try await activateForAction(
             application: context.application,
             processID: context.processID
         )
@@ -380,10 +382,12 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         stateGeneration: UInt64,
         context: WindowContext
     ) async throws {
-        try await captureEngine.activate(
-            application: context.application,
-            processID: context.processID
-        )
+        if action.requiresForegroundApplication {
+            try await activateForAction(
+                application: context.application,
+                processID: context.processID
+            )
+        }
         try await executor.executeContextAction(
             action: action,
             sequence: sequence,
@@ -397,10 +401,6 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         stateGeneration: UInt64,
         context: WindowContext
     ) async throws -> String {
-        try await captureEngine.activate(
-            application: context.application,
-            processID: context.processID
-        )
         return try await executor.readClipboardV2(
             sequence: sequence,
             stateGeneration: stateGeneration,
@@ -586,10 +586,12 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         screenshotGeneration: UInt64,
         capture: CapturedWindow
     ) async throws {
-        try await captureEngine.activate(
-            application: capture.application,
-            processID: capture.processID
-        )
+        if action.requiresForegroundApplication {
+            try await activateForAction(
+                application: capture.application,
+                processID: capture.processID
+            )
+        }
         try await executor.execute(
             action: action,
             sequence: sequence,
@@ -604,10 +606,6 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         screenshotGeneration: UInt64,
         capture: CapturedWindow
     ) async throws {
-        try await captureEngine.activate(
-            application: capture.application,
-            processID: capture.processID
-        )
         try await executor.authorizeCaptureAction(
             action: action,
             sequence: sequence,
@@ -621,10 +619,6 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         screenshotGeneration: UInt64,
         capture: CapturedWindow
     ) async throws -> String {
-        try await captureEngine.activate(
-            application: capture.application,
-            processID: capture.processID
-        )
         return try await executor.readClipboard(
             sequence: sequence,
             screenshotGeneration: screenshotGeneration,
@@ -634,6 +628,51 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
 
     public func releasePressedState() async {
         await executor.releasePressedState()
+    }
+
+    public func restoreUserFocus() async {
+        let hasPressedState = await executor.hasPressedState
+        guard !hasPressedState else { return }
+        let processID = userFocusProcessID
+        userFocusProcessID = nil
+        let remotelyActivated = activatedProcessIDs
+        activatedProcessIDs.removeAll(keepingCapacity: false)
+        guard let processID else { return }
+        let shouldRestore = await MainActor.run {
+            guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
+            // A manual application switch supersedes the focus captured for this turn.
+            return remotelyActivated.contains(frontmost.processIdentifier)
+        }
+        guard shouldRestore else { return }
+        await MainActor.run {
+            WindowCapture.restoreUserApplication(processID: processID)
+        }
+    }
+
+    private func activateForAction(
+        application: ApplicationIdentity,
+        processID: pid_t
+    ) async throws {
+        let priorProcessID = await MainActor.run {
+            NSWorkspace.shared.frontmostApplication?.processIdentifier
+        }
+        if let priorProcessID,
+           priorProcessID != processID,
+           !activatedProcessIDs.contains(priorProcessID)
+        {
+            userFocusProcessID = priorProcessID
+        }
+        activatedProcessIDs.insert(processID)
+        do {
+            let activatedProcessID = try await captureEngine.activate(
+                application: application,
+                processID: processID
+            )
+            activatedProcessIDs.insert(activatedProcessID)
+        } catch {
+            await restoreUserFocus()
+            throw error
+        }
     }
 
     public func clearAccessibilityState(applicationDigest: String?) async {

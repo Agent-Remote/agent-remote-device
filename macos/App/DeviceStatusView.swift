@@ -323,15 +323,6 @@ private struct ApprovalView: View {
             }
             .listStyle(.inset)
 
-            Label(
-                String.localizedStringWithFormat(
-                    localizedAppString("approval.hidden_applications"),
-                    presentation.hiddenApplicationCount
-                ),
-                systemImage: "eye.slash"
-            )
-            .foregroundStyle(.secondary)
-
             HStack {
                 Button(role: .cancel) {
                     model.deny()

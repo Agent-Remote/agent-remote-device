@@ -482,11 +482,10 @@ final class DeviceBrokerClient: @unchecked Sendable {
         else {
             throw DeviceBrokerClientFailure.bindingMismatch
         }
+        // Older Brokers requested Approval UI activation before every screenshot.
+        // Keep the callback compatible, but leave focus ownership to the Executor's
+        // interactive-action path.
         setActiveBinding(request.binding)
-        try await LocalApplicationDiscovery.activate(
-            target: request.targetApplication,
-            approvals: request.approvals
-        )
     }
 }
 

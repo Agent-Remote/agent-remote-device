@@ -39,12 +39,10 @@ public struct ApprovalCandidate: Identifiable, Equatable, Sendable {
 public struct ApprovalPresentation: Equatable, Sendable {
     public let generation: UInt64
     public let applications: [ApprovalCandidate]
-    public let hiddenApplicationCount: Int
 
     public init(
         generation: UInt64,
-        applications: [ApprovalCandidate],
-        hiddenApplicationCount: Int
+        applications: [ApprovalCandidate]
     ) throws {
         guard (1 ... maximumActiveDeviceSessionGeneration).contains(generation) else {
             throw ApprovalModelFailure.invalidGeneration
@@ -55,7 +53,6 @@ public struct ApprovalPresentation: Equatable, Sendable {
         }
         self.generation = generation
         self.applications = applications
-        self.hiddenApplicationCount = max(0, hiddenApplicationCount)
     }
 
     public func approvals(
@@ -77,21 +74,4 @@ public struct ApprovalPresentation: Equatable, Sendable {
         }
     }
 
-    public func updatingHiddenApplicationCount(_ count: Int) -> ApprovalPresentation {
-        ApprovalPresentation(
-            validatedGeneration: generation,
-            applications: applications,
-            hiddenApplicationCount: count
-        )
-    }
-
-    private init(
-        validatedGeneration: UInt64,
-        applications: [ApprovalCandidate],
-        hiddenApplicationCount: Int
-    ) {
-        generation = validatedGeneration
-        self.applications = applications
-        self.hiddenApplicationCount = max(0, hiddenApplicationCount)
-    }
 }

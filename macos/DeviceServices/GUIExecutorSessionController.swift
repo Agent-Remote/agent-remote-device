@@ -79,10 +79,16 @@ public actor GUIExecutorSessionController {
         if data == lastCompletedRequest, let lastCompletedResponse {
             return lastCompletedResponse
         }
-        let response = try await performActionOnce(data)
-        lastCompletedRequest = data
-        lastCompletedResponse = response
-        return response
+        do {
+            let response = try await performActionOnce(data)
+            await runtime?.restoreUserFocus()
+            lastCompletedRequest = data
+            lastCompletedResponse = response
+            return response
+        } catch {
+            await runtime?.restoreUserFocus()
+            throw error
+        }
     }
 
     private func performActionOnce(_ data: Data) async throws -> Data {
@@ -180,6 +186,7 @@ public actor GUIExecutorSessionController {
             throw DeviceIPCFailure.invalidMessage
         }
         await runtime.releasePressedState()
+        await runtime.restoreUserFocus()
         latestCapture = nil
         latestWindowContext = nil
         await runtime.clearAccessibilityState(applicationDigest: nil)
@@ -235,6 +242,7 @@ public actor GUIExecutorSessionController {
     private func failCurrentSession() async {
         if let runtime {
             await runtime.releasePressedState()
+            await runtime.restoreUserFocus()
             await runtime.clearAccessibilityState(applicationDigest: nil)
         }
         if let guardState {

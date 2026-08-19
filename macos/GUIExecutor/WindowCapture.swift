@@ -257,14 +257,15 @@ public struct WindowCapture: Sendable {
         }
         let processID = target.processIdentifier
         let content = try await Self.withOperationTimeout {
+            // Approved full-screen windows can live on another Space while the user
+            // keeps a terminal frontmost.
             try await SCShareableContent.excludingDesktopWindows(
                 true,
-                onScreenWindowsOnly: true
+                onScreenWindowsOnly: false
             )
         }
         let windows = content.windows.filter {
             $0.owningApplication?.processID == processID
-                && $0.isOnScreen
                 && $0.frame.width > 1
                 && $0.frame.height > 1
         }
@@ -289,10 +290,11 @@ public struct WindowCapture: Sendable {
         return (processID, content, window, display, captureFrame)
     }
 
+    @discardableResult
     public func activate(
         application: ApplicationIdentity,
         processID requiredProcessID: pid_t? = nil
-    ) async throws {
+    ) async throws -> pid_t {
         guard application.bundleIdentifier != excludedBundleIdentifier else {
             throw CaptureFailure.applicationActivationRejected
         }
@@ -303,7 +305,7 @@ public struct WindowCapture: Sendable {
         let isAlreadyFrontmost = await MainActor.run {
             Self.isProcessFrontmost(target.processID)
         }
-        if isAlreadyFrontmost { return }
+        if isAlreadyFrontmost { return target.processID }
 
         await MainActor.run {
             Self.requestProcessActivation(processID: target.processID)
@@ -315,7 +317,7 @@ public struct WindowCapture: Sendable {
             processID: target.processID,
             attempts: Self.lightweightActivationAttempts
         ) {
-            return
+            return target.processID
         }
 
         if let bundleURL = target.bundleURL {
@@ -326,7 +328,7 @@ public struct WindowCapture: Sendable {
             processID: target.processID,
             attempts: Self.workspaceActivationAttempts
         ) {
-            return
+            return target.processID
         }
         throw CaptureFailure.applicationActivationTimedOut
     }
@@ -426,7 +428,7 @@ public struct WindowCapture: Sendable {
     private static func requestProcessActivation(processID: pid_t) {
         guard let application = NSRunningApplication(processIdentifier: processID) else { return }
         _ = application.unhide()
-        _ = application.activate(options: [.activateAllWindows])
+        _ = application.activate(options: [])
         requestAccessibilityActivation(processID: processID)
     }
 
@@ -438,27 +440,15 @@ public struct WindowCapture: Sendable {
             kAXFrontmostAttribute as CFString,
             kCFBooleanTrue
         )
-        raiseAccessibilityWindows(processID: processID)
     }
 
-    private static func raiseAccessibilityWindows(processID: pid_t) {
-        let application = AXUIElementCreateApplication(processID)
-        _ = AXUIElementSetAttributeValue(
-            application,
-            kAXFrontmostAttribute as CFString,
-            kCFBooleanTrue
-        )
-        var rawWindows: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            application,
-            kAXWindowsAttribute as CFString,
-            &rawWindows
-        ) == .success,
-            let windows = rawWindows as? [AXUIElement]
+    @MainActor
+    public static func restoreUserApplication(processID: pid_t) {
+        guard let application = NSRunningApplication(processIdentifier: processID),
+              !application.isTerminated
         else { return }
-        for window in windows.prefix(8) {
-            _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        }
+        _ = application.unhide()
+        _ = application.activate(options: [])
     }
 
     public static func cropped(_ capture: CapturedWindow, to region: Region) throws -> CapturedWindow {

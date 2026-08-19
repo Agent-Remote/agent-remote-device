@@ -141,6 +141,15 @@ public enum Action: Sendable, Equatable {
         }
     }
 
+    public var requiresForegroundApplication: Bool {
+        switch self {
+        case .screenshot, .screenshotApplication, .readClipboard, .wait, .zoom:
+            false
+        default:
+            true
+        }
+    }
+
     private static func isValidKey(_ key: String) -> Bool {
         !key.isEmpty && key.utf8.count <= 64 && key.utf8.allSatisfy {
             ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)

@@ -534,12 +534,6 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                             for: request,
                             configuration: configuration
                         )
-                        if selection.activatesViaApprovalUI, let target = selection.target {
-                            try await self.activateApprovalUIApplication(
-                                target,
-                                configuration: configuration
-                            )
-                        }
                         let response = try await self.performExecutorAction(request)
                         if selection.updatesTarget, let target = selection.target {
                             self.setRelayTargetApplication(target, binding: configuration.binding)
@@ -1080,8 +1074,7 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         configuration: ExecutorSessionConfiguration
     ) throws -> (
         target: String?,
-        updatesTarget: Bool,
-        activatesViaApprovalUI: Bool
+        updatesTarget: Bool
     ) {
         let envelope = try DeviceIPCEnvelope.decode(data)
         guard let object = try JSONSerialization.jsonObject(with: envelope.payload) as? [String: Any],
@@ -1092,24 +1085,21 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         let singleApprovedTarget = configuration.approvals.count == 1
             ? configuration.approvals.first?.application.bundleIdentifier
             : nil
-        let activatesViaApprovalUI: Bool
         switch version.uint8Value {
         case DeviceProtocol.protocolVersion:
-            activatesViaApprovalUI = true
             let request = try ActionRequest.decodeStrict(envelope.payload)
             switch request.action {
             case let .screenshotApplication(application):
-                return (application, true, true)
+                return (application, true)
             case .screenshot:
-                return (singleApprovedTarget, true, true)
+                return (singleApprovedTarget, true)
             default:
                 break
             }
         case DeviceProtocol.protocolVersionV2:
-            activatesViaApprovalUI = false
             let request = try ActionRequestV2.decodeStrict(envelope.payload)
             if case let .observe(application) = request.action {
-                return (application ?? singleApprovedTarget, true, false)
+                return (application ?? singleApprovedTarget, true)
             }
         default:
             throw DeviceIPCFailure.invalidMessage
@@ -1118,33 +1108,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
             lock.withLock {
                 relayBinding == configuration.binding ? relayTargetApplication : nil
             },
-            false,
-            activatesViaApprovalUI
+            false
         )
-    }
-
-    private func activateApprovalUIApplication(
-        _ target: String,
-        configuration: ExecutorSessionConfiguration
-    ) async throws {
-        let activation = BrokerApplicationActivationRequest(
-            binding: configuration.binding,
-            targetApplication: target,
-            approvals: configuration.approvals
-        )
-        try activation.validate()
-        let payload = try JSONEncoder().encode(activation)
-        let request = try DeviceIPCEnvelope(requestID: UUID(), payload: payload).encoded()
-        let continuation = XPCVoidContinuation()
-        let approvalUI = lock.withLock { self.approvalUI }
-        guard let approvalUI else { throw DeviceIPCFailure.serviceUnavailable }
-        try await continuation.wait(timeout: xpcReplyTimeout) { callback in
-            approvalUI.activateApplication(request as NSData) { error in
-                callback(error == nil
-                    ? .success(())
-                    : .failure(DeviceIPCFailure.serviceUnavailable))
-            }
-        }
     }
 
     private func setRelayTargetApplication(

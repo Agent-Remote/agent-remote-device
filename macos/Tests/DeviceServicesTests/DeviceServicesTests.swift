@@ -27,6 +27,7 @@ import Testing
 
     #expect(replay == first)
     #expect(await recorder.captureCount == 1)
+    #expect(await recorder.lifecycleEvents == ["restore_focus"])
 
     try await controller.updateSession(update)
     _ = try await controller.performAction(request)
@@ -1580,7 +1581,7 @@ import Testing
     #expect(await recorder.actions == [.wait(50)])
 }
 
-@Test func executorPausesOneTurnAndRequiresANewScreenshotAfterResume() async throws {
+@Test func executorPauseReleasesInputThenRestoresFocusAndRequiresANewScreenshot() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
         RuntimeStub(guardState: guardState, recorder: recorder)
@@ -1604,6 +1605,7 @@ import Testing
     #expect(await !controller.hasActiveSession())
     #expect(await controller.currentState() == .active)
     #expect(await recorder.releaseCount == 1)
+    #expect(await recorder.lifecycleEvents.suffix(2) == ["release", "restore_focus"])
 
     let started = BrokerRuntimeEvent(binding: session.binding, kind: .turnStarted)
     try await controller.resumeTurn(
@@ -2285,7 +2287,7 @@ import Testing
     #expect(releasedBroker.value == nil)
 }
 
-@Test func networkBrokerActivatesTheSelectedApplicationForLegacyActions() async throws {
+@Test func networkBrokerLeavesLegacyScreenshotActivationToTheExecutor() async throws {
     let executor = ExecutorStub()
     let approvalUI = ApprovalUIStub()
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
@@ -2320,7 +2322,7 @@ import Testing
         try await Task.sleep(for: .milliseconds(5))
     }
     #expect(executor.actionedRequest() == requestData as NSData)
-    #expect(approvalUI.activationCount() == 1)
+    #expect(approvalUI.activationCount() == 0)
 }
 
 @Test func slowExecutorActionUsesItsOwnTimeoutWithoutAbortingRelay() async throws {
@@ -2559,7 +2561,7 @@ import Testing
     #expect(await lifecycleRecorder.abortCount == 0)
 }
 
-@Test func unresponsiveApprovalUITimesOutAndAbortsTheRelay() async throws {
+@Test func unresponsiveApprovalUIDoesNotBlockABackgroundScreenshot() async throws {
     let executor = ExecutorStub()
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
     let lifecycleRecorder = LifecycleRecorder()
@@ -2571,7 +2573,7 @@ import Testing
             throw DeviceIPCFailure.invalidMessage
         },
         relayProvider: { configuration in
-            TriggerLifecycleRelay(request: try actionEnvelope(
+            TriggerActionRelay(request: try actionEnvelope(
                 configuration: configuration,
                 requestID: UUID(),
                 sequence: 1,
@@ -2596,9 +2598,12 @@ import Testing
     }
 
     #expect(approvalError == nil)
-    let abort = await lifecycleRecorder.waitForAbort()
-    #expect(abort == BrokerAbortRequest(binding: session.binding, reason: .disconnect))
-    #expect(executor.stoppedRequest() != nil)
+    for _ in 0 ..< 100 where executor.actionedRequest() == nil {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(executor.actionedRequest() != nil)
+    #expect(await lifecycleRecorder.abortRequest == nil)
+    #expect(executor.stoppedRequest() == nil)
     #expect(await lifecycleRecorder.endRequest == nil)
 }
 
@@ -3420,6 +3425,7 @@ private actor RuntimeRecorder {
     private(set) var captureCount = 0
     private(set) var releaseCount = 0
     private(set) var accessibilityClearCount = 0
+    private(set) var lifecycleEvents: [String] = []
     private(set) var captureTargets: [String?] = []
     private(set) var valueFreshnessCalls: [(ElementTarget, String, Date)] = []
     private(set) var observationBaseStateIDs: [UUID?] = []
@@ -3442,6 +3448,11 @@ private actor RuntimeRecorder {
 
     func released() {
         releaseCount += 1
+        lifecycleEvents.append("release")
+    }
+
+    func restoredFocus() {
+        lifecycleEvents.append("restore_focus")
     }
 
     func clearedAccessibility() {
@@ -4077,6 +4088,10 @@ private actor RuntimeStub: GUIActionRuntime {
 
     func releasePressedState() async {
         await recorder.released()
+    }
+
+    func restoreUserFocus() async {
+        await recorder.restoredFocus()
     }
 }
 

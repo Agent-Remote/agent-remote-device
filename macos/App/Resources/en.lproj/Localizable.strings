@@ -22,7 +22,6 @@
 "permission.check_again" = "Check again";
 "permission.request" = "Request";
 "permission.open_settings" = "Open System Settings";
-"approval.hidden_applications" = "%lld other applications will be hidden";
 "approval.deny" = "Deny";
 "approval.allow_session" = "Allow for this session";
 "approval.control_level" = "Control level";

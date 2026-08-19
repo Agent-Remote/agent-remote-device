@@ -18,12 +18,24 @@ the existing machine lock remains held. Session termination stops the Executor,
 calls the authenticated control-plane stop operation, and only then closes the
 relay.
 
-After local approval, the app hides every unapproved application and starts the
-global stop, screen-lock, user-switch, sleep, and network-loss monitors before it
-asks the Broker to activate the server session or start the relay. Failure at any
-point restores application visibility. A local stop observed while activation is
-in flight leaves the UI paused and is forwarded as soon as Broker approval
-returns; activation completion cannot overwrite that paused state.
+After local approval, the app leaves the user's foreground application and all
+other applications visible. It starts the global stop, screen-lock, user-switch,
+sleep, and network-loss monitors before it asks the Broker to activate the server
+session or start the relay. Passive observation, screenshots, waits, zooms, and
+approved clipboard reads do not activate the approved application. Interactive
+input activates only the exact signed target process. After the action and its
+follow-up observation complete, the Executor restores the user's prior foreground
+application when the remote target is still frontmost. Pressed mouse or key state
+delays restoration until release. A local stop observed while
+activation is in flight leaves the UI paused and is forwarded as soon as Broker
+approval returns; activation completion cannot overwrite that paused state.
+Coordinate actions still require the model-visible window frame to remain exact.
+Keyboard, unpositioned scrolling, and AX element actions instead retain the exact
+signed process, window ID, and display binding while allowing macOS to adjust a
+full-screen window's frame during Space activation. While that transition is in
+flight, their exact window ID is resolved from the all-Space window list only after
+the signed target process is confirmed frontmost; coordinate actions remain limited
+to the current on-screen list.
 
 Approval UI or Executor XPC invalidation immediately cancels the active relay.
 Executor input release is best effort after the Executor becomes unavailable,
@@ -32,17 +44,18 @@ ordering applies to user Stop and End Session requests: local cleanup is
 attempted first and control-plane revocation is still mandatory.
 
 A trusted remote turn stop pauses only the current turn, not the approved device
-session. Its acknowledgement waits for Executor input release and Approval UI
-window restoration. Before the next authenticated action, the Broker uses the
-same code-signature-checked XPC connection to re-hide unapproved applications,
-restart the global safety monitors, and resume the Executor. The first resumed
-action must be a new screenshot. Remote session end also waits for Approval UI
-cleanup, while the machine lock remains held across the paused turn interval.
+session. Completed actions normally restore the user's prior foreground application;
+the acknowledgement also waits for Executor input release and performs the same
+restoration as fail-closed cleanup. A user-initiated foreground change is never overwritten. Before
+the next authenticated action, the Broker uses the same code-signature-checked
+XPC connection to restart the global safety monitors and resume the Executor. The
+first resumed action must be a new screenshot. Remote session end also waits for
+Approval UI cleanup, while the machine lock remains held across the paused turn interval.
 All safety-critical Broker calls to the Executor and Approval UI have a local
 15-second reply deadline and cancellation handling. A connected XPC peer that
 stops replying therefore fails closed in the same way as an invalidated peer.
 An invalid relay frame or Executor loss asks the still-connected Approval UI to
-end the current generation and restore applications before the control-plane
+end the current generation and restore any legacy visibility journal before the control-plane
 abort. A plain relay transport disconnect instead cancels any in-flight handler,
 fails the old Executor guard, and rotates to a fresh generation with the exact
 same approved applications. Unknown-status actions are never replayed across

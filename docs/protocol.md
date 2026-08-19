@@ -178,13 +178,25 @@ A newer state for A, an A window/display change, a turn boundary, or a device
 generation change still invalidates A's prior binding. The Executor never
 remaps an old index to a newer state.
 
-Before executing an action against a retained binding for a background
-application, the Executor activates that exact signed process and waits until
-`NSWorkspace` identifies it as frontmost. `NSRunningApplication.isActive` alone
-is not accepted because it may lag during an application transition. A `press`
-on a settable editable text node also establishes and verifies AX focus before
-the action sequence is committed. A successful returned state can therefore be
-followed directly by context-bound text input without an extra observation.
+Passive observations, screenshots, waits, zooms, and approved clipboard reads
+resolve the exact signed process and window without activating it. Window capture
+includes approved windows on another Space so observing a full-screen browser does
+not pull the user away from a terminal. Before interactive input against a retained
+background binding, the Executor records the user's current foreground process,
+activates the exact signed target, and waits until macOS reports it as frontmost.
+A `press` on a settable editable text node also establishes and verifies AX focus
+before the action sequence is committed. After the action, settling, and follow-up
+observation complete, the Executor restores the prior foreground process if the
+remote target is still frontmost. Pressed mouse or key state defers restoration
+until release. A successful returned state can therefore be followed directly by
+context-bound text input without an extra observation.
+Coordinate actions continue to require the exact model-visible window frame.
+Context-bound keyboard and unpositioned scroll actions, and state-bound AX element
+actions, retain the exact signed process, window ID, and display fingerprint but do
+not reject the frame transition macOS may report while activating a full-screen Space.
+During that transition they may resolve the exact window ID from the all-Space list
+after the target process is confirmed frontmost. Coordinate actions still require
+the window to be on-screen.
 
 ### Bounded accessibility state and diffs
 
@@ -249,6 +261,8 @@ coordinate click.
 credentials subject to hand-off policy cannot be set through AX. Coordinate
 actions remain available as a fallback and continue to require the latest
 model-visible `screenshot_generation` and exact returned image dimensions.
+They also require the live window frame to match that screenshot exactly; the
+frame relaxation used for non-coordinate and AX actions never applies to pixels.
 `clear_value` is a compact MCP alias for a state-bound SetValue carrying an empty
 string; it avoids empty-string JSON serialization failures in model clients.
 
@@ -405,18 +419,19 @@ editors, and inaccessible Electron views use image fallback.
 
 The managed proxy also forwards two trusted Claude lifecycle events on the same
 confirmed inner TLS stream. A `turn_stop` frame stops in-flight GUI work and
-restores hidden applications without releasing the machine lock. A `session_end`
+repeats the per-action foreground restoration as cleanup without releasing the machine lock. A `session_end`
 frame ends the device session and releases the lock. Lifecycle frames carry a new
 request UUID and the complete context binding but do not consume an action
 sequence or screenshot generation.
 
 The Broker acknowledges `turn_stop` only after the Executor has released pressed
-input and the Approval UI has restored hidden applications. It retains the
+input and restored the prior foreground application when the remotely activated
+target is still frontmost. It retains the
 generation, lease, approvals, action sequence, and machine lock in a paused local
 turn state. The next authenticated device action is treated as the start of the
 next turn: before forwarding that action, the Broker synchronously asks the
-Approval UI to hide unapproved applications and restart its safety monitors, then
-resumes the Executor. The Executor requires that first action to be a fresh
+Approval UI to restart its safety monitors, then resumes the Executor. The
+Executor requires that first action to be a fresh
 `screenshot`; stale coordinates cannot cross the turn boundary. These
 `turn_started`, `turn_stopped`, and `session_ended` messages are generation-bound
 local XPC events and are not accepted from Claude, MCP arguments, or projects.

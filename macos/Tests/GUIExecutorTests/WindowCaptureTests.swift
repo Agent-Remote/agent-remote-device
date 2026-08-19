@@ -117,6 +117,22 @@ private func synchronouslyBlock(for seconds: Double) {
     ) == nil)
 }
 
+@Test @MainActor func frameChangesOnlyInvalidateGeometryBoundActions() {
+    let expected = CGRect(x: 0, y: 0, width: 1_920, height: 1_080)
+    let fullScreenTransition = CGRect(x: 0, y: 24, width: 1_920, height: 1_032)
+
+    #expect(!ActionExecutor.windowFrameMatches(
+        fullScreenTransition,
+        expected: expected,
+        validation: .exact
+    ))
+    #expect(ActionExecutor.windowFrameMatches(
+        fullScreenTransition,
+        expected: expected,
+        validation: .identityOnly
+    ))
+}
+
 @Test func displaySelectionUsesLargestWindowIntersectionIndependentOfInputOrder() {
     let displays: [(displayID: CGDirectDisplayID, frame: CGRect)] = [
         (20, CGRect(x: 0, y: 0, width: 1_000, height: 800)),

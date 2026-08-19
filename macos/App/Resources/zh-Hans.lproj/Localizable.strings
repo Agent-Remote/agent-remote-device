@@ -22,7 +22,6 @@
 "permission.check_again" = "重新检查";
 "permission.request" = "请求权限";
 "permission.open_settings" = "打开系统设置";
-"approval.hidden_applications" = "将隐藏其他 %lld 个应用";
 "approval.deny" = "拒绝";
 "approval.allow_session" = "本次会话允许";
 "approval.control_level" = "控制级别";

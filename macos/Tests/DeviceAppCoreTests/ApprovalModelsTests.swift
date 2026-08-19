@@ -11,8 +11,7 @@ import Testing
     #expect(throws: ApprovalModelFailure.duplicateApplication) {
         try ApprovalPresentation(
             generation: 1,
-            applications: [candidate, candidate],
-            hiddenApplicationCount: 0
+            applications: [candidate, candidate]
         )
     }
 }
@@ -23,16 +22,14 @@ import Testing
         #expect(throws: ApprovalModelFailure.invalidGeneration) {
             try ApprovalPresentation(
                 generation: generation,
-                applications: [application],
-                hiddenApplicationCount: 0
+                applications: [application]
             )
         }
     }
     #expect(throws: Never.self) {
         try ApprovalPresentation(
             generation: maximumActiveDeviceSessionGeneration,
-            applications: [application],
-            hiddenApplicationCount: 0
+            applications: [application]
         )
     }
 }
@@ -41,8 +38,7 @@ import Testing
     let unknown = candidate(bundleIdentifier: "dev.example.Unknown", requested: .clickOnly)
     let presentation = try ApprovalPresentation(
         generation: 7,
-        applications: [unknown],
-        hiddenApplicationCount: -2
+        applications: [unknown]
     )
     let approvals = presentation.approvals(
         applicationSelections: [unknown.id],
@@ -55,7 +51,6 @@ import Testing
     #expect(approvals.first?.controlLevel == .clickOnly)
     #expect(approvals.first?.generation == 7)
     #expect(approvals.first?.clipboardAllowed == true)
-    #expect(presentation.hiddenApplicationCount == 0)
 }
 
 @Test func clipboardIsDeniedUnlessRequestedAndSelected() throws {
@@ -66,8 +61,7 @@ import Testing
     )
     let presentation = try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 3
+        applications: [browser]
     )
     let approval = try #require(
         presentation.approvals(
@@ -85,8 +79,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     let presentation = try ApprovalPresentation(
         generation: 7,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     )
 
     #expect(presentation.approvals(
@@ -94,19 +87,6 @@ import Testing
         clipboardSelections: [browser.id],
         controlLevelSelections: [:]
     ).isEmpty)
-}
-
-@Test func hiddenApplicationCountCanOnlyBeUpdatedLocallyWithoutChangingApproval() throws {
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    let presentation = try ApprovalPresentation(
-        generation: 4,
-        applications: [browser],
-        hiddenApplicationCount: 99
-    ).updatingHiddenApplicationCount(2)
-
-    #expect(presentation.generation == 4)
-    #expect(presentation.applications == [browser])
-    #expect(presentation.hiddenApplicationCount == 2)
 }
 
 @MainActor
@@ -126,7 +106,7 @@ import Testing
 }
 
 @MainActor
-@Test func localProtectionIsReadyBeforeBrokerApproval() async throws {
+@Test func safetyMonitoringStartsWithoutHidingUserApplications() async throws {
     let events = EventRecorder()
     let visibility = RecordingVisibilityController(events: events)
     let model = DeviceAppModel(
@@ -138,8 +118,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in events.append("approve") }
@@ -150,7 +129,8 @@ import Testing
     }
 
     #expect(model.state == .active)
-    #expect(events.values().prefix(3) == ["hide", "monitor", "approve"])
+    #expect(events.values().prefix(2) == ["monitor", "approve"])
+    #expect(!events.values().contains("hide"))
 }
 
 @MainActor
@@ -166,8 +146,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in }
@@ -237,8 +216,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in }
@@ -289,8 +267,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     let remote = BrokerSessionCandidate(
         toolSessionID: UUID(),
@@ -339,8 +316,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in
@@ -382,8 +358,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in
@@ -413,7 +388,7 @@ import Testing
 }
 
 @MainActor
-@Test func remoteTurnLifecycleRestoresAndReprotectsApplications() async throws {
+@Test func remoteTurnLifecycleRestartsSafetyMonitoringWithoutHidingApplications() async throws {
     let events = EventRecorder()
     let model = DeviceAppModel(
         visibilityController: RecordingVisibilityController(events: events),
@@ -424,8 +399,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in }
@@ -443,7 +417,7 @@ import Testing
 
     #expect(model.state == .selectingSession)
     #expect(model.completionMessage == "The remote device-control session ended.")
-    #expect(events.values().filter { $0 == "hide" }.count == 2)
+    #expect(events.values().filter { $0 == "hide" }.isEmpty)
     #expect(events.values().filter { $0 == "restore" }.count == 2)
     #expect(events.values().filter { $0 == "monitor" }.count == 2)
     #expect(events.values().filter { $0 == "stop-monitor" }.count == 2)
@@ -462,8 +436,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in
@@ -572,8 +545,7 @@ import Testing
     let replacement = sessionCandidate(displayName: "Replacement")
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in throw StaleSessionBindingError() }
@@ -619,8 +591,7 @@ import Testing
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.onDeny = { _ in }
     model.onRefreshSessionCandidates = { [] }
@@ -723,8 +694,7 @@ private func activatedModel(
     let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
     model.presentApproval(try ApprovalPresentation(
         generation: 1,
-        applications: [browser],
-        hiddenApplicationCount: 0
+        applications: [browser]
     ))
     model.applicationSelections = [browser.id]
     model.onApprove = { _ in }
@@ -772,13 +742,6 @@ private final class RecordingVisibilityController: WorkspaceVisibilityControllin
     init(events: EventRecorder, restoreFailure: Error? = nil) {
         self.events = events
         self.restoreFailure = restoreFailure
-    }
-
-    func unapprovedApplicationCount(approvedBundleIdentifiers _: Set<String>) -> Int { 0 }
-
-    func hideUnapprovedApplications(approvedBundleIdentifiers _: Set<String>) throws -> Int {
-        events.append("hide")
-        return 0
     }
 
     func restoreApplications() throws {

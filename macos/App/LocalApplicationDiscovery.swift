@@ -1,7 +1,5 @@
 import AppKit
-import ApplicationServices
 import DeviceAppCore
-import DeviceIPC
 import DeviceSecurity
 import Foundation
 import Security
@@ -45,100 +43,8 @@ enum LocalApplicationDiscovery {
         }
         return try ApprovalPresentation(
             generation: generation,
-            applications: Array(applications.prefix(32)),
-            hiddenApplicationCount: 0
+            applications: Array(applications.prefix(32))
         )
-    }
-
-    @MainActor
-    static func activate(
-        target: String,
-        approvals: [LocalApproval]
-    ) async throws {
-        let matches = approvals.compactMap { approval -> NSRunningApplication? in
-            let applications = NSRunningApplication.runningApplications(
-                withBundleIdentifier: approval.application.bundleIdentifier
-            )
-            return applications.first(where: { application in
-                guard ApplicationTargetMatching.matches(
-                    target: target,
-                    bundleIdentifier: approval.application.bundleIdentifier,
-                    displayNames: [application.localizedName].compactMap { $0 }
-                ) else {
-                    return false
-                }
-                return signingIdentifier(for: application)
-                    == approval.application.signingIdentifier
-            })
-        }
-        guard matches.count == 1, let application = matches.first,
-              let bundleURL = application.bundleURL
-        else {
-            throw DeviceIPCFailure.invalidMessage
-        }
-        await requestWorkspaceActivation(at: bundleURL)
-        for attempt in 0 ..< 20 {
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier
-                == application.processIdentifier
-            {
-                return
-            }
-            if attempt == 10 {
-                requestAccessibilityActivation(application)
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-
-        // Reissue the non-blocking workspace request before the longer fallback window.
-        await requestWorkspaceActivation(at: bundleURL)
-        for attempt in 0 ..< 80 {
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier
-                == application.processIdentifier
-            {
-                return
-            }
-            if attempt.isMultiple(of: 10) {
-                requestAccessibilityActivation(application)
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        throw DeviceIPCFailure.serviceUnavailable
-    }
-
-    @MainActor
-    private static func requestWorkspaceActivation(at bundleURL: URL) async {
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        configuration.addsToRecentItems = false
-        _ = try? await NSWorkspace.shared.openApplication(
-            at: bundleURL,
-            configuration: configuration
-        )
-    }
-
-    @MainActor
-    private static func requestAccessibilityActivation(_ application: NSRunningApplication) {
-        _ = application.unhide()
-
-        let accessibilityApplication = AXUIElementCreateApplication(
-            application.processIdentifier
-        )
-        _ = AXUIElementSetAttributeValue(
-            accessibilityApplication,
-            kAXFrontmostAttribute as CFString,
-            kCFBooleanTrue
-        )
-        var rawWindows: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            accessibilityApplication,
-            kAXWindowsAttribute as CFString,
-            &rawWindows
-        ) == .success,
-            let windows = rawWindows as? [AXUIElement]
-        else { return }
-        for window in windows.prefix(8) {
-            _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        }
     }
 
     private static func isBoundedIdentifier(_ value: String) -> Bool {

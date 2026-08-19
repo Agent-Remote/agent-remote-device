@@ -75,6 +75,12 @@ public enum CoordinateMapper {
     }
 }
 
+enum WindowFrameValidation: Sendable {
+    case exact
+    case approximate
+    case identityOnly
+}
+
 @MainActor
 public final class ActionExecutor {
     private let guardState: SessionGuard
@@ -83,6 +89,10 @@ public final class ActionExecutor {
 
     public init(guardState: SessionGuard) {
         self.guardState = guardState
+    }
+
+    public var hasPressedState: Bool {
+        leftMouseIsDown || heldKeyCode != nil
     }
 
     public func execute(
@@ -95,7 +105,11 @@ public final class ActionExecutor {
             guard AXIsProcessTrusted() else {
                 throw ExecutionFailure.accessibilityPermissionMissing
             }
-            let displayFingerprint = try await verifyLiveContext(capture)
+            let displayFingerprint = try await verifyLiveContext(
+                capture,
+                frameValidation: action.requiresModelVisibleScreenshot ? .exact : .identityOnly,
+                requireFrontmost: action.requiresForegroundApplication
+            )
             try await guardState.authorize(
                 action: action,
                 sequence: sequence,
@@ -122,7 +136,10 @@ public final class ActionExecutor {
             guard AXIsProcessTrusted() else {
                 throw ExecutionFailure.accessibilityPermissionMissing
             }
-            let displayFingerprint = try await verifyLiveContext(context)
+            let displayFingerprint = try await verifyLiveContext(
+                context,
+                frameValidation: .identityOnly
+            )
             try await guardState.authorizeElement(
                 action: action,
                 sequence: sequence,
@@ -180,7 +197,11 @@ public final class ActionExecutor {
             guard AXIsProcessTrusted() else {
                 throw ExecutionFailure.accessibilityPermissionMissing
             }
-            let displayFingerprint = try await verifyLiveContext(context)
+            let displayFingerprint = try await verifyLiveContext(
+                context,
+                frameValidation: .identityOnly,
+                requireFrontmost: action.requiresForegroundApplication
+            )
             try await guardState.authorizeContextAction(
                 action: action,
                 sequence: sequence,
@@ -204,7 +225,10 @@ public final class ActionExecutor {
         capture: CapturedWindow
     ) async throws {
         do {
-            let displayFingerprint = try await verifyLiveContext(capture)
+            let displayFingerprint = try await verifyLiveContext(
+                capture,
+                requireFrontmost: false
+            )
             try await guardState.authorize(
                 action: action,
                 sequence: sequence,
@@ -224,7 +248,10 @@ public final class ActionExecutor {
         capture: CapturedWindow
     ) async throws -> String {
         do {
-            let displayFingerprint = try await verifyLiveContext(capture)
+            let displayFingerprint = try await verifyLiveContext(
+                capture,
+                requireFrontmost: false
+            )
             try await guardState.authorize(
                 action: .readClipboard,
                 sequence: sequence,
@@ -252,7 +279,10 @@ public final class ActionExecutor {
         context: WindowContext
     ) async throws -> String {
         do {
-            let displayFingerprint = try await verifyLiveContext(context)
+            let displayFingerprint = try await verifyLiveContext(
+                context,
+                requireFrontmost: false
+            )
             try await guardState.authorizeClipboardV2(
                 sequence: sequence,
                 stateGeneration: stateGeneration,
@@ -285,29 +315,40 @@ public final class ActionExecutor {
         }
     }
 
-    private func verifyLiveContext(_ capture: CapturedWindow) async throws -> String {
-        try await verifyLiveContext(capture.windowContext, requireExactFrame: true)
+    private func verifyLiveContext(
+        _ capture: CapturedWindow,
+        frameValidation: WindowFrameValidation = .exact,
+        requireFrontmost: Bool = true
+    ) async throws -> String {
+        try await verifyLiveContext(
+            capture.windowContext,
+            frameValidation: frameValidation,
+            requireFrontmost: requireFrontmost
+        )
     }
 
     private func verifyLiveContext(
         _ context: WindowContext,
-        requireExactFrame: Bool = false
+        frameValidation: WindowFrameValidation = .approximate,
+        requireFrontmost: Bool = true
     ) async throws -> String {
-        guard WindowCapture.isFrontmost(
+        if requireFrontmost, !WindowCapture.isFrontmost(
             application: context.application,
             requiredProcessID: context.processID
-        ) else {
+        ) {
             throw ExecutionFailure.applicationChanged
         }
         let content = try await SCShareableContent.excludingDesktopWindows(
             true,
-            onScreenWindowsOnly: true
+            onScreenWindowsOnly: requireFrontmost && frameValidation != .identityOnly
         )
         guard let window = content.windows.first(where: { $0.windowID == context.windowID }),
               window.owningApplication?.processID == context.processID,
-              requireExactFrame
-                ? window.frame.equalTo(context.windowFrame)
-                : AccessibilityRuntime.windowMatchScore(window.frame, context.windowFrame) >= 0.9
+              Self.windowFrameMatches(
+                  window.frame,
+                  expected: context.windowFrame,
+                  validation: frameValidation
+              )
         else {
             throw ExecutionFailure.windowChanged
         }
@@ -320,6 +361,21 @@ public final class ActionExecutor {
         let fingerprint = WindowCapture.displayFingerprint(content.displays, selected: display)
         guard fingerprint == context.displayFingerprint else { throw ExecutionFailure.displayChanged }
         return fingerprint
+    }
+
+    static func windowFrameMatches(
+        _ actual: CGRect,
+        expected: CGRect,
+        validation: WindowFrameValidation
+    ) -> Bool {
+        switch validation {
+        case .exact:
+            actual.equalTo(expected)
+        case .approximate:
+            AccessibilityRuntime.windowMatchScore(actual, expected) >= 0.9
+        case .identityOnly:
+            true
+        }
     }
 
     private func dispatchContextAction(_ action: Action, processID: pid_t) async throws {

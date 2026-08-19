@@ -2,6 +2,16 @@ import Foundation
 import Testing
 @testable import DeviceProtocol
 
+@Test func onlyInteractiveActionsRequireTheApprovedApplicationToBeForeground() {
+    #expect(!Action.screenshot.requiresForegroundApplication)
+    #expect(!Action.screenshotApplication("com.apple.Safari").requiresForegroundApplication)
+    #expect(!Action.readClipboard.requiresForegroundApplication)
+    #expect(!Action.wait(50).requiresForegroundApplication)
+    #expect(!Action.zoom(Region(x: 0, y: 0, width: 1, height: 1)).requiresForegroundApplication)
+    #expect(Action.key("return").requiresForegroundApplication)
+    #expect(Action.leftClick(Point(x: 0, y: 0)).requiresForegroundApplication)
+}
+
 @Test func decodesCrossLanguageVector() throws {
     let url = try #require(Bundle.module.url(forResource: "action-request-valid", withExtension: "json", subdirectory: "Fixtures"))
     let data = try Data(contentsOf: url)
