@@ -2,6 +2,10 @@
 
 All notable changes to this repository are recorded here.
 
+## v0.2.9 - 2026-08-19
+
+- fix: preserve user focus during macOS control (49f5a26)
+
 ## v0.2.8 - 2026-08-19
 
 - docs: define independent release policy (1c39d14)
