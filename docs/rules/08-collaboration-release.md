@@ -9,3 +9,9 @@ Pull requests must describe protocol compatibility, macOS permission and isolati
 Use `.github/workflows/prepare-release.yml` to prepare a version. It updates every repository-owned version reference and `CHANGELOG.md`, verifies the source, commits `chore: release vX.Y.Z`, creates the immutable tag, and dispatches `.github/workflows/release.yml`. The release workflow must build only the exact tagged source and preserve signatures, SBOMs, vulnerability reports, provenance, protected environments, and published verification evidence.
 
 Never manually edit one version file or publish an artifact from an uncommitted tree. Never reuse, rotate, or expose signing material as part of a source change.
+
+The Device version and release cadence belong only to this repository. Preparing a Device release
+must not require or rewrite another component's version. Node chooses an embedded proxy through its
+own immutable `release-dependencies.json`; the root `agent-remote` manifest separately certifies a
+supported production composition. Version equality across repositories is not a compatibility
+contract.

@@ -75,7 +75,7 @@ challenge and proof contract.
 
 The signed signing/notarization record is generated from the packaged Network Broker plist. It
 includes the embedded Team ID, Broker bundle identifier, policy ID, attestor mach service, and
-SHA-256 of the embedded raw public key. Coordinated release assembly requires the external runtime
+SHA-256 of the embedded raw public key. Certified composition assembly requires the external runtime
 policy evidence to match all five values before it can issue a manifest.
 
 The release workflow signs each proxy and notarized application archive and its
