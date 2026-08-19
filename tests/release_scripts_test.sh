@@ -7,8 +7,8 @@ community_release_script="$repo_root/scripts/build-community-release-app.sh"
 packaged_xpc_verifier="$repo_root/scripts/verify-packaged-xpc.sh"
 development_script="$repo_root/scripts/build-development-app.sh"
 proxy_script="$repo_root/scripts/package-proxy-release.sh"
-prepare_version_script="$repo_root/scripts/prepare-version.sh"
-prepare_release_workflow="$repo_root/.github/workflows/prepare-release.yml"
+prepare_release_script="$repo_root/scripts/prepare-release.sh"
+release_workflow="$repo_root/.github/workflows/release.yml"
 gui_executor_entitlements="$repo_root/macos/Entitlements/GUIExecutor.entitlements"
 
 expect_failure() {
@@ -55,7 +55,7 @@ expect_failure \
   env VERSION=999.0.0 "$proxy_script"
 expect_failure \
   "invalid semantic version" \
-  "$prepare_version_script" invalid
+  "$prepare_release_script" invalid
 expect_failure \
   "TEAM_IDENTIFIER must contain exactly 10 uppercase letters or digits" \
   env VERSION=1.0.0 BUILD_NUMBER=1 SIGNING_IDENTITY=Developer TEAM_IDENTIFIER=invalid \
@@ -128,7 +128,7 @@ if grep -Fq "$mock_root" "$mock_root/output/linux-amd64-glibc/SHA256SUMS"; then
 fi
 
 for ownership_flag in '--no-xattrs' '--owner=0' '--group=0' '--numeric-owner'; do
-  if ! grep -Fq -- "$ownership_flag" "$prepare_release_workflow"; then
+  if ! grep -Fq -- "$ownership_flag" "$release_workflow"; then
     echo "proxy release archive does not normalize ownership: $ownership_flag" >&2
     exit 1
   fi

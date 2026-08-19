@@ -1,4 +1,4 @@
-name: prepare release
+name: prepare-release
 
 on:
   workflow_dispatch:
@@ -7,287 +7,58 @@ on:
         description: Semantic release version without a v prefix
         required: true
         type: string
-      build_number:
-        description: Positive macOS bundle build number
-        required: true
-        type: string
 
 permissions:
+  actions: write
   contents: write
-  id-token: write
-  attestations: write
 
 jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit@0.22.2
-      - uses: sigstore/cosign-installer@v4.0.0
-      - name: Verify immutable release source and version
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          version="${VERSION#v}"
-          test "$GITHUB_REF" = "refs/tags/v${version}"
-          resolved=$(cargo metadata --format-version=1 --no-deps | python3 -c \
-            'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "agent-remote-device-proxy"))')
-          test "$resolved" = "$version"
-      - name: Generate release vulnerability reports
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          cargo audit --json > "agent-remote-device-${VERSION}.cargo-audit.json"
-          scripts/audit-swift-dependencies.sh Package.resolved \
-            "agent-remote-device-${VERSION}.swift-osv.json"
-          sha256sum "agent-remote-device-${VERSION}.cargo-audit.json" \
-            > "agent-remote-device-${VERSION}.cargo-audit.json.sha256"
-          sha256sum "agent-remote-device-${VERSION}.swift-osv.json" \
-            > "agent-remote-device-${VERSION}.swift-osv.json.sha256"
-          for report in \
-            "agent-remote-device-${VERSION}.cargo-audit.json" \
-            "agent-remote-device-${VERSION}.swift-osv.json"; do
-            cosign sign-blob --yes --bundle "$report.sigstore.json" "$report"
-            cosign verify-blob \
-              --bundle "$report.sigstore.json" \
-              --certificate-identity \
-                "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/prepare-release.yml@${GITHUB_REF}" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              "$report"
-          done
-      - uses: actions/upload-artifact@v6.0.0
-        with:
-          name: agent-remote-device-vulnerability-reports-${{ inputs.version }}
-          if-no-files-found: error
-          path: |
-            agent-remote-device-${{ inputs.version }}.cargo-audit.json
-            agent-remote-device-${{ inputs.version }}.cargo-audit.json.sha256
-            agent-remote-device-${{ inputs.version }}.cargo-audit.json.sigstore.json
-            agent-remote-device-${{ inputs.version }}.swift-osv.json
-            agent-remote-device-${{ inputs.version }}.swift-osv.json.sha256
-            agent-remote-device-${{ inputs.version }}.swift-osv.json.sigstore.json
-
-  proxy:
-    name: proxy (${{ matrix.label }})
-    runs-on: ubuntu-latest
-    needs: validate
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            label: linux-amd64-glibc
-          - target: aarch64-unknown-linux-gnu
-            label: linux-arm64-glibc
-          - target: x86_64-unknown-linux-musl
-            label: linux-amd64-musl
-          - target: aarch64-unknown-linux-musl
-            label: linux-arm64-musl
-    steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install pinned cross builder
-        run: cargo install cross --locked --version 0.2.5
-      - name: Build proxy release
-        env:
-          BUILD_TOOL: cross
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ inputs.version }}
-        run: scripts/package-proxy-release.sh
-      - name: Create proxy archive
-        env:
-          LABEL: ${{ matrix.label }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          archive="agent-remote-device-proxy-${LABEL}-${VERSION}.tar.gz"
-          tar --no-xattrs --owner=0 --group=0 --numeric-owner \
-            -C "dist/device-proxies/${LABEL}" -czf "$archive" \
-            agent-remote-device-proxy VERSION SHA256SUMS
-          sha256sum "$archive" > "$archive.sha256"
-      - name: Generate proxy SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          path: dist/device-proxies/${{ matrix.label }}
-          format: spdx-json
-          output-file: agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.spdx.json
-      - uses: sigstore/cosign-installer@v4.0.0
-      - name: Sign proxy update archive and SBOM
-        env:
-          LABEL: ${{ matrix.label }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          archive="agent-remote-device-proxy-${LABEL}-${VERSION}.tar.gz"
-          cosign sign-blob --yes --bundle "$archive.sigstore.json" "$archive"
-          sbom="agent-remote-device-proxy-${LABEL}-${VERSION}.spdx.json"
-          cosign sign-blob --yes --bundle "$sbom.sigstore.json" "$sbom"
-      - name: Attest proxy archive
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.tar.gz
-      - name: Verify proxy release evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LABEL: ${{ matrix.label }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          archive="agent-remote-device-proxy-${LABEL}-${VERSION}.tar.gz"
-          sha256sum --check "$archive.sha256"
-          jq -e '.spdxVersion | startswith("SPDX-")' \
-            "agent-remote-device-proxy-${LABEL}-${VERSION}.spdx.json" >/dev/null
-          sbom="agent-remote-device-proxy-${LABEL}-${VERSION}.spdx.json"
-          cosign verify-blob \
-            --bundle "$sbom.sigstore.json" \
-            --certificate-identity \
-              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/prepare-release.yml@${GITHUB_REF}" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$sbom"
-          cosign verify-blob \
-            --bundle "$archive.sigstore.json" \
-            --certificate-identity \
-              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/prepare-release.yml@${GITHUB_REF}" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$archive"
-          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
-      - uses: actions/upload-artifact@v6.0.0
-        with:
-          name: agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}
-          if-no-files-found: error
-          path: |
-            agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.tar.gz
-            agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.tar.gz.sha256
-            agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.tar.gz.sigstore.json
-            agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.spdx.json
-            agent-remote-device-proxy-${{ matrix.label }}-${{ inputs.version }}.spdx.json.sigstore.json
-
-  macos:
-    name: community local-trust macOS application
+  prepare:
     runs-on: macos-15
-    needs: validate
-    environment: production-community-release
     steps:
       - uses: actions/checkout@v7.0.0
-      - name: Import persistent community signing certificate
-        uses: apple-actions/import-codesign-certs@v3
         with:
-          p12-file-base64: ${{ secrets.COMMUNITY_SIGNING_P12_BASE64 }}
-          p12-password: ${{ secrets.COMMUNITY_SIGNING_P12_PASSWORD }}
-          keychain: community_signing
-      - name: Build hardened community-signed application
+          fetch-depth: 0
+      - name: Normalize version
+        id: version
         env:
-          BUILD_NUMBER: ${{ inputs.build_number }}
-          SIGNING_IDENTITY: ${{ secrets.COMMUNITY_SIGNING_IDENTITY }}
-          SIGNER_CERTIFICATE_SHA1: ${{ vars.COMMUNITY_SIGNER_CERTIFICATE_SHA1 }}
-          VERSION: ${{ inputs.version }}
-        run: scripts/build-community-release-app.sh
-      - name: Verify packaged community XPC process chain
-        run: scripts/verify-packaged-xpc.sh "dist/community-release/Agent Remote Device.app"
-      - name: Create community application archive
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          archive="agent-remote-device-macos-${VERSION}.zip"
-          ditto -c -k --keepParent "dist/community-release/Agent Remote Device.app" "$archive"
-          shasum -a 256 "$archive" > "$archive.sha256"
-      - name: Generate application SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          path: dist/community-release/Agent Remote Device.app
-          format: spdx-json
-          output-file: agent-remote-device-macos-${{ inputs.version }}.spdx.json
-      - uses: sigstore/cosign-installer@v4.0.0
-      - name: Sign community application update archive and SBOM
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          archive="agent-remote-device-macos-${VERSION}.zip"
-          cosign sign-blob --yes --bundle "$archive.sigstore.json" "$archive"
-          sbom="agent-remote-device-macos-${VERSION}.spdx.json"
-          cosign sign-blob --yes --bundle "$sbom.sigstore.json" "$sbom"
-      - name: Attest application archive
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: agent-remote-device-macos-${{ inputs.version }}.zip
-      - name: Verify macOS release evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          archive="agent-remote-device-macos-${VERSION}.zip"
-          shasum -a 256 --check "$archive.sha256"
-          jq -e '.spdxVersion | startswith("SPDX-")' \
-            "agent-remote-device-macos-${VERSION}.spdx.json" >/dev/null
-          sbom="agent-remote-device-macos-${VERSION}.spdx.json"
-          cosign verify-blob \
-            --bundle "$sbom.sigstore.json" \
-            --certificate-identity \
-              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/prepare-release.yml@${GITHUB_REF}" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$sbom"
-          jq -e \
-            '.profile == "community-local-trust" and .production_ready == true and
-             .apple_notarized == false and .signing_type == "project-self-signed"' \
-            "dist/community-release/community-signing-${VERSION}.json" >/dev/null
-          cosign verify-blob \
-            --bundle "$archive.sigstore.json" \
-            --certificate-identity \
-              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/prepare-release.yml@${GITHUB_REF}" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$archive"
-          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
-      - name: Create and sign community signing evidence
-        env:
-          VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          archive="agent-remote-device-macos-${VERSION}.zip"
-          source="dist/community-release/community-signing-${VERSION}.json"
-          evidence="agent-remote-device-macos-${VERSION}.community-signing.json"
-          application_sha256=$(shasum -a 256 "$archive" | awk '{print $1}')
-          broker_plist="dist/community-release/Agent Remote Device.app/Contents/XPCServices/AgentRemoteNetworkBroker.xpc/Contents/Info.plist"
-          broker_bundle_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$broker_plist")
-          test "$broker_bundle_identifier" = "dev.agentremote.device.network-broker"
-          jq \
-            --arg application_sha256 "$application_sha256" \
-            --arg broker_bundle_identifier "$broker_bundle_identifier" \
-            '. + {application_sha256:$application_sha256,bundle_identifier:"dev.agentremote.device",broker_bundle_identifier:$broker_bundle_identifier}' \
-            "$source" > "$evidence"
-          shasum -a 256 "$evidence" > "$evidence.sha256"
-          cosign sign-blob --yes --bundle "$evidence.sigstore.json" "$evidence"
-          cosign verify-blob \
-            --bundle "$evidence.sigstore.json" \
-            --certificate-identity \
-              "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/prepare-release.yml@${GITHUB_REF}" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "$evidence"
-      - uses: actions/upload-artifact@v6.0.0
-        with:
-          name: agent-remote-device-macos-${{ inputs.version }}
-          if-no-files-found: error
-          path: |
-            agent-remote-device-macos-${{ inputs.version }}.zip
-            agent-remote-device-macos-${{ inputs.version }}.zip.sha256
-            agent-remote-device-macos-${{ inputs.version }}.zip.sigstore.json
-            agent-remote-device-macos-${{ inputs.version }}.spdx.json
-            agent-remote-device-macos-${{ inputs.version }}.spdx.json.sigstore.json
-            agent-remote-device-macos-${{ inputs.version }}.community-signing.json
-            agent-remote-device-macos-${{ inputs.version }}.community-signing.json.sha256
-            agent-remote-device-macos-${{ inputs.version }}.community-signing.json.sigstore.json
-
-  publish:
-    runs-on: ubuntu-latest
-    needs: [proxy, macos]
-    steps:
-      - uses: actions/download-artifact@v8.0.1
-        with:
-          path: release-artifacts
-      - uses: softprops/action-gh-release@v3.0.1
-        with:
-          tag_name: v${{ inputs.version }}
-          name: agent-remote-device v${{ inputs.version }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: release-artifacts/**/*
+          version="${INPUT_VERSION#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid semantic version: $INPUT_VERSION" >&2
+            exit 2
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null 2>&1; then
+            echo "tag v${version} already exists" >&2
+            exit 1
+          fi
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+      - name: Prepare release files
+        run: scripts/prepare-release.sh "${{ steps.version.outputs.value }}"
+      - name: Verify prepared source
+        run: |
+          cargo check --workspace --locked
+          swift build
+          bash tests/release_scripts_test.sh
+          ruby tests/release_workflow_contract_test.rb
+          git diff --check
+      - name: Commit, tag, and start protected release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock fuzz/Cargo.lock README.md README.zh-CN.md \
+            CHANGELOG.md scripts/prepare-release.sh
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: release v${VERSION}"
+          fi
+          git diff --exit-code
+          git tag "v${VERSION}"
+          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin "v${VERSION}"
+          gh workflow run release.yml --ref "v${VERSION}" -f version="${VERSION}" -f build_number="${GITHUB_RUN_NUMBER}"

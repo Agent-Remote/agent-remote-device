@@ -4,20 +4,25 @@ require "yaml"
 
 repository_root = File.expand_path("..", __dir__)
 ci_path = File.join(repository_root, ".github/workflows/ci.yml")
-release_path = File.join(repository_root, ".github/workflows/prepare-release.yml")
-prepare_version_path = File.join(repository_root, ".github/workflows/prepare-version.yml")
+release_path = File.join(repository_root, ".github/workflows/release.yml")
+prepare_release_path = File.join(repository_root, ".github/workflows/prepare-release.yml")
 ci = YAML.safe_load(File.read(ci_path), aliases: true)
 release = YAML.safe_load(File.read(release_path), aliases: true)
-prepare_version = YAML.safe_load(File.read(prepare_version_path), aliases: true)
+prepare_release = YAML.safe_load(File.read(prepare_release_path), aliases: true)
 
-prepare_commands = prepare_version.dig("jobs", "prepare", "steps").map { |step| step["run"] }.compact.join("\n")
+prepare_commands = prepare_release.dig("jobs", "prepare", "steps").map { |step| step["run"] }.compact.join("\n")
 raise "version preparation does not create an immutable tag" unless prepare_commands.include?('git tag "v${VERSION}"')
-raise "version preparation does not dispatch the protected release" unless prepare_commands.include?("prepare-release.yml")
-prepare_script = File.read(File.join(repository_root, "scripts/prepare-version.sh"))
+raise "version preparation does not dispatch the protected release" unless prepare_commands.include?("release.yml")
+raise "version preparation does not require a clean committed tree" unless prepare_commands.include?("git diff --exit-code")
+prepare_script = File.read(File.join(repository_root, "scripts/prepare-release.sh"))
 raise "version preparation does not update Cargo.lock" unless prepare_script.include?('lock_path = Path("Cargo.lock")')
 raise "version preparation does not update fuzz/Cargo.lock" unless prepare_script.include?('fuzz_lock_path = Path("fuzz/Cargo.lock")')
 raise "version preparation does not verify locked fuzz metadata" unless prepare_script.include?("--manifest-path fuzz/Cargo.toml --format-version=1 --locked")
-raise "version preparation does not commit fuzz/Cargo.lock" unless prepare_commands.include?("git add Cargo.toml Cargo.lock fuzz/Cargo.lock README.md")
+raise "version preparation does not update the Chinese README" unless prepare_script.include?('readme_cn_path = Path("README.zh-CN.md")')
+raise "version preparation does not update CHANGELOG.md" unless prepare_script.include?('scripts/update-changelog.sh "$version"')
+raise "version preparation does not commit fuzz/Cargo.lock" unless prepare_commands.include?("Cargo.toml Cargo.lock fuzz/Cargo.lock")
+raise "version preparation does not commit both READMEs" unless prepare_commands.include?("README.md README.zh-CN.md")
+raise "version preparation does not commit CHANGELOG.md" unless prepare_commands.include?("CHANGELOG.md scripts/prepare-release.sh")
 
 rust_steps = ci.dig("jobs", "rust", "steps")
 raise "CI Rust job is missing" unless rust_steps
@@ -46,6 +51,7 @@ raise "release Rust vulnerability report is missing" unless validate_commands.in
 raise "release Swift vulnerability report is missing" unless validate_commands.include?("swift-osv.json")
 raise "release vulnerability reports are not signed" unless validate_commands.include?("cosign sign-blob")
 raise "release does not publish a GitHub Release" unless release.dig("jobs", "publish", "steps").any? { |step| step.fetch("uses", "").start_with?("softprops/action-gh-release@") }
+raise "release identity does not use release.yml" unless File.read(release_path).include?(".github/workflows/release.yml@${GITHUB_REF}")
 
 raise "CI supply-chain job is missing" unless ci.dig("jobs", "supply-chain", "steps")
 

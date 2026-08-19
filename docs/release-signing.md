@@ -70,7 +70,7 @@ until every gate above has independently verifiable evidence.
 The attestor private key must remain in the independently managed policy service. It must not be
 stored in GitHub, the application bundle, an application preference, or a release asset. Configure
 the mach service and policy ID as protected environment variables and the public key as a protected
-secret named by `.github/workflows/prepare-release.yml`. See `isolation-verification.md` for the
+secret named by `.github/workflows/release.yml`. See `isolation-verification.md` for the
 challenge and proof contract.
 
 The signed signing/notarization record is generated from the packaged Network Broker plist. It

@@ -11,6 +11,8 @@
   <a href="LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/github/license/Agent-Remote/agent-remote-device"></a>
 </p>
 
+English | [中文](README.zh-CN.md)
+
 Security-sensitive macOS device bridge and managed MCP proxy for agent-remote.
 
 This repository owns the versioned device protocol, the native macOS components,
@@ -48,8 +50,9 @@ VERSION=0.2.7 scripts/package-proxy-release.sh
 ```
 
 `VERSION` must exactly match the Rust workspace package version. Prepare a new
-source version with `scripts/prepare-version.sh`; the `prepare version` workflow
-commits and tags that version before dispatching the protected signed release.
+source version with `scripts/prepare-release.sh`; the `prepare-release` workflow
+updates repository version files and `CHANGELOG.md`, commits and tags that version,
+then dispatches the protected signed `release` workflow.
 
 Cross builds set `TARGET` to one of `x86_64-unknown-linux-gnu`,
 `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, or
