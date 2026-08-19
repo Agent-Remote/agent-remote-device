@@ -40,7 +40,7 @@ Network.framework peer。它的临时控制平面仅监听 loopback，且不会�
 为 Node 打包构建 Linux proxy artifact：
 
 ```sh
-VERSION=0.2.7 scripts/package-proxy-release.sh
+VERSION=0.2.8 scripts/package-proxy-release.sh
 ```
 
 `VERSION` 必须与 Rust workspace package 版本完全一致。使用 `scripts/prepare-release.sh`

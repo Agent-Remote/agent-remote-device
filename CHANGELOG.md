@@ -2,6 +2,11 @@
 
 All notable changes to this repository are recorded here.
 
+## v0.2.8 - 2026-08-19
+
+- docs: define independent release policy (1c39d14)
+- feat: align device documentation and release automation (0ab0686)
+
 ## v0.1.0 - 2026-07-31
 
 - feat: add the macOS device control app, approval UI, and executor XPC services
