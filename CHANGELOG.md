@@ -2,6 +2,10 @@
 
 All notable changes to this repository are recorded here.
 
+## v0.2.10 - 2026-09-01
+
+- feat(device-control): improve macos control resilience (55aa5e3)
+
 ## v0.2.9 - 2026-08-19
 
 - fix: preserve user focus during macOS control (49f5a26)
