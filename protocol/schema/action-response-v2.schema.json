@@ -28,6 +28,11 @@
     "base_state_id": {"$ref": "#/$defs/uuid"},
     "status": {"enum": ["success", "failed"]},
     "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "clipboard": {
+      "type": "string",
+      "maxLength": 65536,
+      "description": "Negotiated clipboard payload; runtime validation applies the 65536-byte UTF-8 limit."
+    },
     "observation": {"$ref": "#/$defs/observation"},
     "settle": {"$ref": "#/$defs/settle"},
     "image": {"$ref": "#/$defs/image"}
@@ -49,6 +54,7 @@
             {"required": ["window_id"]},
             {"required": ["display_fingerprint"]},
             {"required": ["base_state_id"]},
+            {"required": ["clipboard"]},
             {"required": ["observation"]},
             {"required": ["image"]}
           ]

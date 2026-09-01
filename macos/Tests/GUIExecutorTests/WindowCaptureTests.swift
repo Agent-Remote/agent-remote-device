@@ -80,6 +80,24 @@ private func synchronouslyBlock(for seconds: Double) {
     #expect(selected == 20)
 }
 
+@Test func preferredWindowUsesTheRequiredBoundWindowInsteadOfZOrder() {
+    let candidates: [(windowID: CGWindowID, frame: CGRect)] = [
+        (windowID: 10, frame: CGRect(x: 0, y: 0, width: 1_400, height: 900)),
+        (windowID: 20, frame: CGRect(x: 100, y: 100, width: 900, height: 700)),
+    ]
+
+    #expect(WindowCapture.preferredWindowID(
+        candidates: candidates,
+        frontToBackWindowIDs: [10, 20],
+        requiredWindowID: 20
+    ) == 20)
+    #expect(WindowCapture.preferredWindowID(
+        candidates: candidates,
+        frontToBackWindowIDs: [10, 20],
+        requiredWindowID: 30
+    ) == nil)
+}
+
 @Test func captureScalingPreservesAspectRatioWithoutUpscaling() {
     #expect(WindowCapture.scaledSize(
         sourceWidth: 2_000,

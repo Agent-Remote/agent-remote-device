@@ -44,6 +44,7 @@ public protocol GUIActionRuntime: Sendable {
     func captureV2(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?,
+        preferredWindowContexts: [WindowContext],
         profile: ImageProfile,
         region: Region?
     ) async throws -> CapturedWindow
@@ -110,7 +111,8 @@ public protocol GUIActionRuntime: Sendable {
     func readClipboardV2(
         sequence: UInt64,
         stateGeneration: UInt64,
-        context: WindowContext
+        context: WindowContext,
+        maximumBytes: Int
     ) async throws -> String
     func releasePressedState() async
     func restoreUserFocus() async
@@ -121,6 +123,7 @@ public extension GUIActionRuntime {
     func captureV2(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?,
+        preferredWindowContexts _: [WindowContext],
         profile _: ImageProfile,
         region: Region?
     ) async throws -> CapturedWindow {
@@ -211,7 +214,8 @@ public extension GUIActionRuntime {
     func readClipboardV2(
         sequence _: UInt64,
         stateGeneration _: UInt64,
-        context _: WindowContext
+        context _: WindowContext,
+        maximumBytes _: Int
     ) async throws -> String {
         throw AccessibilityFailure.operationFailed
     }
@@ -252,6 +256,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
     public func captureV2(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?,
+        preferredWindowContexts: [WindowContext],
         profile: ImageProfile,
         region: Region?
     ) async throws -> CapturedWindow {
@@ -268,7 +273,13 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         let engine = WindowCapture(
             profile: CaptureProfile(maximumWidth: dimensions.0, maximumHeight: dimensions.1)
         )
-        let capture = try await engine.capture(application: application)
+        let preferredWindowID = preferredWindowContexts.first {
+            $0.application.stableDigest == application.stableDigest
+        }?.windowID
+        let capture = try await engine.capture(
+            application: application,
+            requiredWindowID: preferredWindowID
+        )
         return try region.map { try WindowCapture.cropped(capture, to: $0) } ?? capture
     }
 
@@ -399,12 +410,14 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
     public func readClipboardV2(
         sequence: UInt64,
         stateGeneration: UInt64,
-        context: WindowContext
+        context: WindowContext,
+        maximumBytes: Int
     ) async throws -> String {
         return try await executor.readClipboardV2(
             sequence: sequence,
             stateGeneration: stateGeneration,
-            context: context
+            context: context,
+            maximumBytes: maximumBytes
         )
     }
 

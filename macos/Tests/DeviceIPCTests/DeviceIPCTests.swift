@@ -81,6 +81,32 @@ import DeviceSecurity
     #expect(!value.matchesSessionIdentity(differentSession))
 }
 
+@Test func clipboardPayloadCapabilityRemainsOptionalForProtocolV2() throws {
+    let sessionBinding = binding(generation: 1)
+    let application = ApplicationIdentity(
+        bundleIdentifier: "com.example.fixture",
+        signingIdentifier: "com.example.fixture"
+    )
+    let configuration = ExecutorSessionConfiguration(
+        binding: sessionBinding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: [LocalApproval(
+            application: application,
+            controlLevel: .viewOnly,
+            clipboardAllowed: true,
+            generation: sessionBinding.generation
+        )],
+        capabilities: [
+            capabilityObservationModeV2,
+            capabilityAXStateV2,
+            capabilityAdaptiveSettleV2,
+        ]
+    )
+
+    #expect(configuration.supportsProtocolV2)
+    #expect(!configuration.supportsClipboardPayloadV2)
+}
+
 @Test func ipcDecoderRejectsDuplicateAndUnknownFieldsAtEveryLevel() throws {
     let requestID = UUID()
     let encoded = try DeviceIPCEnvelope(

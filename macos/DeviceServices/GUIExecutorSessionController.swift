@@ -496,6 +496,7 @@ public actor GUIExecutorSessionController {
                 let capture = try await runtime.captureV2(
                     approvedApplications: approvedApplications,
                     targetApplication: targetApplication,
+                    preferredWindowContexts: Array(windowContextsByApplication.values),
                     profile: profile,
                     region: request.observation.region
                 )
@@ -548,6 +549,7 @@ public actor GUIExecutorSessionController {
             )
         }
         var message = "Action completed."
+        var clipboard: String?
         do {
             switch request.action {
             case .observe:
@@ -591,11 +593,21 @@ public actor GUIExecutorSessionController {
                     context: windowContext
                 )
             case .readClipboard:
-                message = try await runtime.readClipboardV2(
+                let supportsClipboardPayload = configuration.supportsClipboardPayloadV2
+                let text = try await runtime.readClipboardV2(
                     sequence: request.context.monotonicSequence,
                     stateGeneration: currentStateGeneration,
-                    context: windowContext
+                    context: windowContext,
+                    maximumBytes: supportsClipboardPayload
+                        ? maximumClipboardTextBytesV2
+                        : 4 * 1_024
                 )
+                if supportsClipboardPayload {
+                    message = "Clipboard read."
+                    clipboard = text
+                } else {
+                    message = text
+                }
             }
         } catch let failure as AccessibilityFailure {
             return try failureResponseV2(
@@ -648,6 +660,7 @@ public actor GUIExecutorSessionController {
                 baseStateID: nil,
                 status: .success,
                 message: message,
+                clipboard: clipboard,
                 observation: nil,
                 settle: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
                 image: nil
@@ -824,6 +837,11 @@ public actor GUIExecutorSessionController {
                     capture = try await runtime.captureV2(
                         approvedApplications: approvedApplications,
                         targetApplication: actionApplication,
+                        preferredWindowContexts: [windowContext]
+                            + windowContextsByApplication.values.filter {
+                                $0.application.stableDigest
+                                    != windowContext.application.stableDigest
+                            },
                         profile: profile,
                         region: request.observation.region
                     )

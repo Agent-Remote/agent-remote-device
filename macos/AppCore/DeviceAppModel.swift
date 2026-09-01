@@ -64,6 +64,10 @@ public final class DeviceAppModel: ObservableObject {
     private var safetyMonitor: (any SessionSafetyMonitoring)?
     private var approvedBundleIdentifiers: Set<String> = []
     private var operationGeneration: UInt64 = 0
+    private var permissionRecheckID: UUID?
+
+    private static let permissionRecheckDelay: Duration = .milliseconds(250)
+    private static let permissionRecheckCount = 2
 
     public var onApprove: ([LocalApproval]) async throws -> Void = { _ in
         throw DeviceAppFailure.transportUnavailable
@@ -139,6 +143,7 @@ public final class DeviceAppModel: ObservableObject {
     }
 
     private func applySessionCandidates(_ candidates: [BrokerSessionCandidate]) {
+        permissions.refresh()
         sessionCandidates = candidates
         failureMessage = nil
         failureCode = nil
@@ -276,8 +281,34 @@ public final class DeviceAppModel: ObservableObject {
     public func enforceCurrentPermissions() {
         guard state == .active || state == .activating || state == .paused else { return }
         permissions.refresh()
-        guard !permissionsGranted() else { return }
-        endSession()
+        guard !permissionsGranted() else {
+            permissionRecheckID = nil
+            return
+        }
+        guard permissionRecheckID == nil else { return }
+        let recheckID = UUID()
+        permissionRecheckID = recheckID
+        Task { [weak self] in
+            guard let self else { return }
+            for _ in 0 ..< Self.permissionRecheckCount {
+                try? await Task.sleep(for: Self.permissionRecheckDelay)
+                guard !Task.isCancelled,
+                      permissionRecheckID == recheckID
+                else { return }
+                guard state == .active || state == .activating || state == .paused else {
+                    permissionRecheckID = nil
+                    return
+                }
+                permissions.refresh()
+                if permissionsGranted() {
+                    permissionRecheckID = nil
+                    return
+                }
+            }
+            guard permissionRecheckID == recheckID else { return }
+            permissionRecheckID = nil
+            endSession()
+        }
     }
 
     public func retryAfterPermissionChange() {
@@ -517,12 +548,7 @@ public final class DeviceAppModel: ObservableObject {
             } catch {
                 restorationError = error
             }
-            approvalPresentation = nil
-            applicationSelections = []
-            clipboardSelections = []
-            controlLevelSelections = [:]
-            approvedBundleIdentifiers = []
-            lastUnsafeTransition = nil
+            clearSessionContext()
             if let restorationError {
                 failClosed(
                     message: userFacingDescription(restorationError),
@@ -556,6 +582,7 @@ public final class DeviceAppModel: ObservableObject {
     }
 
     private func clearSessionContext() {
+        permissionRecheckID = nil
         approvalPresentation = nil
         applicationSelections = []
         clipboardSelections = []
@@ -605,6 +632,7 @@ public final class DeviceAppModel: ObservableObject {
 
     private func invalidateAsyncOperations() {
         operationGeneration &+= 1
+        permissionRecheckID = nil
         isRefreshingSessionCandidates = false
     }
 

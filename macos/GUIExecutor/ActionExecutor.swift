@@ -276,7 +276,8 @@ public final class ActionExecutor {
     public func readClipboardV2(
         sequence: UInt64,
         stateGeneration: UInt64,
-        context: WindowContext
+        context: WindowContext,
+        maximumBytes: Int = maximumClipboardTextBytesV2
     ) async throws -> String {
         do {
             let displayFingerprint = try await verifyLiveContext(
@@ -293,7 +294,7 @@ public final class ActionExecutor {
             guard let text = NSPasteboard.general.string(forType: .string) else {
                 throw ExecutionFailure.clipboardContentUnavailable
             }
-            guard text.utf8.count <= 64 * 1_024 else {
+            guard maximumBytes > 0, text.utf8.count <= maximumBytes else {
                 throw ExecutionFailure.clipboardContentTooLarge
             }
             try await guardState.accept(sequence: sequence)

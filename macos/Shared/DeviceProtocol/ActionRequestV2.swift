@@ -4,6 +4,7 @@ public let protocolVersionV2: UInt8 = 2
 public let capabilityObservationModeV2 = "observation_mode_v2"
 public let capabilityAXStateV2 = "ax_state_v2"
 public let capabilityAdaptiveSettleV2 = "adaptive_settle_v2"
+public let capabilityClipboardPayloadV2 = "clipboard_payload_v2"
 
 public let maximumAXNodes: UInt16 = 800
 public let maximumAXDepth: UInt8 = 20
@@ -14,6 +15,7 @@ public let maximumSettleTimeoutMilliseconds: UInt32 = 5_000
 public let defaultAXNodes: UInt16 = 600
 public let defaultAXTotalTextBytes: UInt32 = 12 * 1_024
 public let defaultAXVisibleRowsPerContainer: UInt8 = 12
+public let maximumClipboardTextBytesV2 = 64 * 1_024
 
 public struct ActionRequestV2: Codable, Sendable, Equatable {
     public let version: UInt8
@@ -563,6 +565,7 @@ public struct ActionResponseV2: Codable, Sendable, Equatable {
     public let baseStateID: UUID?
     public let status: ResponseStatusV2
     public let message: String
+    public let clipboard: String?
     public let observation: AccessibilityObservation?
     public let settle: SettleResult
     public let image: ImagePayloadV2?
@@ -579,6 +582,7 @@ public struct ActionResponseV2: Codable, Sendable, Equatable {
         baseStateID: UUID?,
         status: ResponseStatusV2,
         message: String,
+        clipboard: String? = nil,
         observation: AccessibilityObservation?,
         settle: SettleResult,
         image: ImagePayloadV2?
@@ -594,6 +598,7 @@ public struct ActionResponseV2: Codable, Sendable, Equatable {
         self.baseStateID = baseStateID
         self.status = status
         self.message = message
+        self.clipboard = clipboard
         self.observation = observation
         self.settle = settle
         self.image = image
@@ -609,6 +614,6 @@ public struct ActionResponseV2: Codable, Sendable, Equatable {
         case windowID = "window_id"
         case displayFingerprint = "display_fingerprint"
         case baseStateID = "base_state_id"
-        case status, message, observation, settle, image
+        case status, message, clipboard, observation, settle, image
     }
 }

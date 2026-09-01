@@ -35,7 +35,7 @@ use crate::{
         AccessibilityObservation, AccessibilityObservationKind, ActionRequestV2, ActionResponseV2,
         ActionV2, ImageProfile, ObservationMode, ObservationPolicy, RequestContextV2,
         ResponseStatusV2, SettleResult, CAPABILITY_ADAPTIVE_SETTLE_V2, CAPABILITY_AX_STATE_V2,
-        CAPABILITY_OBSERVATION_MODE_V2, PROTOCOL_VERSION_V2,
+        CAPABILITY_CLIPBOARD_PAYLOAD_V2, CAPABILITY_OBSERVATION_MODE_V2, PROTOCOL_VERSION_V2,
     },
 };
 
@@ -1288,6 +1288,21 @@ fn apply_response_v2(
         }
         return Err(TransportError::DeviceRejected(response.message));
     }
+    let message = match model_message_v2(
+        &request.action,
+        state
+            .context
+            .capabilities
+            .contains(CAPABILITY_CLIPBOARD_PAYLOAD_V2),
+        response.message,
+        response.clipboard,
+    ) {
+        Ok(message) => message,
+        Err(reason) => {
+            poison(state);
+            return Err(TransportError::ResponseValidation(reason));
+        }
+    };
     let preserves_state = matches!(request.action, ActionV2::ReadClipboard);
     let expected_state_generation = if preserves_state {
         request.context.current_state_generation
@@ -1376,7 +1391,7 @@ fn apply_response_v2(
         profile: image.profile,
     });
     Ok(DeviceResultV2 {
-        message: response.message,
+        message,
         state_generation: response.state_generation,
         screenshot_generation: response.screenshot_generation,
         state_id,
@@ -1390,6 +1405,22 @@ fn apply_response_v2(
         retry_count: 0,
         manual_recovery: false,
     })
+}
+
+fn model_message_v2(
+    action: &ActionV2,
+    supports_clipboard_payload: bool,
+    message: String,
+    clipboard: Option<String>,
+) -> Result<String, &'static str> {
+    match (action, supports_clipboard_payload, clipboard) {
+        (ActionV2::ReadClipboard, true, Some(clipboard)) => Ok(clipboard),
+        (ActionV2::ReadClipboard, true, None) => Err("missing clipboard payload"),
+        (ActionV2::ReadClipboard, false, None) => Ok(message),
+        (ActionV2::ReadClipboard, false, Some(_)) => Err("unnegotiated clipboard payload"),
+        (_, _, None) => Ok(message),
+        (_, _, Some(_)) => Err("unexpected clipboard payload"),
+    }
 }
 
 fn valid_observation_binding(
@@ -1567,6 +1598,56 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
 
     use super::*;
+
+    #[test]
+    fn clipboard_payload_negotiation_controls_model_visible_message() {
+        let large_clipboard = "a".repeat(4_097);
+        assert_eq!(
+            model_message_v2(
+                &ActionV2::ReadClipboard,
+                true,
+                "Clipboard read.".to_owned(),
+                Some(large_clipboard.clone()),
+            ),
+            Ok(large_clipboard)
+        );
+        assert_eq!(
+            model_message_v2(
+                &ActionV2::ReadClipboard,
+                false,
+                "legacy clipboard".to_owned(),
+                None,
+            ),
+            Ok("legacy clipboard".to_owned())
+        );
+        assert_eq!(
+            model_message_v2(
+                &ActionV2::ReadClipboard,
+                true,
+                "Clipboard read.".to_owned(),
+                None,
+            ),
+            Err("missing clipboard payload")
+        );
+        assert_eq!(
+            model_message_v2(
+                &ActionV2::ReadClipboard,
+                false,
+                "legacy clipboard".to_owned(),
+                Some("unnegotiated".to_owned()),
+            ),
+            Err("unnegotiated clipboard payload")
+        );
+        assert_eq!(
+            model_message_v2(
+                &ActionV2::Observe { application: None },
+                true,
+                "Action completed.".to_owned(),
+                Some("unexpected".to_owned()),
+            ),
+            Err("unexpected clipboard payload")
+        );
+    }
     use crate::nested_tls::{
         server_config, server_exporter_binding, GenerationIdentity, GenerationMaterial,
     };
@@ -2441,6 +2522,7 @@ mod tests {
         context.capabilities = [
             CAPABILITY_ADAPTIVE_SETTLE_V2.to_owned(),
             CAPABILITY_AX_STATE_V2.to_owned(),
+            CAPABILITY_CLIPBOARD_PAYLOAD_V2.to_owned(),
             CAPABILITY_OBSERVATION_MODE_V2.to_owned(),
         ]
         .into_iter()
@@ -2557,7 +2639,8 @@ mod tests {
                     "window_id": 7,
                     "display_fingerprint": "display-layout",
                     "status": "success",
-                    "message": "clipboard text",
+                    "message": "Clipboard read.",
+                    "clipboard": "clipboard text",
                     "settle": {"status": "not_requested", "elapsed_ms": 0}
                 }),
             )
@@ -2679,6 +2762,7 @@ mod tests {
             .expect("clipboard read");
         assert_eq!(after_clipboard.state_id, state_id);
         assert_eq!(after_clipboard.state_generation, 1);
+        assert_eq!(after_clipboard.message, "clipboard text");
         assert!(after_clipboard.observation.is_none());
 
         let error = transport

@@ -168,11 +168,17 @@ public struct WindowCapture: Sendable {
     }
 
     @MainActor
-    public func capture(application: ApplicationIdentity) async throws -> CapturedWindow {
+    public func capture(
+        application: ApplicationIdentity,
+        requiredWindowID: CGWindowID? = nil
+    ) async throws -> CapturedWindow {
         guard CGPreflightScreenCaptureAccess() else {
             throw CaptureFailure.screenRecordingPermissionMissing
         }
-        let resolved = try await resolve(application: application)
+        let resolved = try await resolve(
+            application: application,
+            requiredWindowID: requiredWindowID
+        )
         let size = Self.scaledSize(
             sourceWidth: resolved.captureFrame.width,
             sourceHeight: resolved.captureFrame.height,
@@ -218,8 +224,14 @@ public struct WindowCapture: Sendable {
     }
 
     @MainActor
-    public func context(application: ApplicationIdentity) async throws -> WindowContext {
-        let resolved = try await resolve(application: application)
+    public func context(
+        application: ApplicationIdentity,
+        requiredWindowID: CGWindowID? = nil
+    ) async throws -> WindowContext {
+        let resolved = try await resolve(
+            application: application,
+            requiredWindowID: requiredWindowID
+        )
         return WindowContext(
             windowID: resolved.window.windowID,
             windowFrame: resolved.window.frame,
@@ -233,7 +245,10 @@ public struct WindowCapture: Sendable {
     }
 
     @MainActor
-    private func resolve(application: ApplicationIdentity) async throws -> (
+    private func resolve(
+        application: ApplicationIdentity,
+        requiredWindowID: CGWindowID?
+    ) async throws -> (
         processID: pid_t,
         content: SCShareableContent,
         window: SCWindow,
@@ -271,7 +286,8 @@ public struct WindowCapture: Sendable {
         }
         let selectedWindowID = Self.preferredWindowID(
             candidates: windows.map { ($0.windowID, $0.frame) },
-            frontToBackWindowIDs: Self.frontToBackWindowIDs(processID: processID)
+            frontToBackWindowIDs: Self.frontToBackWindowIDs(processID: processID),
+            requiredWindowID: requiredWindowID
         )
         guard let selectedWindowID,
               let window = windows.first(where: { $0.windowID == selectedWindowID })
@@ -578,9 +594,13 @@ public struct WindowCapture: Sendable {
 
     static func preferredWindowID(
         candidates: [(windowID: CGWindowID, frame: CGRect)],
-        frontToBackWindowIDs: [CGWindowID]
+        frontToBackWindowIDs: [CGWindowID],
+        requiredWindowID: CGWindowID? = nil
     ) -> CGWindowID? {
         let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.windowID, $0.frame) })
+        if let requiredWindowID {
+            return byID[requiredWindowID] == nil ? nil : requiredWindowID
+        }
         if let frontmostSubstantial = frontToBackWindowIDs.first(where: { windowID in
             guard let frame = byID[windowID] else { return false }
             return frame.width >= 100 && frame.height >= 100

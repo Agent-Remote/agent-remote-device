@@ -1,0 +1,13 @@
+{
+  "request_id": "10000000-0000-4000-8000-000000000021",
+  "monotonic_sequence": 9,
+  "state_generation": 4,
+  "screenshot_generation": 2,
+  "status": "failed",
+  "message": "Clipboard read failed.",
+  "clipboard": "must not be exposed on failure",
+  "settle": {
+    "status": "not_requested",
+    "elapsed_ms": 0
+  }
+}

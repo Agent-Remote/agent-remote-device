@@ -53,15 +53,18 @@ The authoritative machine-readable request schema is
 `protocol/schema/action-request-v1.schema.json`. Cross-language fixtures live in
 `protocol/test-vectors`.
 
-`read_clipboard` returns at most 64 KiB of plain text and never mutates the Mac
-clipboard. V1 requires a current screenshot; v2 requires the current verified
+`read_clipboard` returns bounded plain text and never mutates the Mac clipboard.
+V1 requires a current screenshot; v2 requires the current verified
 application/window state. Both paths require that application's explicit
 per-session clipboard approval. A successful read consumes the action sequence
 but does not create an image or advance the screenshot generation. Missing,
 non-text, oversized, and unapproved clipboard content return concrete device
 errors without dropping the encrypted channel.
-On the compact v2 surface it requests observation mode `none` and returns only the
-JSON-escaped clipboard text plus the unchanged `state_id` and `state_generation`.
+On the compact v2 surface it requests observation mode `none`. When
+`clipboard_payload_v2` is negotiated, `message` remains a bounded status and the
+`clipboard` field carries at most 64 KiB of UTF-8 text. A peer without the optional
+extension retains the legacy `message` payload with a 4 KiB UTF-8 limit. The result
+also preserves the unchanged `state_id` and `state_generation`.
 Because a read cannot mutate GUI state, existing element indexes remain valid without
 another `observe`. AX nodes, screenshot metadata, and settle fields are intentionally
 omitted.
@@ -95,11 +98,17 @@ ax_state_v2
 adaptive_settle_v2
 ```
 
+Those three capabilities are the required v2 base. The optional
+`clipboard_payload_v2` extension moves successful clipboard content out of the
+bounded response status message and raises its UTF-8 byte limit from 4 KiB to
+64 KiB. It does not change clipboard approval or state-binding requirements.
+
 Unknown capabilities, a missing capability, or a version mismatch selects the
 complete v1 behavior. The fallback is not allowed to accept a v2 frame and ignore
 unknown observation fields. Existing managed contexts with no capability list are
-read as v1 and upgraded on renewal. The Server enables the complete set by default
-and may force the empty v1 set for emergency rollback; it never sends a partial set.
+read as v1 and upgraded on renewal. The Server enables the complete supported set by
+default and may force the empty v1 set for emergency rollback; it never sends an
+incomplete required base.
 
 ### Request observation policy
 
@@ -147,6 +156,8 @@ vector is `protocol/test-vectors/action-response-v2-valid.json`:
   "screenshot_generation": 17,
   "state_id": "device-generated-opaque-id",
   "base_state_id": "prior-model-visible-state-or-null",
+  "message": "Action completed.",
+  "clipboard": "optional negotiated clipboard text",
   "observation": {
     "mode": "ax_diff",
     "reset": false,
@@ -177,6 +188,12 @@ not invalidate the latest model-visible element indexes for application A.
 A newer state for A, an A window/display change, a turn boundary, or a device
 generation change still invalidates A's prior binding. The Executor never
 remaps an old index to a newer state.
+
+The `clipboard` field is valid only for a successful `read_clipboard` response in
+a generation that negotiated `clipboard_payload_v2`. It is forbidden on other
+actions and on failed responses. The proxy validates the 64 KiB UTF-8 byte bound
+before exposing the text and poisons the generation on an unexpected, missing,
+or unnegotiated clipboard payload.
 
 Passive observations, screenshots, waits, zooms, and approved clipboard reads
 resolve the exact signed process and window without activating it. Window capture

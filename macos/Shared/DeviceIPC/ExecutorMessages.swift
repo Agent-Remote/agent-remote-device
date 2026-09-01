@@ -321,6 +321,7 @@ public struct ExecutorSessionConfiguration: Codable, Equatable, Sendable {
             capabilityObservationModeV2,
             capabilityAXStateV2,
             capabilityAdaptiveSettleV2,
+            capabilityClipboardPayloadV2,
         ]
     ) {
         self.binding = binding
@@ -343,14 +344,22 @@ public struct ExecutorSessionConfiguration: Codable, Equatable, Sendable {
     }
 
     public var supportsProtocolV2: Bool {
-        Self.knownCapabilities.isSubset(of: capabilities)
+        Self.requiredV2Capabilities.isSubset(of: capabilities)
     }
 
-    private static let knownCapabilities: Set<String> = [
+    public var supportsClipboardPayloadV2: Bool {
+        capabilities.contains(capabilityClipboardPayloadV2)
+    }
+
+    private static let requiredV2Capabilities: Set<String> = [
         capabilityObservationModeV2,
         capabilityAXStateV2,
         capabilityAdaptiveSettleV2,
     ]
+
+    private static let knownCapabilities = requiredV2Capabilities.union([
+        capabilityClipboardPayloadV2,
+    ])
 }
 
 private extension DeviceSessionBinding {

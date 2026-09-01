@@ -1,0 +1,17 @@
+{
+  "request_id": "10000000-0000-4000-8000-000000000020",
+  "monotonic_sequence": 9,
+  "state_generation": 4,
+  "screenshot_generation": 2,
+  "state_id": "10000000-0000-4000-8000-000000000011",
+  "application_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "window_id": 7,
+  "display_fingerprint": "display-layout-v1",
+  "status": "success",
+  "message": "Clipboard read.",
+  "clipboard": "clipboard text",
+  "settle": {
+    "status": "not_requested",
+    "elapsed_ms": 0
+  }
+}

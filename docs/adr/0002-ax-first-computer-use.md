@@ -15,13 +15,17 @@ the underlying screenshot cost and makes freshness harder to reason about.
 
 Use a capability-gated v2 path with v1 as the complete fail-closed fallback.
 The managed proxy exposes `observe`, `act`, `input_text`, and `read_clipboard` when
-the exact capability set is negotiated:
+the required capability base is negotiated:
 
 ```text
 observation_mode_v2
 ax_state_v2
 adaptive_settle_v2
 ```
+
+Recognized optional extensions can refine individual responses without changing
+that base. `clipboard_payload_v2` carries successful clipboard text in a dedicated
+64 KiB UTF-8 field while retaining the existing approval and state bindings.
 
 The normal operation is:
 

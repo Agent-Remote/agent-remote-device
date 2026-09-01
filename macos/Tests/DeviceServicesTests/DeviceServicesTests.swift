@@ -77,6 +77,41 @@ import Testing
     #expect(await controller.currentState() == .active)
 }
 
+@Test func namedScreenshotReusesTheApplicationsLatestBoundWindow() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: "com.apple.Safari")
+    ))
+    let screenshotData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .screenshot),
+        action: .observe(application: "com.apple.Safari")
+    ))
+    let screenshot = try JSONDecoder().decode(ActionResponseV2.self, from: screenshotData)
+
+    #expect(screenshot.status == .success)
+    #expect(screenshot.windowID == 7)
+    #expect(await recorder.preferredWindowIDs == [[7]])
+}
+
 @Test func executorRunsStateBoundV2ElementActionAndRejectsItsReuse() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -1448,11 +1483,13 @@ import Testing
     ))
     let clipboard = try JSONDecoder().decode(ActionResponseV2.self, from: clipboardData)
     #expect(clipboard.status == .success)
-    #expect(clipboard.message == "clipboard text")
+    #expect(clipboard.message == "Clipboard read.")
+    #expect(clipboard.clipboard == "clipboard text")
     #expect(clipboard.observation == nil)
     #expect(clipboard.image == nil)
     #expect(clipboard.stateID == observed.stateID)
     #expect(clipboard.stateGeneration == observed.stateGeneration)
+    #expect(await recorder.clipboardMaximumBytes == [maximumClipboardTextBytesV2])
 
     let originalTarget = ElementTarget(
         stateID: try #require(observed.stateID),
@@ -1479,6 +1516,64 @@ import Testing
     let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
     #expect(action.status == .success)
     #expect(await recorder.elementActions == [.press(originalTarget)])
+}
+
+@Test func v2ClipboardReadUsesTheBoundedMessageFallbackWithoutThePayloadCapability() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .viewOnly,
+                clipboardAllowed: true,
+                generation: $0.generation
+            )
+        },
+        capabilities: [
+            capabilityObservationModeV2,
+            capabilityAXStateV2,
+            capabilityAdaptiveSettleV2,
+        ]
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let clipboardData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: observed.stateGeneration,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .readClipboard
+    ))
+    let clipboard = try JSONDecoder().decode(ActionResponseV2.self, from: clipboardData)
+
+    #expect(clipboard.status == .success)
+    #expect(clipboard.message == "clipboard text")
+    #expect(clipboard.clipboard == nil)
+    #expect(await recorder.clipboardMaximumBytes == [4 * 1_024])
 }
 
 @Test func executorRejectsCrossGenerationStopAndEndMessages() async throws {
@@ -3427,6 +3522,8 @@ private actor RuntimeRecorder {
     private(set) var accessibilityClearCount = 0
     private(set) var lifecycleEvents: [String] = []
     private(set) var captureTargets: [String?] = []
+    private(set) var preferredWindowIDs: [[UInt32]] = []
+    private(set) var clipboardMaximumBytes: [Int] = []
     private(set) var valueFreshnessCalls: [(ElementTarget, String, Date)] = []
     private(set) var observationBaseStateIDs: [UUID?] = []
     private(set) var settlePhases: [String] = []
@@ -3434,6 +3531,14 @@ private actor RuntimeRecorder {
     func captured(targetApplication: String? = nil) {
         captureCount += 1
         captureTargets.append(targetApplication)
+    }
+
+    func captured(preferredWindowContexts: [WindowContext]) {
+        preferredWindowIDs.append(preferredWindowContexts.map(\.windowID))
+    }
+
+    func readClipboard(maximumBytes: Int) {
+        clipboardMaximumBytes.append(maximumBytes)
     }
 
     func executed(_ action: Action) {
@@ -3864,6 +3969,21 @@ private actor RuntimeStub: GUIActionRuntime {
         )
     }
 
+    func captureV2(
+        approvedApplications: [ApplicationIdentity],
+        targetApplication: String?,
+        preferredWindowContexts: [WindowContext],
+        profile _: ImageProfile,
+        region: Region?
+    ) async throws -> CapturedWindow {
+        await recorder.captured(preferredWindowContexts: preferredWindowContexts)
+        let capture = try await capture(
+            approvedApplications: approvedApplications,
+            targetApplication: targetApplication
+        )
+        return try region.map { try WindowCapture.cropped(capture, to: $0) } ?? capture
+    }
+
     func windowContext(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?
@@ -4042,8 +4162,10 @@ private actor RuntimeStub: GUIActionRuntime {
     func readClipboardV2(
         sequence: UInt64,
         stateGeneration: UInt64,
-        context: WindowContext
+        context: WindowContext,
+        maximumBytes: Int
     ) async throws -> String {
+        await recorder.readClipboard(maximumBytes: maximumBytes)
         try await guardState.authorizeClipboardV2(
             sequence: sequence,
             stateGeneration: stateGeneration,
@@ -4051,6 +4173,9 @@ private actor RuntimeStub: GUIActionRuntime {
             windowID: context.windowID,
             application: context.application
         )
+        guard "clipboard text".utf8.count <= maximumBytes else {
+            throw ExecutionFailure.clipboardContentTooLarge
+        }
         try await guardState.accept(sequence: sequence)
         return "clipboard text"
     }

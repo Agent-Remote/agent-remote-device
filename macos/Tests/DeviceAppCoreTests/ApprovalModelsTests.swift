@@ -158,13 +158,93 @@ import Testing
 
     permissionsGranted = false
     model.enforceCurrentPermissions()
-    for _ in 0 ..< 100 where model.state != .permissionRequired {
+    for _ in 0 ..< 200 where model.state != .permissionRequired {
         try await Task.sleep(for: .milliseconds(5))
     }
 
     #expect(model.state == .permissionRequired)
     #expect(events.values().contains("restore"))
     #expect(events.values().contains("end"))
+}
+
+@MainActor
+@Test func transientPermissionFailureIsRetriedWithoutEndingControl() async throws {
+    let events = EventRecorder()
+    var permissionsGranted = true
+    let model = DeviceAppModel(
+        visibilityController: RecordingVisibilityController(events: events),
+        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
+        permissionsGranted: { permissionsGranted },
+        controlNotifier: {}
+    )
+    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
+    model.presentApproval(try ApprovalPresentation(
+        generation: 1,
+        applications: [browser]
+    ))
+    model.applicationSelections = [browser.id]
+    model.onApprove = { _ in }
+    model.onEndSession = { events.append("end") }
+    model.allowForSession()
+    for _ in 0 ..< 100 where model.state != .active {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    permissionsGranted = false
+    model.enforceCurrentPermissions()
+    permissionsGranted = true
+    try await Task.sleep(for: .milliseconds(350))
+
+    #expect(model.state == .active)
+    #expect(!events.values().contains("end"))
+}
+
+@MainActor
+@Test func pendingPermissionRetryCannotEndReplacementSession() async throws {
+    let events = EventRecorder()
+    var permissionsGranted = true
+    let model = DeviceAppModel(
+        visibilityController: RecordingVisibilityController(events: events),
+        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
+        permissionsGranted: { permissionsGranted },
+        controlNotifier: {}
+    )
+    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
+    let presentation = try ApprovalPresentation(generation: 1, applications: [browser])
+    model.onApprove = { _ in }
+    model.onEndSession = { events.append("end") }
+    model.presentApproval(presentation)
+    model.applicationSelections = [browser.id]
+    model.allowForSession()
+    for _ in 0 ..< 100 where model.state != .active {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    permissionsGranted = false
+    model.enforceCurrentPermissions()
+    try await Task.sleep(for: .milliseconds(300))
+
+    try model.handleRuntimeEvent(.sessionEnded)
+    permissionsGranted = true
+    model.presentApproval(presentation)
+    model.applicationSelections = [browser.id]
+    model.allowForSession()
+    for _ in 0 ..< 100 where model.state != .active {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    permissionsGranted = false
+    model.enforceCurrentPermissions()
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(model.state == .active)
+    #expect(!events.values().contains("end"))
+
+    permissionsGranted = true
+    try await Task.sleep(for: .milliseconds(300))
+
+    #expect(model.state == .active)
+    #expect(!events.values().contains("end"))
 }
 
 @MainActor

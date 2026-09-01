@@ -57,6 +57,19 @@ import Testing
     #expect(response.observation?.nodes.first?.title == "Continue")
 }
 
+@Test func decodesCrossLanguageV2ClipboardResponseVector() throws {
+    let url = try #require(Bundle.module.url(
+        forResource: "action-response-v2-clipboard-valid",
+        withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let response = try JSONDecoder().decode(ActionResponseV2.self, from: Data(contentsOf: url))
+
+    #expect(response.status == .success)
+    #expect(response.message == "Clipboard read.")
+    #expect(response.clipboard == "clipboard text")
+}
+
 @Test func v2SetValueAcceptsAnEmptyStringForClearingEditableControls() throws {
     let target = ElementTarget(
         stateID: UUID(),

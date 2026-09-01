@@ -9,6 +9,7 @@ pub const PROTOCOL_VERSION_V2: u8 = 2;
 pub const CAPABILITY_OBSERVATION_MODE_V2: &str = "observation_mode_v2";
 pub const CAPABILITY_AX_STATE_V2: &str = "ax_state_v2";
 pub const CAPABILITY_ADAPTIVE_SETTLE_V2: &str = "adaptive_settle_v2";
+pub const CAPABILITY_CLIPBOARD_PAYLOAD_V2: &str = "clipboard_payload_v2";
 
 pub const MAX_AX_NODES: u16 = 800;
 pub const MAX_AX_DEPTH: u8 = 20;
@@ -20,6 +21,7 @@ pub const DEFAULT_AX_NODES: u16 = 600;
 pub const DEFAULT_AX_TOTAL_TEXT_BYTES: u32 = 12 * 1024;
 pub const DEFAULT_AX_VISIBLE_ROWS_PER_CONTAINER: u8 = 12;
 pub const MAX_RESPONSE_MESSAGE_CHARACTERS: usize = 4_096;
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1_024;
 pub const MAX_AX_ROLE_CHARACTERS: usize = 80;
 pub const MAX_AX_ACTIONS_PER_NODE: usize = 16;
 pub const MAX_AX_ACTION_CHARACTERS: usize = 128;
@@ -285,6 +287,7 @@ pub struct ActionResponseV2 {
     pub base_state_id: Option<Uuid>,
     pub status: ResponseStatusV2,
     pub message: String,
+    pub clipboard: Option<String>,
     pub observation: Option<AccessibilityObservation>,
     pub settle: SettleResult,
     pub image: Option<ImagePayloadV2>,
@@ -314,6 +317,16 @@ impl ActionResponseV2 {
         }
         if self.message.chars().count() > MAX_RESPONSE_MESSAGE_CHARACTERS {
             return Err("response_message_length");
+        }
+        if self
+            .clipboard
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_CLIPBOARD_TEXT_BYTES)
+        {
+            return Err("clipboard_payload_length");
+        }
+        if matches!(self.status, ResponseStatusV2::Failed) && self.clipboard.is_some() {
+            return Err("failed_response_clipboard");
         }
         if self.settle.elapsed_ms > MAX_SETTLE_TIMEOUT_MS {
             return Err("settle_elapsed");
@@ -556,6 +569,38 @@ mod tests {
     }
 
     #[test]
+    fn swift_v2_clipboard_response_vector_decodes_and_stays_bounded() {
+        let raw =
+            include_str!("../../protocol/test-vectors/action-response-v2-clipboard-valid.json");
+        let response: ActionResponseV2 =
+            serde_json::from_str(raw).expect("valid v2 clipboard response fixture");
+        assert_eq!(response.clipboard.as_deref(), Some("clipboard text"));
+        assert!(response.validate_payload(&ObservationPolicy::default()));
+    }
+
+    #[test]
+    fn clipboard_response_rejects_failed_and_oversized_payloads() {
+        let raw =
+            include_str!("../../protocol/test-vectors/action-response-v2-clipboard-invalid.json");
+        let mut response: ActionResponseV2 =
+            serde_json::from_str(raw).expect("decodable invalid v2 clipboard response fixture");
+        assert_eq!(
+            response.validate_payload_reason(&ObservationPolicy::default()),
+            Err("failed_response_clipboard")
+        );
+
+        response.status = ResponseStatusV2::Success;
+        response.clipboard = Some("a".repeat(4_097));
+        assert!(response.validate_payload(&ObservationPolicy::default()));
+
+        response.clipboard = Some("a".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1));
+        assert_eq!(
+            response.validate_payload_reason(&ObservationPolicy::default()),
+            Err("clipboard_payload_length")
+        );
+    }
+
+    #[test]
     fn default_policy_stays_within_compiled_bounds() {
         assert!(ObservationPolicy::default().validate());
     }
@@ -627,6 +672,7 @@ mod tests {
             base_state_id: None,
             status: ResponseStatusV2::Success,
             message: "ok".to_owned(),
+            clipboard: None,
             observation: Some(AccessibilityObservation {
                 kind: AccessibilityObservationKind::Diff,
                 reset: false,
