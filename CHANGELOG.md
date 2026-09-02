@@ -2,6 +2,10 @@
 
 All notable changes to this repository are recorded here.
 
+## v0.2.11 - 2026-09-02
+
+- fix(device-control): preserve exact window targeting (39fafb3)
+
 ## v0.2.10 - 2026-09-01
 
 - feat(device-control): improve macos control resilience (55aa5e3)
