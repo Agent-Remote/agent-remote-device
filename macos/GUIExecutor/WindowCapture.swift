@@ -76,6 +76,12 @@ public struct WindowContext: Equatable, Sendable {
     }
 }
 
+struct WindowCandidate: Equatable, Sendable {
+    let windowID: CGWindowID
+    let frame: CGRect
+    let processID: pid_t
+}
+
 public extension CapturedWindow {
     var windowContext: WindowContext {
         WindowContext(
@@ -195,11 +201,8 @@ public struct WindowCapture: Sendable {
         configuration.height = size.height
         configuration.showsCursor = true
         configuration.capturesAudio = false
-        configuration.sourceRect = Self.displayLocalRect(
-            resolved.captureFrame,
-            displayFrame: resolved.display.frame
-        )
-        let filter = SCContentFilter(display: resolved.display, including: [resolved.window])
+        configuration.ignoreShadowsSingleWindow = true
+        let filter = SCContentFilter(desktopIndependentWindow: resolved.window)
         let image = try await Self.withOperationTimeout {
             try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
@@ -267,10 +270,10 @@ public struct WindowCapture: Sendable {
         let matching = running.filter {
             Self.signingIdentifier(for: $0) == application.signingIdentifier
         }
-        guard matching.count == 1, let target = matching.first else {
+        guard !matching.isEmpty else {
             throw CaptureFailure.signingIdentifierMismatch
         }
-        let processID = target.processIdentifier
+        let matchingProcessIDs = Set(matching.map(\.processIdentifier))
         let content = try await Self.withOperationTimeout {
             // Approved full-screen windows can live on another Space while the user
             // keeps a terminal frontmost.
@@ -279,25 +282,38 @@ public struct WindowCapture: Sendable {
                 onScreenWindowsOnly: false
             )
         }
+        let candidates = Self.matchingWindowCandidates(
+            content.windows.compactMap { window in
+                guard let processID = window.owningApplication?.processID else { return nil }
+                return WindowCandidate(
+                    windowID: window.windowID,
+                    frame: window.frame,
+                    processID: processID
+                )
+            },
+            processIDs: matchingProcessIDs
+        )
+        let candidateIDs = Set(candidates.map(\.windowID))
         let windows = content.windows.filter {
-            $0.owningApplication?.processID == processID
-                && $0.frame.width > 1
-                && $0.frame.height > 1
+            candidateIDs.contains($0.windowID)
         }
         let selectedWindowID = Self.preferredWindowID(
-            candidates: windows.map { ($0.windowID, $0.frame) },
-            frontToBackWindowIDs: Self.frontToBackWindowIDs(processID: processID),
+            candidates: candidates.map { ($0.windowID, $0.frame) },
+            frontToBackWindowIDs: Self.frontToBackWindowIDs(
+                processIDs: matchingProcessIDs
+            ),
             requiredWindowID: requiredWindowID
         )
         guard let selectedWindowID,
-              let window = windows.first(where: { $0.windowID == selectedWindowID })
+              let window = windows.first(where: { $0.windowID == selectedWindowID }),
+              let processID = window.owningApplication?.processID
         else {
             throw CaptureFailure.approvedWindowMissing
         }
         guard let display = Self.selectedDisplay(for: window.frame, from: content.displays) else {
             throw CaptureFailure.displayMissing
         }
-        let captureFrame = window.frame.intersection(display.frame)
+        let captureFrame = window.frame
         guard !captureFrame.isNull, !captureFrame.isInfinite,
               captureFrame.width > 0, captureFrame.height > 0
         else {
@@ -615,6 +631,17 @@ public struct WindowCapture: Sendable {
         }?.windowID
     }
 
+    static func matchingWindowCandidates(
+        _ candidates: [WindowCandidate],
+        processIDs: Set<pid_t>
+    ) -> [WindowCandidate] {
+        candidates.filter {
+            processIDs.contains($0.processID)
+                && $0.frame.width > 1
+                && $0.frame.height > 1
+        }
+    }
+
     static func withOperationTimeout<Value: Sendable>(
         _ timeout: Duration = operationTimeout,
         operation: @escaping @Sendable () async throws -> Value
@@ -642,13 +669,14 @@ public struct WindowCapture: Sendable {
         }
     }
 
-    private static func frontToBackWindowIDs(processID: pid_t) -> [CGWindowID] {
+    private static func frontToBackWindowIDs(processIDs: Set<pid_t>) -> [CGWindowID] {
         guard let values = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else { return [] }
         return values.compactMap { value in
-            guard (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processID,
+            guard let owner = (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  processIDs.contains(owner),
                   (value[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   let number = value[kCGWindowNumber as String] as? NSNumber
             else { return nil }

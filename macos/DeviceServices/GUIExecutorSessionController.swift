@@ -317,9 +317,12 @@ public actor GUIExecutorSessionController {
             case let .screenshotApplication(application): application
             default: nil
             }
-            capture = try await runtime.capture(
+            capture = try await runtime.captureV2(
                 approvedApplications: approvedApplications,
-                targetApplication: targetApplication
+                targetApplication: targetApplication,
+                preferredWindowContexts: latestCapture.map { [$0.windowContext] } ?? [],
+                profile: .standard,
+                region: nil
             )
             try await record(
                 capture: capture,
@@ -363,9 +366,12 @@ public actor GUIExecutorSessionController {
                 capture: latestCapture
             )
             do {
-                capture = try await runtime.capture(
+                capture = try await runtime.captureV2(
                     approvedApplications: approvedApplications,
-                    targetApplication: latestCapture.application.bundleIdentifier
+                    targetApplication: latestCapture.application.bundleIdentifier,
+                    preferredWindowContexts: [latestCapture.windowContext],
+                    profile: .standard,
+                    region: nil
                 )
             } catch let failure as CaptureFailure {
                 requiresFreshScreenshot = true
@@ -505,7 +511,8 @@ public actor GUIExecutorSessionController {
             } else if case .observe = request.action {
                 windowContext = try await runtime.windowContext(
                     approvedApplications: approvedApplications,
-                    targetApplication: targetApplication
+                    targetApplication: targetApplication,
+                    preferredWindowContexts: Array(windowContextsByApplication.values)
                 )
             } else if let elementApplicationDigest,
                       let elementContext = windowContextsByApplication[elementApplicationDigest]
@@ -676,7 +683,12 @@ public actor GUIExecutorSessionController {
             do {
                 let refreshed = try await runtime.windowContext(
                     approvedApplications: approvedApplications,
-                    targetApplication: actionApplication
+                    targetApplication: actionApplication,
+                    preferredWindowContexts: [windowContext]
+                        + windowContextsByApplication.values.filter {
+                            $0.application.stableDigest
+                                != windowContext.application.stableDigest
+                        }
                 )
                 if !Self.sameAccessibilityIdentity(refreshed, windowContext) {
                     latestCapture = nil

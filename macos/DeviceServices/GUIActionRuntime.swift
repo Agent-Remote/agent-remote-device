@@ -50,7 +50,8 @@ public protocol GUIActionRuntime: Sendable {
     ) async throws -> CapturedWindow
     func windowContext(
         approvedApplications: [ApplicationIdentity],
-        targetApplication: String?
+        targetApplication: String?,
+        preferredWindowContexts: [WindowContext]
     ) async throws -> WindowContext
     func observeAccessibility(
         context: WindowContext,
@@ -136,7 +137,8 @@ public extension GUIActionRuntime {
 
     func windowContext(
         approvedApplications: [ApplicationIdentity],
-        targetApplication: String?
+        targetApplication: String?,
+        preferredWindowContexts _: [WindowContext]
     ) async throws -> WindowContext {
         try await capture(
             approvedApplications: approvedApplications,
@@ -285,13 +287,20 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
 
     public func windowContext(
         approvedApplications: [ApplicationIdentity],
-        targetApplication: String? = nil
+        targetApplication: String? = nil,
+        preferredWindowContexts: [WindowContext] = []
     ) async throws -> WindowContext {
         let application = try await selectedApplication(
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
-        return try await captureEngine.context(application: application)
+        let preferredWindowID = preferredWindowContexts.first {
+            $0.application.stableDigest == application.stableDigest
+        }?.windowID
+        return try await captureEngine.context(
+            application: application,
+            requiredWindowID: preferredWindowID
+        )
     }
 
     private func selectedApplication(

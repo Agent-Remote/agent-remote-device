@@ -90,6 +90,19 @@ import Testing
 }
 
 @MainActor
+@Test func approvalDoesNotPreselectClipboardAccess() throws {
+    let model = DeviceAppModel(permissionsGranted: { true })
+    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
+
+    model.presentApproval(try ApprovalPresentation(
+        generation: 1,
+        applications: [browser]
+    ))
+
+    #expect(model.clipboardSelections.isEmpty)
+}
+
+@MainActor
 @Test func unavailableSecureIPCChangesOnlyTheReadyStateToFailed() {
     let journalURL = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)

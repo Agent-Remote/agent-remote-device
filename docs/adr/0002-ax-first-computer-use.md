@@ -78,6 +78,14 @@ signed process to become the `NSWorkspace` frontmost process; a lagging
 committing the action sequence, preventing a following context keyboard action
 from reaching the application that was previously frontmost.
 
+When one approved bundle has multiple running processes or windows, initial
+resolution selects the frontmost substantial window across every process with the
+approved signing identity. Later AX observations, screenshots, v1 fallback
+captures, and post-action refreshes reuse the bound process and window ID. Pixel
+capture uses ScreenCaptureKit's desktop-independent single-window filter, so a
+window on another display cannot be replaced by a different window from the same
+application.
+
 Adaptive settle and post-action navigation recovery share one navigation
 classifier. Copy/select/cut shortcuts stay on the local path and preserve Diff;
 Return and browser Back/Forward remain navigation-capable. Local actions use two

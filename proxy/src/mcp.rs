@@ -1708,6 +1708,22 @@ mod tests {
 
     #[test]
     fn compact_act_schema_accepts_each_exact_action_shape() {
+        let server = DeviceMcp::token_efficient(Arc::new(SuccessTransport));
+        let act = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "act")
+            .expect("compact act tool");
+        let input_schema = serde_json::Value::Object((*act.input_schema).clone());
+        let action_kinds = input_schema
+            .pointer("/$defs/ActKind/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("act kind enum");
+        assert!(action_kinds.iter().any(|value| value == "hold_key"));
+        assert!(input_schema.pointer("/properties/key").is_some());
+        assert!(input_schema.pointer("/properties/duration_ms").is_some());
+
         let valid = [
             serde_json::json!({"type": "press", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1}),
             serde_json::json!({"type": "set_value", "state_id": "10000000-0000-4000-8000-000000000001", "state_generation": 1, "element_index": 1, "value": "value"}),

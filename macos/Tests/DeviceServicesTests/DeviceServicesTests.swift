@@ -112,6 +112,66 @@ import Testing
     #expect(await recorder.preferredWindowIDs == [[7]])
 }
 
+@Test func legacyScreenshotsReuseTheLatestBoundWindow() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        screenshotGeneration: 0,
+        action: .screenshot
+    ))
+    _ = try await controller.performAction(actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        screenshotGeneration: 1,
+        action: .screenshot
+    ))
+
+    #expect(await recorder.preferredWindowIDs == [[], [7]])
+}
+
+@Test func repeatedAccessibilityObservationsReuseTheLatestBoundWindow() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: "com.apple.Safari")
+    ))
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: "com.apple.Safari")
+    ))
+
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
+}
+
 @Test func executorRunsStateBoundV2ElementActionAndRejectsItsReuse() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -3523,6 +3583,7 @@ private actor RuntimeRecorder {
     private(set) var lifecycleEvents: [String] = []
     private(set) var captureTargets: [String?] = []
     private(set) var preferredWindowIDs: [[UInt32]] = []
+    private(set) var windowContextPreferredWindowIDs: [[UInt32]] = []
     private(set) var clipboardMaximumBytes: [Int] = []
     private(set) var valueFreshnessCalls: [(ElementTarget, String, Date)] = []
     private(set) var observationBaseStateIDs: [UUID?] = []
@@ -3535,6 +3596,10 @@ private actor RuntimeRecorder {
 
     func captured(preferredWindowContexts: [WindowContext]) {
         preferredWindowIDs.append(preferredWindowContexts.map(\.windowID))
+    }
+
+    func resolvedWindowContext(preferredWindowContexts: [WindowContext]) {
+        windowContextPreferredWindowIDs.append(preferredWindowContexts.map(\.windowID))
     }
 
     func readClipboard(maximumBytes: Int) {
@@ -3986,8 +4051,12 @@ private actor RuntimeStub: GUIActionRuntime {
 
     func windowContext(
         approvedApplications: [ApplicationIdentity],
-        targetApplication: String?
+        targetApplication: String?,
+        preferredWindowContexts: [WindowContext]
     ) async throws -> WindowContext {
+        await recorder.resolvedWindowContext(
+            preferredWindowContexts: preferredWindowContexts
+        )
         let capture = try await capture(
             approvedApplications: approvedApplications,
             targetApplication: targetApplication

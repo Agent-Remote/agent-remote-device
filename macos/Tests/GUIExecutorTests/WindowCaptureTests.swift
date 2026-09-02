@@ -98,6 +98,41 @@ private func synchronouslyBlock(for seconds: Double) {
     ) == nil)
 }
 
+@Test func preferredWindowSelectsTheFrontmostSurfaceAcrossApplicationInstances() {
+    let candidates = WindowCapture.matchingWindowCandidates(
+        [
+            WindowCandidate(
+                windowID: 10,
+                frame: CGRect(x: 0, y: 0, width: 1_400, height: 900),
+                processID: 100
+            ),
+            WindowCandidate(
+                windowID: 20,
+                frame: CGRect(x: 1_500, y: 0, width: 1_200, height: 800),
+                processID: 200
+            ),
+            WindowCandidate(
+                windowID: 30,
+                frame: CGRect(x: 0, y: 0, width: 1_600, height: 1_000),
+                processID: 300
+            ),
+            WindowCandidate(
+                windowID: 40,
+                frame: CGRect(x: 0, y: 0, width: 1, height: 1),
+                processID: 100
+            ),
+        ],
+        processIDs: [100, 200]
+    )
+    let selected = WindowCapture.preferredWindowID(
+        candidates: candidates.map { ($0.windowID, $0.frame) },
+        frontToBackWindowIDs: [20, 10]
+    )
+
+    #expect(candidates.map(\.windowID) == [10, 20])
+    #expect(selected == 20)
+}
+
 @Test func captureScalingPreservesAspectRatioWithoutUpscaling() {
     #expect(WindowCapture.scaledSize(
         sourceWidth: 2_000,
