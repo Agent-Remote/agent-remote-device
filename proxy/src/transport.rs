@@ -34,8 +34,10 @@ use crate::{
     protocol_v2::{
         AccessibilityObservation, AccessibilityObservationKind, ActionRequestV2, ActionResponseV2,
         ActionV2, ImageProfile, ObservationMode, ObservationPolicy, RequestContextV2,
-        ResponseStatusV2, SettleResult, CAPABILITY_ADAPTIVE_SETTLE_V2, CAPABILITY_AX_STATE_V2,
-        CAPABILITY_CLIPBOARD_PAYLOAD_V2, CAPABILITY_OBSERVATION_MODE_V2, PROTOCOL_VERSION_V2,
+        ResponseStatusV2, SettleResult, CAPABILITY_ADAPTIVE_SETTLE_V2,
+        CAPABILITY_APPLICATION_LAUNCH_V1, CAPABILITY_AX_STATE_V2, CAPABILITY_CLIPBOARD_PAYLOAD_V2,
+        CAPABILITY_GLOBAL_CLIPBOARD_V1, CAPABILITY_OBSERVATION_MODE_V2,
+        CAPABILITY_SESSION_FULL_TRUST_V1, PROTOCOL_VERSION_V2,
     },
 };
 
@@ -62,9 +64,28 @@ const MIN_ACTION_LEASE_REMAINING: Duration = Duration::from_secs(30);
 const CONTEXT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SAME_GENERATION_RECONNECTS: u16 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorizationMode {
+    PerApplicationApproval,
+    SessionFullTrust,
+}
+
+fn default_authorization_mode() -> AuthorizationMode {
+    AuthorizationMode::PerApplicationApproval
+}
+
+fn default_authorization_policy_version() -> u8 {
+    1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedContext {
+    #[serde(default = "default_authorization_mode")]
+    pub authorization_mode: AuthorizationMode,
+    #[serde(default = "default_authorization_policy_version")]
+    pub authorization_policy_version: u8,
     pub user_id: Uuid,
     pub device_id: Uuid,
     pub tool_session_id: Uuid,
@@ -122,11 +143,27 @@ impl ManagedContext {
         if bytes.len() as u64 > MAX_CONTEXT_BYTES {
             return Err(TransportError::UnsafeContextFile);
         }
-        let context: Self = serde_json::from_slice(&bytes)?;
+        let document: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let object = document.as_object().ok_or(TransportError::InvalidContext)?;
+        if object.contains_key("authorization_mode")
+            != object.contains_key("authorization_policy_version")
+        {
+            return Err(TransportError::InvalidContext);
+        }
+        let context: Self = serde_json::from_value(document)?;
         if context.generation == 0
             || context.generation > MAX_ACTIVE_DEVICE_SESSION_GENERATION
             || context.next_sequence == 0
             || context.platform != Platform::Macos
+            || context.authorization_policy_version != 1
+            || match context.authorization_mode {
+                AuthorizationMode::PerApplicationApproval => {
+                    !legacy_capabilities_are_valid(&context.capabilities)
+                }
+                AuthorizationMode::SessionFullTrust => {
+                    context.capabilities != full_trust_capabilities()
+                }
+            }
         {
             return Err(TransportError::InvalidContext);
         }
@@ -141,8 +178,54 @@ impl ManagedContext {
             && self.node_id == other.node_id
             && self.platform == other.platform
             && self.generation == other.generation
+            && self.authorization_mode == other.authorization_mode
+            && self.authorization_policy_version == other.authorization_policy_version
             && self.capabilities == other.capabilities
     }
+}
+
+fn full_trust_capabilities() -> BTreeSet<String> {
+    [
+        CAPABILITY_ADAPTIVE_SETTLE_V2,
+        CAPABILITY_APPLICATION_LAUNCH_V1,
+        CAPABILITY_AX_STATE_V2,
+        CAPABILITY_CLIPBOARD_PAYLOAD_V2,
+        CAPABILITY_GLOBAL_CLIPBOARD_V1,
+        CAPABILITY_OBSERVATION_MODE_V2,
+        CAPABILITY_SESSION_FULL_TRUST_V1,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn observation_v2_capabilities() -> BTreeSet<String> {
+    [
+        CAPABILITY_ADAPTIVE_SETTLE_V2,
+        CAPABILITY_AX_STATE_V2,
+        CAPABILITY_OBSERVATION_MODE_V2,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn legacy_v2_capabilities() -> BTreeSet<String> {
+    [
+        CAPABILITY_ADAPTIVE_SETTLE_V2,
+        CAPABILITY_AX_STATE_V2,
+        CAPABILITY_CLIPBOARD_PAYLOAD_V2,
+        CAPABILITY_OBSERVATION_MODE_V2,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn legacy_capabilities_are_valid(capabilities: &BTreeSet<String>) -> bool {
+    capabilities.is_empty()
+        || *capabilities == observation_v2_capabilities()
+        || *capabilities == legacy_v2_capabilities()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,10 +241,10 @@ pub struct DeviceResultV2 {
     pub message: String,
     pub state_generation: u64,
     pub screenshot_generation: u64,
-    pub state_id: Uuid,
-    pub application_digest: String,
-    pub window_id: u32,
-    pub display_fingerprint: String,
+    pub state_id: Option<Uuid>,
+    pub application_digest: Option<String>,
+    pub window_id: Option<u32>,
+    pub display_fingerprint: Option<String>,
     pub base_state_id: Option<Uuid>,
     pub observation: Option<AccessibilityObservation>,
     pub settle: SettleResult,
@@ -188,6 +271,10 @@ pub struct Screenshot {
 #[async_trait]
 pub trait DeviceTransport: Send + Sync + 'static {
     async fn supports_v2(&self) -> Result<bool, TransportError> {
+        Ok(false)
+    }
+
+    async fn supports_capability(&self, _capability: &str) -> Result<bool, TransportError> {
         Ok(false)
     }
 
@@ -492,6 +579,7 @@ impl UnixDeviceTransport {
                 request_id: request.request_id,
                 monotonic_sequence: request.context.monotonic_sequence,
             },
+            true,
         )
         .await?;
         serde_json::from_slice(&response_bytes.0)
@@ -521,6 +609,7 @@ impl UnixDeviceTransport {
                 request_id: request.request_id,
                 monotonic_sequence: request.context.monotonic_sequence,
             },
+            replayable_action_v2(&request.action),
         )
         .await?;
         serde_json::from_slice(&response_bytes.0)
@@ -897,6 +986,7 @@ async fn exchange_payload_with_replay(
     payload: &[u8],
     max_attempt_wait: Duration,
     expected_binding: ResponseBinding,
+    allow_replay: bool,
 ) -> Result<(Vec<u8>, u16), ExchangeFailure> {
     let deadline = Instant::now() + max_attempt_wait;
     let mut retry_count = 0_u16;
@@ -934,7 +1024,7 @@ async fn exchange_payload_with_replay(
         request_started |= matches!(phase, ExchangePhase::RequestStarted);
         match result {
             Ok(response) => return Ok((response, retry_count)),
-            Err(error) if replayable_exchange_error(&error) => {
+            Err(error) if replayable_exchange_error(&error) && allow_replay => {
                 first_error.get_or_insert(error);
                 state.connection = None;
             }
@@ -1034,11 +1124,20 @@ fn replayable_exchange_error(error: &TransportError) -> bool {
     )
 }
 
+fn replayable_action_v2(action: &ActionV2) -> bool {
+    !matches!(action, ActionV2::LaunchApplication { .. })
+}
+
 #[async_trait]
 impl DeviceTransport for ActivatedUnixDeviceTransport {
     async fn supports_v2(&self) -> Result<bool, TransportError> {
         let context = self.action_context().await?;
         Ok(supports_v2(&context.capabilities))
+    }
+
+    async fn supports_capability(&self, capability: &str) -> Result<bool, TransportError> {
+        let context = self.action_context().await?;
+        Ok(context.capabilities.contains(capability))
     }
 
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError> {
@@ -1067,6 +1166,11 @@ impl DeviceTransport for UnixDeviceTransport {
     async fn supports_v2(&self) -> Result<bool, TransportError> {
         let state = self.state.lock().await;
         Ok(!state.poisoned && supports_v2(&state.context.capabilities))
+    }
+
+    async fn supports_capability(&self, capability: &str) -> Result<bool, TransportError> {
+        let state = self.state.lock().await;
+        Ok(!state.poisoned && state.context.capabilities.contains(capability))
     }
 
     async fn execute(&self, action: Action) -> Result<DeviceResult, TransportError> {
@@ -1203,7 +1307,10 @@ impl DeviceTransport for UnixDeviceTransport {
             Ok(response) => response,
             Err(failure) => {
                 clear_failed_connection(&mut state);
-                if failure.request_started && replayable_exchange_error(&failure.error) {
+                if failure.request_started
+                    && replayable_exchange_error(&failure.error)
+                    && replayable_action_v2(&request.action)
+                {
                     state.pending_request = Some(PendingRequest::V2(request));
                 } else if failure.request_started {
                     poison(&mut state);
@@ -1320,6 +1427,44 @@ fn apply_response_v2(
             .checked_add(1)
             .ok_or(TransportError::CounterExhausted)?
     };
+    let stateless_global_clipboard = preserves_state
+        && request.context.current_state_generation == 0
+        && state
+            .context
+            .capabilities
+            .contains(CAPABILITY_GLOBAL_CLIPBOARD_V1)
+        && response.state_id.is_none()
+        && response.application_digest.is_none()
+        && response.window_id.is_none()
+        && response.display_fingerprint.is_none();
+    if stateless_global_clipboard {
+        if response.state_generation != 0
+            || response.screenshot_generation != request.context.current_screenshot_generation
+            || response.observation.is_some()
+            || response.image.is_some()
+        {
+            poison(state);
+            return Err(TransportError::ResponseValidation(
+                "stateless clipboard response contains state",
+            ));
+        }
+        state.context.next_sequence += 1;
+        return Ok(DeviceResultV2 {
+            message,
+            state_generation: response.state_generation,
+            screenshot_generation: response.screenshot_generation,
+            state_id: None,
+            application_digest: None,
+            window_id: None,
+            display_fingerprint: None,
+            base_state_id: None,
+            observation: None,
+            settle: response.settle,
+            screenshot: None,
+            retry_count: 0,
+            manual_recovery: false,
+        });
+    }
     let Some(state_id) = response.state_id else {
         poison(state);
         return Err(TransportError::ResponseValidation("missing state_id"));
@@ -1401,10 +1546,10 @@ fn apply_response_v2(
         message,
         state_generation: response.state_generation,
         screenshot_generation: response.screenshot_generation,
-        state_id,
-        application_digest,
-        window_id,
-        display_fingerprint,
+        state_id: Some(state_id),
+        application_digest: Some(application_digest),
+        window_id: Some(window_id),
+        display_fingerprint: Some(display_fingerprint),
         base_state_id: response.base_state_id,
         observation: response.observation,
         settle: response.settle,
@@ -1455,6 +1600,8 @@ fn supports_v2(capabilities: &BTreeSet<String>) -> bool {
 
 fn is_terminal_device_rejection(message: &str) -> bool {
     message.starts_with("window_refresh_failed:")
+        || message.starts_with("application_launch_timeout:")
+        || message.starts_with("application_launch_result_unknown:")
 }
 
 fn poison(state: &mut TransportState) {
@@ -1782,6 +1929,109 @@ mod tests {
         assert!(loaded.capabilities.is_empty());
     }
 
+    #[test]
+    fn managed_context_defaults_missing_authorization_to_legacy_v1() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("context.json");
+        let context = test_context(1, Utc::now() + chrono::Duration::seconds(30));
+        let mut value = serde_json::to_value(context).expect("serialize context");
+        value
+            .as_object_mut()
+            .expect("context object")
+            .remove("authorization_mode");
+        value
+            .as_object_mut()
+            .expect("context object")
+            .remove("authorization_policy_version");
+        std::fs::write(&path, serde_json::to_vec(&value).expect("encode context"))
+            .expect("write context");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set context permissions");
+
+        let loaded = ManagedContext::load(&path).expect("load legacy context");
+        assert_eq!(
+            loaded.authorization_mode,
+            AuthorizationMode::PerApplicationApproval
+        );
+        assert_eq!(loaded.authorization_policy_version, 1);
+
+        let mut partial = value;
+        partial["authorization_mode"] =
+            serde_json::Value::String("per_application_approval".to_owned());
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&partial).expect("encode partial context"),
+        )
+        .expect("rewrite context");
+        assert!(matches!(
+            ManagedContext::load(&path),
+            Err(TransportError::InvalidContext)
+        ));
+    }
+
+    #[test]
+    fn managed_context_requires_the_complete_full_trust_capability_set() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("context.json");
+        let mut context = test_context(1, Utc::now() + chrono::Duration::seconds(30));
+        context.authorization_mode = AuthorizationMode::SessionFullTrust;
+        context.capabilities = full_trust_capabilities();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&context).expect("encode full-trust context"),
+        )
+        .expect("write context");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set context permissions");
+
+        assert_eq!(
+            ManagedContext::load(&path).expect("load full-trust context"),
+            context
+        );
+
+        context.capabilities.remove(CAPABILITY_GLOBAL_CLIPBOARD_V1);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&context).expect("encode incomplete context"),
+        )
+        .expect("rewrite context");
+        assert!(matches!(
+            ManagedContext::load(&path),
+            Err(TransportError::InvalidContext)
+        ));
+    }
+
+    #[test]
+    fn managed_context_rejects_full_trust_capabilities_for_legacy_authorization() {
+        let directory = tempdir().expect("temp directory");
+        let path = directory.path().join("context.json");
+        let mut context = test_context(1, Utc::now() + chrono::Duration::seconds(30));
+        context.capabilities = full_trust_capabilities();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&context).expect("encode legacy context"),
+        )
+        .expect("write context");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set context permissions");
+
+        assert!(matches!(
+            ManagedContext::load(&path),
+            Err(TransportError::InvalidContext)
+        ));
+
+        context.capabilities = legacy_v2_capabilities();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&context).expect("encode bounded legacy context"),
+        )
+        .expect("rewrite context");
+        assert_eq!(
+            ManagedContext::load(&path).expect("load bounded legacy context"),
+            context
+        );
+    }
+
     #[tokio::test]
     async fn activated_transport_remains_discoverable_before_context_exists() {
         let directory = tempdir().expect("temp directory");
@@ -2000,6 +2250,19 @@ mod tests {
             activated.transport_for_context(changed).await,
             Err(TransportError::ContextBinding)
         ));
+
+        let context = test_context(2, Utc::now() + chrono::Duration::seconds(30));
+        activated
+            .transport_for_context(context.clone())
+            .await
+            .expect("rotated transport");
+        let mut changed = context;
+        changed.authorization_mode = AuthorizationMode::SessionFullTrust;
+        changed.capabilities = full_trust_capabilities();
+        assert!(matches!(
+            activated.transport_for_context(changed).await,
+            Err(TransportError::ContextBinding)
+        ));
     }
 
     #[tokio::test]
@@ -2082,14 +2345,19 @@ mod tests {
 
     #[test]
     fn rejected_device_action_preserves_the_concrete_reason() {
-        let error = TransportError::DeviceRejected(
-            "screen_recording_permission_missing: grant access in System Settings".to_owned(),
-        );
-
-        assert_eq!(
-            error.to_string(),
-            "device rejected the action: screen_recording_permission_missing: grant access in System Settings"
-        );
+        for code in [
+            "clipboard_empty",
+            "clipboard_non_text",
+            "clipboard_unavailable",
+            "clipboard_too_large",
+            "clipboard_access_denied",
+        ] {
+            let error = TransportError::DeviceRejected(format!("{code}: clipboard rejected"));
+            assert_eq!(
+                error.client_message(),
+                format!("device rejected the action: {code}: clipboard rejected")
+            );
+        }
     }
 
     #[test]
@@ -2897,7 +3165,7 @@ mod tests {
             )
             .await
             .expect("v2 observation");
-        assert_eq!(first.state_id, state_id);
+        assert_eq!(first.state_id, Some(state_id));
         assert_eq!(first.state_generation, 1);
         assert_eq!(first.screenshot_generation, 0);
 
@@ -2914,7 +3182,7 @@ mod tests {
             )
             .await
             .expect("clipboard read");
-        assert_eq!(after_clipboard.state_id, state_id);
+        assert_eq!(after_clipboard.state_id, Some(state_id));
         assert_eq!(after_clipboard.state_generation, 1);
         assert_eq!(after_clipboard.message, "clipboard text");
         assert!(after_clipboard.observation.is_none());
@@ -2954,7 +3222,7 @@ mod tests {
             )
             .await
             .expect("explicit full observation");
-        assert_eq!(after_full.state_id, state_id_after_full);
+        assert_eq!(after_full.state_id, Some(state_id_after_full));
         assert_eq!(after_full.state_generation, 2);
         let state = transport.state.lock().await;
         assert_eq!(state.context.next_sequence, 4);
@@ -2983,9 +3251,98 @@ mod tests {
             )
             .await
             .expect("element action uses its bound state as the diff base");
-        assert_eq!(after_element.state_id, state_id_after_element);
+        assert_eq!(after_element.state_id, Some(state_id_after_element));
         assert_eq!(after_element.base_state_id, Some(state_id_after_full));
         server.await.expect("bridge server");
+    }
+
+    #[test]
+    fn stateless_global_clipboard_preserves_empty_gui_state() {
+        let mut context = test_context(1, Utc::now() + chrono::Duration::seconds(60));
+        context.authorization_mode = AuthorizationMode::SessionFullTrust;
+        context.capabilities = full_trust_capabilities();
+        let mut state = TransportState {
+            context: context.clone(),
+            state_id: None,
+            state_context: None,
+            model_ax_bases: BTreeMap::new(),
+            poisoned: false,
+            pending_request: None,
+            last_completed_response_binding: None,
+            connection: None,
+        };
+        let observation = ObservationPolicy {
+            mode: ObservationMode::None,
+            settle: crate::protocol_v2::SettleMode::None,
+            settle_timeout_ms: 0,
+            image_profile: ImageProfile::None,
+            ..ObservationPolicy::default()
+        };
+        let request = ActionRequestV2 {
+            version: PROTOCOL_VERSION_V2,
+            request_id: Uuid::new_v4(),
+            context: RequestContextV2 {
+                user_id: context.user_id,
+                device_id: context.device_id,
+                tool_session_id: context.tool_session_id,
+                device_session_id: context.device_session_id,
+                node_id: context.node_id,
+                platform: context.platform,
+                generation: context.generation,
+                monotonic_sequence: 1,
+                current_state_generation: 0,
+                current_screenshot_generation: 0,
+                base_state_id: None,
+            },
+            lease_until: context.lease_until,
+            observation,
+            action: ActionV2::ReadClipboard,
+        };
+        let response = ActionResponseV2 {
+            request_id: request.request_id,
+            monotonic_sequence: 1,
+            state_generation: 0,
+            screenshot_generation: 0,
+            state_id: None,
+            application_digest: None,
+            window_id: None,
+            display_fingerprint: None,
+            base_state_id: None,
+            status: ResponseStatusV2::Success,
+            message: "Clipboard read.".to_owned(),
+            clipboard: Some("clipboard text".to_owned()),
+            observation: None,
+            settle: SettleResult {
+                status: crate::protocol_v2::SettleStatus::NotRequested,
+                elapsed_ms: 0,
+            },
+            image: None,
+        };
+
+        let result = apply_response_v2(&mut state, &request, response)
+            .expect("stateless global clipboard response");
+        assert_eq!(result.message, "clipboard text");
+        assert!(result.state_id.is_none());
+        assert_eq!(state.context.next_sequence, 2);
+        assert_eq!(state.context.current_state_generation, 0);
+        assert!(state.state_id.is_none());
+    }
+
+    #[test]
+    fn application_launch_is_never_automatically_replayed() {
+        assert!(!replayable_action_v2(&ActionV2::LaunchApplication {
+            application: "com.apple.TextEdit".to_owned(),
+        }));
+        assert!(replayable_action_v2(&ActionV2::ReadClipboard));
+        assert!(is_terminal_device_rejection(
+            "application_launch_timeout: no eligible window"
+        ));
+        assert!(is_terminal_device_rejection(
+            "application_launch_result_unknown: launch state was not verified"
+        ));
+        assert!(!is_terminal_device_rejection(
+            "application_not_found: no eligible application"
+        ));
     }
 
     async fn read_framed_json(
@@ -3069,6 +3426,8 @@ mod tests {
 
     fn test_context(generation: u64, lease_until: DateTime<Utc>) -> ManagedContext {
         ManagedContext {
+            authorization_mode: AuthorizationMode::PerApplicationApproval,
+            authorization_policy_version: 1,
             user_id: Uuid::new_v4(),
             device_id: Uuid::new_v4(),
             tool_session_id: Uuid::new_v4(),

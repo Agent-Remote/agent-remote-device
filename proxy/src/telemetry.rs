@@ -40,6 +40,7 @@ pub enum MetricAction {
     SelectText,
     ScrollElement,
     SecondaryAction,
+    LaunchApplication,
     ReadClipboard,
 }
 
@@ -416,6 +417,7 @@ fn metric_action_v2(action: &ActionV2) -> MetricAction {
         ActionV2::SelectText { .. } => MetricAction::SelectText,
         ActionV2::ScrollElement { .. } => MetricAction::ScrollElement,
         ActionV2::SecondaryAction { .. } => MetricAction::SecondaryAction,
+        ActionV2::LaunchApplication { .. } => MetricAction::LaunchApplication,
         ActionV2::ReadClipboard => MetricAction::ReadClipboard,
     }
 }
@@ -604,10 +606,10 @@ mod tests {
                     .to_owned(),
                 state_generation: 1,
                 screenshot_generation: 0,
-                state_id: uuid::Uuid::new_v4(),
-                application_digest: "a".repeat(64),
-                window_id: 1,
-                display_fingerprint: "display".to_owned(),
+                state_id: Some(uuid::Uuid::new_v4()),
+                application_digest: Some("a".repeat(64)),
+                window_id: Some(1),
+                display_fingerprint: Some("display".to_owned()),
                 base_state_id: None,
                 observation: None,
                 settle: crate::protocol_v2::SettleResult {
@@ -638,10 +640,10 @@ mod tests {
                 message: "done".to_owned(),
                 state_generation: 1,
                 screenshot_generation: 1,
-                state_id: uuid::Uuid::new_v4(),
-                application_digest: "a".repeat(64),
-                window_id: 1,
-                display_fingerprint: "display".to_owned(),
+                state_id: Some(uuid::Uuid::new_v4()),
+                application_digest: Some("a".repeat(64)),
+                window_id: Some(1),
+                display_fingerprint: Some("display".to_owned()),
                 base_state_id: None,
                 observation: None,
                 settle: crate::protocol_v2::SettleResult {

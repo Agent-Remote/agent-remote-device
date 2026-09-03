@@ -2,7 +2,7 @@
 
 Load this reference only for browser tasks.
 
-Use a dedicated browser connector or approved structured integration when the task needs repeatable data access and does not depend on the user's existing local browser state. Use this Computer Use path for rendered UI, existing approved sessions, browser chrome, or visual verification. Do not enable CDP, remote debugging, DOM injection, profile access, or cookie access as an implicit fallback.
+Use a dedicated browser connector or structured integration when the task needs repeatable data access and does not depend on the user's existing local browser state. Use this Computer Use path for rendered UI, existing signed-in sessions, browser chrome, or visual verification. Do not enable CDP, remote debugging, DOM injection, profile access, or cookie access as an implicit fallback.
 
 ## Navigate And Search
 
@@ -36,5 +36,5 @@ Use a complete URL when the destination is known. Do not expose browser profiles
 ## Keep State Valid
 
 - Every browser action can invalidate prior element indexes even when the page looks unchanged.
-- Browser tab, window, display, externally changed content, and turn changes require a fresh named observation. Merely operating another approved application does not invalidate the browser's retained latest binding.
+- Browser tab, window, display, externally changed content, and turn changes require a fresh named observation. Merely operating another eligible application does not invalidate the browser's retained latest binding.
 - A screenshot is valid only for its returned dimensions and coordinate frame. Never scale remembered coordinates yourself.

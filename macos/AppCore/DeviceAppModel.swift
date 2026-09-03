@@ -11,14 +11,12 @@ public enum DeviceAppState: String, Sendable {
     case selectingSession = "selecting_session"
     case claimingSession = "claiming_session"
     case permissionRequired = "permission_required"
-    case awaitingApproval = "awaiting_approval"
     case activating
     case active
     case pausing
     case paused
     case endingSession = "ending_session"
     case reconnecting
-    case denied
     case stopped
     case failed
 }
@@ -41,11 +39,8 @@ public enum DeviceAppFailure: Error, Equatable, Sendable {
 @MainActor
 public final class DeviceAppModel: ObservableObject {
     @Published public private(set) var state: DeviceAppState = .ready
-    @Published public private(set) var approvalPresentation: ApprovalPresentation?
     @Published public private(set) var sessionCandidates: [BrokerSessionCandidate] = []
-    @Published public var applicationSelections: Set<String> = []
-    @Published public var clipboardSelections: Set<String> = []
-    @Published public var controlLevelSelections: [String: ControlLevel] = [:]
+    @Published public private(set) var selectedSession: BrokerSessionCandidate?
     @Published public private(set) var lastUnsafeTransition: UnsafeTransitionReason?
     @Published public private(set) var failureMessage: String?
     @Published public private(set) var failureCode: String?
@@ -62,21 +57,15 @@ public final class DeviceAppModel: ObservableObject {
     private let permissionsGranted: () -> Bool
     private let controlNotifier: (() async -> Void)?
     private var safetyMonitor: (any SessionSafetyMonitoring)?
-    private var approvedBundleIdentifiers: Set<String> = []
+    private var sessionFullTrustActive = false
     private var operationGeneration: UInt64 = 0
     private var permissionRecheckID: UUID?
 
     private static let permissionRecheckDelay: Duration = .milliseconds(250)
     private static let permissionRecheckCount = 2
 
-    public var onApprove: ([LocalApproval]) async throws -> Void = { _ in
-        throw DeviceAppFailure.transportUnavailable
-    }
     public var onRefreshSessionCandidates: () async throws -> [BrokerSessionCandidate] = { [] }
-    public var onClaimSession: (UUID) async throws -> Void = { _ in
-        throw DeviceAppFailure.transportUnavailable
-    }
-    public var onDeny: ([LocalApproval]) async throws -> Void = { _ in
+    public var onClaimSession: (UUID) async throws -> Bool = { _ in
         throw DeviceAppFailure.transportUnavailable
     }
     public var onAbort: (UnsafeTransitionReason) async throws -> Void = { _ in
@@ -112,29 +101,11 @@ public final class DeviceAppModel: ObservableObject {
         }
     }
 
-    public func presentApproval(_ presentation: ApprovalPresentation) {
-        invalidateAsyncOperations()
-        sessionCandidates = []
-        failureMessage = nil
-        failureCode = nil
-        failureRecovery = nil
-        completionMessage = nil
-        permissions.refresh()
-        approvalPresentation = presentation
-        applicationSelections = []
-        clipboardSelections = []
-        controlLevelSelections = Dictionary(uniqueKeysWithValues: presentation.applications.map {
-            ($0.id, $0.classification.controlLevel ?? .viewOnly)
-        })
-        state = permissionsGranted() ? .awaitingApproval : .permissionRequired
-    }
-
     public func presentSessionCandidates(_ candidates: [BrokerSessionCandidate]) {
         guard state == .ready
             || state == .selectingSession
             || state == .claimingSession
             || state == .permissionRequired
-            || state == .denied
             || state == .stopped
             || state == .reconnecting
         else { return }
@@ -156,7 +127,6 @@ public final class DeviceAppModel: ObservableObject {
         guard state == .ready
             || state == .selectingSession
             || state == .permissionRequired
-            || state == .denied
             || state == .stopped
             || state == .failed
         else {
@@ -190,17 +160,50 @@ public final class DeviceAppModel: ObservableObject {
             return
         }
         state = .claimingSession
+        selectedSession = candidate
         failureMessage = nil
         failureCode = nil
         completionMessage = nil
         let operation = beginAsyncOperation()
         Task {
+            var brokerActivated = false
             do {
-                try await onClaimSession(candidate.toolSessionID)
-                guard isCurrentOperation(operation), state == .claimingSession else { return }
-                state = .ready
+                brokerActivated = try await onClaimSession(candidate.toolSessionID)
+                guard isCurrentOperation(operation), state == .claimingSession else {
+                    if brokerActivated {
+                        try? await onAbort(.networkDisconnected)
+                    }
+                    return
+                }
+                guard brokerActivated else {
+                    selectedSession = nil
+                    state = .selectingSession
+                    failureMessage = localizedCoreString(
+                        "failure.full_trust_not_supported",
+                        defaultValue: "The server does not support secure session full control. Update the server and try again."
+                    )
+                    failureCode = "full_trust_not_supported"
+                    return
+                }
+                state = .activating
+                try startSafetyMonitoring()
+                sessionFullTrustActive = true
+                state = .active
+                if let controlNotifier {
+                    await controlNotifier()
+                } else {
+                    await postControlNotification()
+                }
             } catch {
-                guard isCurrentOperation(operation), state == .claimingSession else { return }
+                if brokerActivated {
+                    try? await onAbort(.networkDisconnected)
+                }
+                guard isCurrentOperation(operation),
+                      state == .claimingSession || state == .activating
+                else { return }
+                safetyMonitor?.stop()
+                safetyMonitor = nil
+                selectedSession = nil
                 state = .selectingSession
                 failureMessage = userFacingDescription(error)
                 failureCode = errorCode(error)
@@ -313,97 +316,11 @@ public final class DeviceAppModel: ObservableObject {
 
     public func retryAfterPermissionChange() {
         permissions.refresh()
-        guard approvalPresentation != nil else {
-            if sessionCandidates.isEmpty {
-                state = .ready
-                refreshSessionCandidates()
-            } else {
-                state = .selectingSession
-            }
-            return
-        }
-        state = permissionsGranted() ? .awaitingApproval : .permissionRequired
-    }
-
-    public func allowForSession() {
-        guard state == .awaitingApproval, let approvalPresentation else { return }
-        let approvals = approvalPresentation.approvals(
-            applicationSelections: applicationSelections,
-            clipboardSelections: clipboardSelections,
-            controlLevelSelections: controlLevelSelections
-        )
-        guard !approvals.isEmpty else { return }
-        approvedBundleIdentifiers = Set(approvals.map { $0.application.bundleIdentifier })
-        state = .activating
-        completionMessage = nil
-        let operation = beginAsyncOperation()
-        Task {
-            do {
-                try startSafetyMonitoring()
-                try await onApprove(approvals)
-                guard isCurrentOperation(operation), state == .activating else {
-                    if let reason = lastUnsafeTransition {
-                        try await onAbort(reason)
-                        guard isCurrentOperation(operation), state == .pausing else { return }
-                        state = .paused
-                    }
-                    return
-                }
-                state = .active
-                lastUnsafeTransition = nil
-                if let controlNotifier {
-                    await controlNotifier()
-                } else {
-                    await postControlNotification()
-                }
-            } catch {
-                guard isCurrentOperation(operation) else { return }
-                safetyMonitor?.stop()
-                safetyMonitor = nil
-                do {
-                    try visibilityController.restoreApplications()
-                    if errorCode(error) == "session_binding_changed" {
-                        clearSessionContext()
-                        completionMessage = nil
-                        state = .selectingSession
-                        refreshSessionCandidates()
-                    } else {
-                        transitionToFailure(error, recovery: .sessionSelection)
-                    }
-                } catch {
-                    failClosed(
-                        message: userFacingDescription(error),
-                        recovery: .restartApplication
-                    )
-                }
-            }
-        }
-    }
-
-    public func deny() {
-        guard state == .awaitingApproval || state == .permissionRequired else { return }
-        guard let presentation = approvalPresentation else { return }
-        let deniedApprovals = presentation.approvals(
-            applicationSelections: Set(presentation.applications.map(\.id)),
-            clipboardSelections: [],
-            controlLevelSelections: controlLevelSelections
-        )
-        state = .denied
-        clearSessionContext()
-        let operation = beginAsyncOperation()
-        Task {
-            do {
-                try await onDeny(deniedApprovals)
-                guard isCurrentOperation(operation), state == .denied else { return }
-                completionMessage = localizedCoreString(
-                    "completion.denied",
-                    defaultValue: "The device-control request was denied."
-                )
-                await loadSessionCandidates(after: operation)
-            } catch {
-                guard isCurrentOperation(operation), state == .denied else { return }
-                transitionToFailure(error, recovery: .sessionSelection)
-            }
+        if sessionCandidates.isEmpty {
+            state = .ready
+            refreshSessionCandidates()
+        } else {
+            state = .selectingSession
         }
     }
 
@@ -459,8 +376,6 @@ public final class DeviceAppModel: ObservableObject {
         state == .active
             || state == .activating
             || state == .paused
-            || state == .awaitingApproval
-            || (state == .permissionRequired && approvalPresentation != nil)
     }
 
     private func endCurrentSession(completion: String) {
@@ -515,7 +430,7 @@ public final class DeviceAppModel: ObservableObject {
         case .turnStarted:
             guard state == .paused,
                   lastUnsafeTransition == nil,
-                  !approvedBundleIdentifiers.isEmpty
+                  sessionFullTrustActive
             else {
                 throw DeviceAppFailure.invalidRuntimeTransition
             }
@@ -583,11 +498,8 @@ public final class DeviceAppModel: ObservableObject {
 
     private func clearSessionContext() {
         permissionRecheckID = nil
-        approvalPresentation = nil
-        applicationSelections = []
-        clipboardSelections = []
-        controlLevelSelections = [:]
-        approvedBundleIdentifiers = []
+        sessionFullTrustActive = false
+        selectedSession = nil
         lastUnsafeTransition = nil
     }
 

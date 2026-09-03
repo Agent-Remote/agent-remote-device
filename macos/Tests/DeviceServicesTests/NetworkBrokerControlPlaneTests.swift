@@ -1,6 +1,7 @@
 import Crypto
 import DeviceServices
 import DeviceIPC
+import DeviceProtocol
 import DeviceSecurity
 import Foundation
 import Testing
@@ -227,6 +228,9 @@ private func sessionJSON(
     status: String = "pending_device",
     deviceID: String = controlPlaneDeviceID,
     generation: UInt64 = 1,
+    authorizationMode: String = "per_application_approval",
+    authorizationPolicyVersion: UInt16 = 1,
+    authorizedAt: String = "null",
     leaseUntil: String = "null",
     lockAcquiredAt: String = "null",
     stoppedAt: String = "null",
@@ -243,6 +247,9 @@ private func sessionJSON(
       "platform":"macos",
       "status":"\(status)",
       "generation":\(generation),
+      "authorization_mode":"\(authorizationMode)",
+      "authorization_policy_version":\(authorizationPolicyVersion),
+      "authorized_at":\(authorizedAt),
       "lease_until":\(leaseUntil),
       "expires_at":"2099-12-31T00:00:00Z",
       "lock_acquired_at":\(lockAcquiredAt),
@@ -324,7 +331,7 @@ private func relayMaterialJSON(
     #expect(requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer \(controlPlaneToken)")
 }
 
-@Test func candidatesAreStrictlyDecodedAndClaimUsesOnlyToolSessionID() async throws {
+@Test func candidatesAreStrictlyDecodedAndClaimUsesOnlyToolSessionIDAndFixedCapability() async throws {
     let candidatesBody = try #require(
         "{\"data\":{\"items\":[\(candidateJSON())]},\"request_id\":null}"
             .data(using: .utf8)
@@ -358,9 +365,10 @@ private func relayMaterialJSON(
     let claimObject = try #require(
         JSONSerialization.jsonObject(with: claimBody) as? [String: Any]
     )
-    #expect(claimObject.count == 1)
+    #expect(claimObject.count == 2)
     #expect((claimObject["tool_session_id"] as? String)?.lowercased()
         == "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    #expect(claimObject["device_capabilities"] as? [String] == [capabilitySessionFullTrustV1])
 }
 
 @Test func markConnectedRequiresTheExactReturnedBindingAndStatus() async throws {
@@ -389,6 +397,122 @@ private func relayMaterialJSON(
     #expect(requests[1].httpMethod == "POST")
     #expect(requests[1].url?.path.hasSuffix("/device-connected") == true)
     #expect(String(data: requests[1].httpBody!, encoding: .utf8)?.contains("\"generation\":1") == true)
+}
+
+@Test func fullTrustDiscoveryActivatesWithoutApprovalAndPreservesAuthorization() async throws {
+    let authorizedAt = "\"2096-01-01T00:00:00Z\""
+    let pending = sessionJSON(
+        authorizationMode: "session_full_trust",
+        authorizedAt: authorizedAt
+    )
+    let active = sessionJSON(
+        status: "active",
+        authorizationMode: "session_full_trust",
+        authorizedAt: authorizedAt,
+        leaseUntil: "\"2099-12-30T23:59:00Z\""
+    )
+    let renewed = sessionJSON(
+        status: "active",
+        authorizationMode: "session_full_trust",
+        authorizedAt: authorizedAt,
+        leaseUntil: "\"2099-12-30T23:59:15Z\""
+    )
+    let rotatedPending = sessionJSON(
+        generation: 2,
+        authorizationMode: "session_full_trust",
+        authorizedAt: authorizedAt
+    )
+    let rotatedActive = sessionJSON(
+        status: "active",
+        generation: 2,
+        authorizationMode: "session_full_trust",
+        authorizedAt: authorizedAt,
+        leaseUntil: "\"2099-12-30T23:59:30Z\""
+    )
+    let inbox = Data("{\"data\":{\"items\":[\(pending)]},\"request_id\":null}".utf8)
+    let response = { (session: String) in
+        Data("{\"data\":\(session),\"request_id\":null}".utf8)
+    }
+    let transport = RecordingHTTPTransport(responses: [
+        (inbox, 200),
+        (response(active), 200),
+        (response(renewed), 200),
+        (response(rotatedPending), 200),
+        (response(rotatedActive), 200),
+    ])
+    let coordinator = NetworkBrokerDiscoveryCoordinator(
+        credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+        transport: transport,
+        outboundPolicyChecker: SequencedOutboundPolicyChecker()
+    )
+    let now = Date(timeIntervalSince1970: 4_000_000_000)
+
+    let discovered = try #require(try await coordinator.nextPendingSession(now: now))
+    let initial = try #require(discovered.activationConfiguration)
+    let initialAuthorization = try #require(initial.authorization)
+    #expect(discovered.binding == initial.binding)
+    #expect(initial.approvals.isEmpty)
+    #expect(initialAuthorization.mode == .sessionFullTrust)
+    #expect(initialAuthorization.policyVersion == 1)
+
+    let renewedConfiguration = try await coordinator.renew(initial, now: now)
+    #expect(renewedConfiguration.authorization == initial.authorization)
+    #expect(renewedConfiguration.capabilities == initial.capabilities)
+
+    let rotated = try await coordinator.rotate(renewedConfiguration, now: now)
+    let rotatedAuthorization = try #require(rotated.authorization)
+    #expect(rotated.binding.generation == 2)
+    #expect(rotatedAuthorization.generation == 2)
+    #expect(rotatedAuthorization.mode == initialAuthorization.mode)
+    #expect(rotatedAuthorization.policyVersion == initialAuthorization.policyVersion)
+    #expect(rotatedAuthorization.applicationScope == initialAuthorization.applicationScope)
+    #expect(rotatedAuthorization.controlLevel == initialAuthorization.controlLevel)
+    #expect(rotatedAuthorization.clipboardScope == initialAuthorization.clipboardScope)
+    #expect(rotatedAuthorization.applicationLaunch == initialAuthorization.applicationLaunch)
+    #expect(rotatedAuthorization.excludedBundleIdentifiers
+        == initialAuthorization.excludedBundleIdentifiers)
+    #expect(rotated.capabilities == initial.capabilities)
+
+    let requests = await transport.recordedRequests()
+    #expect(requests.map(\.url?.path) == [
+        "/api/v1/device-sessions/device-inbox",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/device-connected",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/renew",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/abort",
+        "/api/v1/device-sessions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/device-connected",
+    ])
+    #expect(requests.allSatisfy { $0.url?.path.hasSuffix("/approve") != true })
+}
+
+@Test func fullTrustDeviceConnectedRejectsAuthorizationModeOrPolicyDrift() async throws {
+    let authorizedAt = "\"2096-01-01T00:00:00Z\""
+    let pending = sessionJSON(
+        authorizationMode: "session_full_trust",
+        authorizedAt: authorizedAt
+    )
+    for connected in [
+        sessionJSON(status: "pending_user_approval"),
+        sessionJSON(
+            status: "active",
+            authorizationMode: "session_full_trust",
+            authorizationPolicyVersion: 2,
+            authorizedAt: authorizedAt,
+            leaseUntil: "\"2099-12-30T23:59:00Z\""
+        ),
+    ] {
+        let inbox = Data("{\"data\":{\"items\":[\(pending)]},\"request_id\":null}".utf8)
+        let response = Data("{\"data\":\(connected),\"request_id\":null}".utf8)
+        let transport = RecordingHTTPTransport(responses: [(inbox, 200), (response, 200)])
+        let coordinator = NetworkBrokerDiscoveryCoordinator(
+            credentialLoader: StaticCredentialLoader(credential: try brokerCredential()),
+            transport: transport
+        )
+        await #expect(throws: Error.self) {
+            try await coordinator.nextPendingSession(
+                now: Date(timeIntervalSince1970: 4_000_000_000)
+            )
+        }
+    }
 }
 
 @Test func inboxRejectsCrossDeviceTerminalAndUnknownFieldResponses() async throws {

@@ -15,7 +15,8 @@ use crate::{
     protocol::{Action, Point, Region},
     protocol_v2::{
         ActionV2, ElementTarget, ImageProfile, ObservationMode, ObservationPolicy, ScrollDirection,
-        SelectionType, SettleMode,
+        SelectionType, SettleMode, CAPABILITY_APPLICATION_LAUNCH_V1,
+        CAPABILITY_GLOBAL_CLIPBOARD_V1,
     },
     telemetry::{OptimizationEvent, OptimizationMetrics, OptimizationSummary},
     transport::{DeviceResult, DeviceResultV2, DeviceTransport},
@@ -54,7 +55,7 @@ pub struct PointParameters {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenshotParameters {
-    /// Approved application display name or bundle identifier.
+    /// Eligible GUI application display name or bundle identifier.
     pub application: Option<String>,
 }
 
@@ -62,6 +63,13 @@ pub struct ScreenshotParameters {
 #[serde(deny_unknown_fields)]
 pub struct TypeParameters {
     pub text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchApplicationParameters {
+    /// Exact installed GUI application Bundle ID or unambiguous display name.
+    pub application: String,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -149,7 +157,7 @@ pub enum ImageProfileParameter {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveParameters {
-    /// Approved application display name or bundle identifier.
+    /// Eligible GUI application display name or bundle identifier. Omit for the frontmost app.
     pub application: Option<String>,
     /// Prefer auto; request screenshots only for visual judgment or AX fallback.
     pub mode: Option<ObservationModeParameter>,
@@ -512,7 +520,7 @@ impl DeviceMcp {
                 .filter(|name| {
                     !matches!(
                         name.as_str(),
-                        "observe" | "act" | "input_text" | "read_clipboard"
+                        "observe" | "act" | "input_text" | "launch_application" | "read_clipboard"
                     )
                 })
                 .collect::<Vec<_>>()
@@ -781,16 +789,24 @@ impl DeviceMcp {
     }
 
     async fn remember_v2_state(&self, result: &DeviceResultV2) {
-        let mut states = self.v2_states.lock().await;
-        states.retain(|_, state| state.application_digest != result.application_digest);
-        states.insert(
+        let (Some(state_id), Some(application_digest), Some(window_id), Some(display_fingerprint)) = (
             result.state_id,
+            result.application_digest.as_ref(),
+            result.window_id,
+            result.display_fingerprint.as_ref(),
+        ) else {
+            return;
+        };
+        let mut states = self.v2_states.lock().await;
+        states.retain(|_, state| state.application_digest != *application_digest);
+        states.insert(
+            state_id,
             McpBoundState {
-                state_id: result.state_id,
+                state_id,
                 state_generation: result.state_generation,
-                application_digest: result.application_digest.clone(),
-                window_id: result.window_id,
-                display_fingerprint: result.display_fingerprint.clone(),
+                application_digest: application_digest.clone(),
+                window_id,
+                display_fingerprint: display_fingerprint.clone(),
             },
         );
     }
@@ -986,12 +1002,18 @@ fn compact_clipboard_result_v2(result: DeviceResultV2) -> Result<CallToolResult,
 }
 
 fn render_v2_result(result: &DeviceResultV2) -> Result<String, String> {
+    let state_id = result
+        .state_id
+        .ok_or_else(|| "device response omitted state_id".to_owned())?;
+    let window_id = result
+        .window_id
+        .ok_or_else(|| "device response omitted window_id".to_owned())?;
     let mut lines = vec![format!(
         "state={} generation={} screenshot_generation={} window_id={} settle={:?} elapsed_ms={}",
-        result.state_id,
+        state_id,
         result.state_generation,
         result.screenshot_generation,
-        result.window_id,
+        window_id,
         result.settle.status,
         result.settle.elapsed_ms,
     )];
@@ -1309,7 +1331,7 @@ impl DeviceMcp {
     }
 
     #[tool(
-        description = "Capture an approved macOS application, bringing the named application to the foreground when provided"
+        description = "Capture an eligible macOS application, bringing the named application to the foreground when provided"
     )]
     async fn screenshot(
         &self,
@@ -1323,22 +1345,50 @@ impl DeviceMcp {
     }
 
     #[tool(
-        description = "Read bounded text from the Mac clipboard when explicitly approved for the current application session"
+        description = "Read bounded global plain text from the Mac clipboard under the active local full-trust session"
     )]
     async fn read_clipboard(&self) -> Result<CallToolResult, String> {
-        if self
+        let supports_v2 = self
             .transport
             .supports_v2()
             .await
-            .map_err(|error| error.client_message())?
-            && !self.v2_states.lock().await.is_empty()
-        {
+            .map_err(|error| error.client_message())?;
+        let supports_global_clipboard = self
+            .transport
+            .supports_capability(CAPABILITY_GLOBAL_CLIPBOARD_V1)
+            .await
+            .map_err(|error| error.client_message())?;
+        if supports_v2 && (supports_global_clipboard || !self.v2_states.lock().await.is_empty()) {
             return self.dispatch_clipboard_v2().await;
         }
         self.dispatch(Action::ReadClipboard).await
     }
 
-    #[tool(description = "Click the approved application at image-relative coordinates")]
+    #[tool(
+        description = "Launch an installed eligible macOS GUI application by exact Bundle ID or unambiguous application name, then return its first full observation. Paths, URLs, arguments, commands, and environment variables are rejected"
+    )]
+    async fn launch_application(
+        &self,
+        Parameters(params): Parameters<LaunchApplicationParameters>,
+    ) -> Result<CallToolResult, String> {
+        if !self
+            .transport
+            .supports_capability(CAPABILITY_APPLICATION_LAUNCH_V1)
+            .await
+            .map_err(|error| error.client_message())?
+        {
+            return Err("unsupported_capability: application_launch_v1 is unavailable".to_owned());
+        }
+        self.dispatch_v2(
+            ActionV2::LaunchApplication {
+                application: params.application,
+            },
+            ObservationPolicy::default(),
+        )
+        .await
+    }
+
+    #[tool(description = "Click the current application at image-relative coordinates")]
     async fn left_click(
         &self,
         Parameters(params): Parameters<PointParameters>,
@@ -1349,7 +1399,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(name = "type", description = "Type text into the approved application")]
+    #[tool(name = "type", description = "Type text into the current application")]
     async fn type_text(
         &self,
         Parameters(params): Parameters<TypeParameters>,
@@ -1404,7 +1454,7 @@ impl DeviceMcp {
         }
     }
 
-    #[tool(description = "Send an approved key or key combination")]
+    #[tool(description = "Send a supported key or key combination")]
     async fn key(
         &self,
         Parameters(params): Parameters<KeyParameters>,
@@ -1412,7 +1462,7 @@ impl DeviceMcp {
         self.dispatch(Action::Key { key: params.key }).await
     }
 
-    #[tool(description = "Move the pointer within the approved image region")]
+    #[tool(description = "Move the pointer within the current image region")]
     async fn mouse_move(
         &self,
         Parameters(params): Parameters<PointParameters>,
@@ -1423,7 +1473,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(description = "Scroll the approved application")]
+    #[tool(description = "Scroll the current application")]
     async fn scroll(
         &self,
         Parameters(params): Parameters<ScrollParameters>,
@@ -1436,7 +1486,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(description = "Drag between image-relative coordinates in the approved application")]
+    #[tool(description = "Drag between image-relative coordinates in the current application")]
     async fn left_click_drag(
         &self,
         Parameters(params): Parameters<DragParameters>,
@@ -1449,7 +1499,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(description = "Right-click the approved application")]
+    #[tool(description = "Right-click the current application")]
     async fn right_click(
         &self,
         Parameters(params): Parameters<PointParameters>,
@@ -1460,7 +1510,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(description = "Middle-click the approved application")]
+    #[tool(description = "Middle-click the current application")]
     async fn middle_click(
         &self,
         Parameters(params): Parameters<PointParameters>,
@@ -1471,7 +1521,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(description = "Double-click the approved application")]
+    #[tool(description = "Double-click the current application")]
     async fn double_click(
         &self,
         Parameters(params): Parameters<PointParameters>,
@@ -1482,7 +1532,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(description = "Triple-click the approved application")]
+    #[tool(description = "Triple-click the current application")]
     async fn triple_click(
         &self,
         Parameters(params): Parameters<PointParameters>,
@@ -1503,7 +1553,7 @@ impl DeviceMcp {
         self.dispatch(Action::LeftMouseUp).await
     }
 
-    #[tool(description = "Hold an approved key for a bounded duration")]
+    #[tool(description = "Hold a supported key for a bounded duration")]
     async fn hold_key(
         &self,
         Parameters(params): Parameters<HoldKeyParameters>,
@@ -1526,7 +1576,7 @@ impl DeviceMcp {
         .await
     }
 
-    #[tool(description = "Zoom an approved image-relative region when supported")]
+    #[tool(description = "Zoom the current image-relative region when supported")]
     async fn zoom(
         &self,
         Parameters(params): Parameters<ZoomParameters>,
@@ -1587,7 +1637,7 @@ fn observation_policy(
 impl ServerHandler for DeviceMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Controls only approved macOS applications. Start with observe, which returns bounded accessibility state or a diff and falls back to a screenshot when needed. Bind every element operation to the state_id and state_generation returned with its fresh element_index; use coordinates only from the latest model-visible screenshot. A successful operation already returns the next state, so do not observe again immediately. Prefer one AX-targeted input_text call for deterministic address-bar, search, and form sequences; keep consequential final actions separate for observation and confirmation.",
+            "Controls eligible macOS GUI applications within the active local full-trust session. Start with observe, which resolves the named application or the eligible frontmost application and returns bounded accessibility state or a diff, with screenshot fallback when needed. Bind every element operation to the state_id and state_generation returned with its fresh element_index; use coordinates only from the latest model-visible screenshot. A successful operation already returns the next state, so do not observe again immediately. Prefer one AX-targeted input_text call for deterministic address-bar, search, and form sequences; keep consequential final actions separate for observation and confirmation.",
         )
     }
 }
@@ -1615,6 +1665,10 @@ mod tests {
 
     struct ImageTransport {
         screenshot: Screenshot,
+    }
+
+    struct FullTrustTransport {
+        actions: std::sync::Mutex<Vec<ActionV2>>,
     }
 
     #[async_trait]
@@ -1657,6 +1711,58 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl DeviceTransport for FullTrustTransport {
+        async fn supports_v2(&self) -> Result<bool, TransportError> {
+            Ok(true)
+        }
+
+        async fn supports_capability(&self, capability: &str) -> Result<bool, TransportError> {
+            Ok(matches!(
+                capability,
+                CAPABILITY_APPLICATION_LAUNCH_V1 | CAPABILITY_GLOBAL_CLIPBOARD_V1
+            ))
+        }
+
+        async fn execute(&self, _action: Action) -> Result<DeviceResult, TransportError> {
+            Err(TransportError::CapabilityUnavailable)
+        }
+
+        async fn execute_v2(
+            &self,
+            action: ActionV2,
+            _observation: ObservationPolicy,
+        ) -> Result<DeviceResultV2, TransportError> {
+            self.actions
+                .lock()
+                .expect("full-trust actions lock")
+                .push(action.clone());
+            let has_state = matches!(action, ActionV2::LaunchApplication { .. });
+            Ok(DeviceResultV2 {
+                message: if has_state {
+                    "Action completed.".to_owned()
+                } else {
+                    "clipboard text".to_owned()
+                },
+                state_generation: u64::from(has_state),
+                screenshot_generation: 0,
+                state_id: has_state.then(Uuid::new_v4),
+                application_digest: has_state.then(|| "a".repeat(64)),
+                window_id: has_state.then_some(1),
+                display_fingerprint: has_state.then(|| "display".to_owned()),
+                base_state_id: None,
+                observation: None,
+                settle: crate::protocol_v2::SettleResult {
+                    status: crate::protocol_v2::SettleStatus::NotRequested,
+                    elapsed_ms: 0,
+                },
+                screenshot: None,
+                retry_count: 0,
+                manual_recovery: false,
+            })
+        }
+    }
+
     #[test]
     fn exposes_only_the_public_computer_use_actions() {
         let server = DeviceMcp::new(Arc::new(SuccessTransport));
@@ -1675,6 +1781,7 @@ mod tests {
                 "hold_key",
                 "input_text",
                 "key",
+                "launch_application",
                 "left_click",
                 "left_click_drag",
                 "left_mouse_down",
@@ -1695,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn token_efficient_surface_exposes_only_four_composable_tools() {
+    fn token_efficient_surface_exposes_full_trust_composable_tools() {
         let server = DeviceMcp::token_efficient(Arc::new(SuccessTransport));
         let mut names: Vec<_> = server
             .tool_router
@@ -1704,7 +1811,45 @@ mod tests {
             .map(|tool| tool.name.into_owned())
             .collect();
         names.sort_unstable();
-        assert_eq!(names, ["act", "input_text", "observe", "read_clipboard"]);
+        assert_eq!(
+            names,
+            [
+                "act",
+                "input_text",
+                "launch_application",
+                "observe",
+                "read_clipboard",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_trust_tools_dispatch_without_a_prior_observation() {
+        let transport = Arc::new(FullTrustTransport {
+            actions: std::sync::Mutex::new(Vec::new()),
+        });
+        let server = DeviceMcp::token_efficient(transport.clone());
+
+        server
+            .read_clipboard()
+            .await
+            .expect("stateless global clipboard");
+        server
+            .launch_application(Parameters(LaunchApplicationParameters {
+                application: "com.apple.TextEdit".to_owned(),
+            }))
+            .await
+            .expect("full-trust application launch");
+
+        assert_eq!(
+            *transport.actions.lock().expect("full-trust actions lock"),
+            [
+                ActionV2::ReadClipboard,
+                ActionV2::LaunchApplication {
+                    application: "com.apple.TextEdit".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1837,10 +1982,10 @@ mod tests {
             message: "ok".to_owned(),
             state_generation: 1,
             screenshot_generation: 0,
-            state_id: Uuid::new_v4(),
-            application_digest: "a".repeat(64),
-            window_id: 1,
-            display_fingerprint: "display".to_owned(),
+            state_id: Some(Uuid::new_v4()),
+            application_digest: Some("a".repeat(64)),
+            window_id: Some(1),
+            display_fingerprint: Some("display".to_owned()),
             base_state_id: None,
             observation: Some(AccessibilityObservation {
                 kind: AccessibilityObservationKind::Full,
@@ -1920,10 +2065,10 @@ mod tests {
             message: "Action completed.".to_owned(),
             state_generation: 3,
             screenshot_generation: 2,
-            state_id: Uuid::new_v4(),
-            application_digest: "a".repeat(64),
-            window_id: 42,
-            display_fingerprint: "display".to_owned(),
+            state_id: Some(Uuid::new_v4()),
+            application_digest: Some("a".repeat(64)),
+            window_id: Some(42),
+            display_fingerprint: Some("display".to_owned()),
             base_state_id: None,
             observation: None,
             settle: SettleResult {
@@ -1948,10 +2093,10 @@ mod tests {
             message: "Clipboard v2 test".to_owned(),
             state_generation: 9,
             screenshot_generation: 4,
-            state_id,
-            application_digest: "a".repeat(64),
-            window_id: 1,
-            display_fingerprint: "display".to_owned(),
+            state_id: Some(state_id),
+            application_digest: Some("a".repeat(64)),
+            window_id: Some(1),
+            display_fingerprint: Some("display".to_owned()),
             base_state_id: None,
             observation: None,
             settle: SettleResult {

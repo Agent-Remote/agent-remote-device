@@ -152,7 +152,12 @@ final class DeviceBrokerClient: @unchecked Sendable {
         let envelope = try DeviceIPCEnvelope.decode(response)
         let pending = try DeviceIPCDecoder.decode(BrokerPendingSession.self, from: envelope.payload)
         try pending.validate()
-        setPendingSession(pending)
+        if pending.activationConfiguration != nil {
+            setPendingSession(nil)
+            setActiveBinding(pending.binding)
+        } else {
+            setPendingSession(pending)
+        }
         return pending
     }
 
@@ -177,7 +182,7 @@ final class DeviceBrokerClient: @unchecked Sendable {
         return candidates.items
     }
 
-    func claimSession(toolSessionID: UUID) async throws {
+    func claimSession(toolSessionID: UUID) async throws -> Bool {
         let request = BrokerClaimRequest(toolSessionID: toolSessionID)
         try request.validate()
         let envelope = try DeviceIPCEnvelope(
@@ -201,76 +206,14 @@ final class DeviceBrokerClient: @unchecked Sendable {
             from: responseEnvelope.payload
         )
         try pending.validate()
+        if pending.activationConfiguration != nil {
+            setPendingSession(nil)
+            setActiveBinding(pending.binding)
+            return true
+        }
         setPendingSession(pending)
         setActiveBinding(nil)
-    }
-
-    func approve(_ approvals: [LocalApproval]) async throws {
-        _ = try await decide(approvals, result: .allowed)
-    }
-
-    func deny(_ approvals: [LocalApproval]) async throws {
-        _ = try await decide(approvals, result: .denied)
-    }
-
-    private func decide(
-        _ approvals: [LocalApproval],
-        result: BrokerApprovalResult
-    ) async throws -> ExecutorSessionConfiguration? {
-        let pending = try currentPendingSession()
-        let decision = BrokerApprovalDecision(
-            binding: pending.binding,
-            approvals: approvals,
-            result: result
-        )
-        try decision.validate()
-        let envelope = try DeviceIPCEnvelope(
-            requestID: UUID(),
-            payload: JSONEncoder().encode(decision)
-        ).encoded() as NSData
-        let broker = try brokerProxy()
-        let response: Data?
-        do {
-            response = try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<Data?, Error>) in
-                broker.approveSession(envelope) { data, error in
-                    guard error == nil else {
-                        continuation.resume(throwing: brokerFailure(error))
-                        return
-                    }
-                    continuation.resume(returning: data.map { Data(referencing: $0) })
-                }
-            }
-        } catch let failure as DeviceBrokerClientFailure {
-            if failure == .serviceUnavailable {
-                let refreshed = try? await pollPendingSession()
-                if refreshed?.binding != pending.binding {
-                    throw DeviceBrokerClientFailure.bindingMismatch
-                }
-            }
-            throw failure
-        }
-        if result == .denied {
-            guard response == nil else { throw DeviceBrokerClientFailure.invalidResponse }
-            setPendingSession(nil)
-            setActiveBinding(nil)
-            return nil
-        }
-        guard let response else { throw DeviceBrokerClientFailure.invalidResponse }
-        let responseEnvelope = try DeviceIPCEnvelope.decode(response)
-        let configuration = try DeviceIPCDecoder.decode(
-            ExecutorSessionConfiguration.self,
-            from: responseEnvelope.payload
-        )
-        try configuration.validate()
-        guard configuration.binding == pending.binding,
-              configuration.approvals == approvals
-        else {
-            throw DeviceBrokerClientFailure.bindingMismatch
-        }
-        setPendingSession(nil)
-        setActiveBinding(configuration.binding)
-        return configuration
+        return false
     }
 
     func abort(reason: BrokerAbortReason) async throws {

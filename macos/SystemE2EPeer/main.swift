@@ -174,36 +174,67 @@ private enum SystemE2EPeer {
                         requiresLowercaseIdentifiers: true
                     )
                     guard binding.matches(request.context),
-                          request.action == .observe(application: nil),
-                          request.context.currentStateGeneration == 0,
                           request.context.currentScreenshotGeneration == 0
                     else {
                         throw SystemE2EFailure.bindingMismatch
                     }
-                    let response = ActionResponseV2(
-                        requestID: request.requestID,
-                        monotonicSequence: request.context.monotonicSequence,
-                        stateGeneration: request.context.currentStateGeneration + 1,
-                        screenshotGeneration: request.context.currentScreenshotGeneration,
-                        stateID: UUID(uuidString: "20000000-0000-4000-8000-000000000001"),
-                        applicationDigest: String(repeating: "a", count: 64),
-                        windowID: 1,
-                        displayFingerprint: "system-e2e-display",
-                        baseStateID: nil,
-                        status: .success,
-                        message: "system-e2e-v2-ok",
-                        observation: AccessibilityObservation(
-                            kind: .full,
-                            reset: true,
-                            truncated: false,
-                            nodes: [],
-                            removed: []
-                        ),
-                        settle: SettleResult(status: .settled, elapsedMilliseconds: 1),
-                        image: nil
-                    )
+                    let response: ActionResponseV2
+                    switch request.action {
+                    case .readClipboard:
+                        guard request.context.monotonicSequence == 1,
+                              request.context.currentStateGeneration == 0
+                        else {
+                            throw SystemE2EFailure.bindingMismatch
+                        }
+                        response = ActionResponseV2(
+                            requestID: request.requestID,
+                            monotonicSequence: request.context.monotonicSequence,
+                            stateGeneration: 0,
+                            screenshotGeneration: 0,
+                            stateID: nil,
+                            applicationDigest: nil,
+                            windowID: nil,
+                            displayFingerprint: nil,
+                            baseStateID: nil,
+                            status: .success,
+                            message: "Clipboard read.",
+                            clipboard: "system-e2e-clipboard",
+                            observation: nil,
+                            settle: SettleResult(
+                                status: .notRequested,
+                                elapsedMilliseconds: 0
+                            ),
+                            image: nil
+                        )
+                    case .launchApplication("TextEdit"):
+                        guard request.context.monotonicSequence == 2,
+                              request.context.currentStateGeneration == 0
+                        else {
+                            throw SystemE2EFailure.bindingMismatch
+                        }
+                        response = observedResponse(
+                            request: request,
+                            stateGeneration: 1,
+                            stateID: "20000000-0000-4000-8000-000000000001",
+                            message: "system-e2e-launch-ok"
+                        )
+                    case .observe(application: nil):
+                        guard request.context.monotonicSequence == 3,
+                              request.context.currentStateGeneration == 1
+                        else {
+                            throw SystemE2EFailure.bindingMismatch
+                        }
+                        response = observedResponse(
+                            request: request,
+                            stateGeneration: 2,
+                            stateID: "20000000-0000-4000-8000-000000000002",
+                            message: "system-e2e-observe-ok"
+                        )
+                        await completion.resolve()
+                    default:
+                        throw SystemE2EFailure.bindingMismatch
+                    }
                     let encoded = try JSONEncoder().encode(response)
-                    await completion.resolve()
                     return encoded
                 },
                 lifecycleHandler: { _ in }
@@ -215,6 +246,36 @@ private enum SystemE2EPeer {
         relayTask.cancel()
         print("Swift device peer handled the E2E action")
     }
+}
+
+private func observedResponse(
+    request: ActionRequestV2,
+    stateGeneration: UInt64,
+    stateID: String,
+    message: String
+) -> ActionResponseV2 {
+    ActionResponseV2(
+        requestID: request.requestID,
+        monotonicSequence: request.context.monotonicSequence,
+        stateGeneration: stateGeneration,
+        screenshotGeneration: 0,
+        stateID: UUID(uuidString: stateID),
+        applicationDigest: String(repeating: "a", count: 64),
+        windowID: 1,
+        displayFingerprint: "system-e2e-display",
+        baseStateID: nil,
+        status: .success,
+        message: message,
+        observation: AccessibilityObservation(
+            kind: .full,
+            reset: true,
+            truncated: false,
+            nodes: [],
+            removed: []
+        ),
+        settle: SettleResult(status: .settled, elapsedMilliseconds: 1),
+        image: nil
+    )
 }
 
 private func loadConfiguration() throws -> Configuration {

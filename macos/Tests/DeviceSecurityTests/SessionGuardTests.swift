@@ -88,6 +88,45 @@ import Testing
     }
 }
 
+@Test func fullTrustAuthorizesDynamicApplicationsAndGlobalClipboardForOneGeneration() async throws {
+    let application = ApplicationIdentity(
+        bundleIdentifier: "com.example.Dynamic",
+        signingIdentifier: "com.example.Dynamic"
+    )
+    let guardState = SessionGuard(generation: 4)
+    try await guardState.deviceConnected()
+    try await guardState.activateFullTrust(
+        authorizationGeneration: 4,
+        leaseUntil: Date().addingTimeInterval(60)
+    )
+    try await guardState.recordScreenshot(ScreenshotContext(
+        generation: 1,
+        displayFingerprint: "display-a",
+        applicationDigest: application.stableDigest,
+        pixelWidth: 800,
+        pixelHeight: 600
+    ))
+    try await guardState.authorize(
+        action: .type("allowed"),
+        sequence: 1,
+        screenshotGeneration: 1,
+        displayFingerprint: "display-a",
+        application: application
+    )
+    try await guardState.accept(sequence: 1)
+    try await guardState.authorizeGlobalClipboard(sequence: 2)
+    try await guardState.accept(sequence: 2)
+
+    try await guardState.moveToNewGeneration(5)
+    try await guardState.deviceConnected()
+    await #expect(throws: GuardFailure.invalidState) {
+        try await guardState.activateFullTrust(
+            authorizationGeneration: 4,
+            leaseUntil: Date().addingTimeInterval(60)
+        )
+    }
+}
+
 @Test func staleCoordinatesAndControlLevelFailClosed() async throws {
     let application = ApplicationIdentity(
         bundleIdentifier: "com.apple.Terminal",

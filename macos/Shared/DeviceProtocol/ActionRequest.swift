@@ -151,7 +151,7 @@ public enum Action: Sendable, Equatable {
     }
 
     /// Whether normal HID routing is required because the key can change the
-    /// frontmost window within the approved application.
+    /// frontmost window within the target application.
     public var mayChangeFrontmostWindow: Bool {
         guard case let .key(key) = self else { return false }
         return Self.isFrontmostWindowShortcut(key)

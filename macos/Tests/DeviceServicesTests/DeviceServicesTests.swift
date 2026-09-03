@@ -2273,6 +2273,181 @@ import Testing
     #expect(await controller.currentState() == .active)
 }
 
+@Test func fullTrustClipboardReadDoesNotRequireAnApplicationObservation() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = fullTrustConfiguration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let responseData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .readClipboard
+    ))
+    let response = try JSONDecoder().decode(ActionResponseV2.self, from: responseData)
+
+    #expect(response.status == .success)
+    #expect(response.clipboard == "clipboard text")
+    #expect(response.stateGeneration == 0)
+    #expect(response.screenshotGeneration == 0)
+    #expect(response.stateID == nil)
+    #expect(response.applicationDigest == nil)
+    #expect(await recorder.clipboardMaximumBytes == [maximumClipboardTextBytesV2])
+}
+
+@Test func fullTrustClipboardFailuresPreserveConcreteCodesWithoutEndingTheSession() async throws {
+    let failures: [(ExecutionFailure, String)] = [
+        (.clipboardEmpty, "clipboard_empty"),
+        (.clipboardNonText, "clipboard_non_text"),
+        (.clipboardUnavailable, "clipboard_unavailable"),
+        (.clipboardTooLarge, "clipboard_too_large"),
+    ]
+    for (failure, code) in failures {
+        let recorder = RuntimeRecorder()
+        let controller = GUIExecutorSessionController { guardState in
+            RuntimeStub(
+                guardState: guardState,
+                recorder: recorder,
+                clipboardFailure: failure
+            )
+        }
+        let session = fullTrustConfiguration(leaseUntil: Date().addingTimeInterval(60))
+        try await controller.updateSession(
+            envelope(payload: JSONEncoder().encode(session)).encoded()
+        )
+
+        let responseData = try await controller.performAction(actionEnvelopeV2(
+            configuration: session,
+            requestID: UUID(),
+            sequence: 1,
+            stateGeneration: 0,
+            screenshotGeneration: 0,
+            observation: ObservationPolicy(
+                mode: .none,
+                settle: .none,
+                settleTimeoutMilliseconds: 0,
+                imageProfile: .none
+            ),
+            action: .readClipboard
+        ))
+        let response = try JSONDecoder().decode(ActionResponseV2.self, from: responseData)
+
+        #expect(response.status == .failed)
+        #expect(response.message.hasPrefix("\(code): "))
+        #expect(response.clipboard == nil)
+        #expect(await controller.currentState() == .active)
+    }
+}
+
+@Test func fullTrustLaunchReturnsAFirstObservationAndExactReplayDoesNotRelaunch() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = fullTrustConfiguration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+    let request = try actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .launchApplication("com.apple.Safari")
+    )
+
+    let firstData = try await controller.performAction(request)
+    let replayData = try await controller.performAction(request)
+    let response = try JSONDecoder().decode(ActionResponseV2.self, from: firstData)
+
+    #expect(firstData == replayData)
+    #expect(response.status == .success, Comment(rawValue: response.message))
+    #expect(response.observation?.kind == .full)
+    #expect(response.stateGeneration == 1)
+    #expect(await recorder.launchedApplications == ["com.apple.Safari"])
+}
+
+@Test func uncertainFullTrustLaunchFailureEndsTheGenerationButPreflightFailureDoesNot() async throws {
+    for (failure, expectedCode, expectedState) in [
+        (
+            CaptureFailure.applicationLaunchTimeout,
+            "application_launch_timeout",
+            DeviceSessionState.failed
+        ),
+        (
+            CaptureFailure.applicationLaunchResultUnknown,
+            "application_launch_result_unknown",
+            DeviceSessionState.failed
+        ),
+        (
+            CaptureFailure.applicationNotFound,
+            "application_not_found",
+            DeviceSessionState.active
+        ),
+    ] {
+        let recorder = RuntimeRecorder()
+        let controller = GUIExecutorSessionController { guardState in
+            RuntimeStub(
+                guardState: guardState,
+                recorder: recorder,
+                launchFailure: failure
+            )
+        }
+        let session = fullTrustConfiguration(leaseUntil: Date().addingTimeInterval(60))
+        try await controller.updateSession(
+            envelope(payload: JSONEncoder().encode(session)).encoded()
+        )
+        let request = try actionEnvelopeV2(
+            configuration: session,
+            requestID: UUID(),
+            sequence: 1,
+            stateGeneration: 0,
+            screenshotGeneration: 0,
+            observation: ObservationPolicy(mode: .axFull),
+            action: .launchApplication("com.apple.Safari")
+        )
+
+        let firstData = try await controller.performAction(request)
+        let replayData = try await controller.performAction(request)
+        let response = try JSONDecoder().decode(ActionResponseV2.self, from: firstData)
+
+        #expect(firstData == replayData)
+        #expect(response.status == .failed)
+        #expect(response.message.hasPrefix("\(expectedCode): "))
+        #expect(await controller.currentState() == expectedState)
+        #expect(await recorder.launchedApplications == ["com.apple.Safari"])
+    }
+}
+
+@Test func launchedWindowFailureRestoresThePriorUserFocus() async {
+    let recorder = RuntimeRecorder()
+
+    await #expect(throws: CaptureFailure.displayMissing) {
+        try await LiveGUIActionRuntime.waitForLaunchedWindow(
+            deadline: Date().addingTimeInterval(1),
+            context: { throw CaptureFailure.displayMissing },
+            restore: { await recorder.restoredFocus() }
+        )
+    }
+
+    #expect(await recorder.lifecycleEvents == ["restore_focus"])
+}
+
 @Test func v2ClipboardReadPreservesTheExistingAXSnapshotForTheNextElementAction() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -2995,6 +3170,154 @@ import Testing
     #expect(executor.sessionUpdateCount() == 2)
     #expect(executor.stoppedRequest() != nil)
     #expect(approvalUI.recordedEvents().isEmpty)
+}
+
+@Test func fullTrustClaimActivatesExecutorAndRelayBeforeReplying() async throws {
+    let executor = ExecutorStub()
+    let session = fullTrustConfiguration(leaseUntil: Date().addingTimeInterval(60))
+    let relayConfigurations = ConfigurationRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        claimProvider: { request in
+            #expect(request.toolSessionID == session.binding.toolSessionID)
+            #expect(request.deviceCapabilities == [capabilitySessionFullTrustV1])
+            return BrokerPendingSession(
+                binding: session.binding,
+                expiresAt: session.leaseUntil.addingTimeInterval(1),
+                activationConfiguration: session
+            )
+        },
+        relayProvider: { configuration in
+            await relayConfigurations.record(configuration)
+            return HoldingRelay(cancellationRecorder: CancellationRecorder())
+        },
+        lockProvider: { _ in }
+    )
+    let requestID = UUID()
+    let request = try DeviceIPCEnvelope(
+        requestID: requestID,
+        payload: JSONEncoder().encode(BrokerClaimRequest(
+            toolSessionID: session.binding.toolSessionID
+        ))
+    ).encoded() as NSData
+
+    let result = await withCheckedContinuation { continuation in
+        broker.claimSession(request) { data, error in
+            continuation.resume(returning: (data.map { Data(referencing: $0) }, error?.code))
+        }
+    }
+
+    let response = try DeviceIPCEnvelope.decode(try #require(result.0))
+    let pending = try JSONDecoder().decode(BrokerPendingSession.self, from: response.payload)
+    #expect(result.1 == nil)
+    #expect(pending.activationConfiguration == session)
+    #expect(executor.sessionUpdateCount() == 1)
+    #expect(await relayConfigurations.first == session)
+}
+
+@Test func failedFullTrustClaimActivationStopsExecutorAndAbortsControlPlane() async throws {
+    let executor = ExecutorStub()
+    let session = fullTrustConfiguration(leaseUntil: Date().addingTimeInterval(60))
+    let lifecycleRecorder = LifecycleRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        claimProvider: { _ in
+            BrokerPendingSession(
+                binding: session.binding,
+                expiresAt: session.leaseUntil.addingTimeInterval(1),
+                activationConfiguration: session
+            )
+        },
+        abortProvider: { request in
+            await lifecycleRecorder.recordAbort(request)
+            return BrokerPendingSession(
+                binding: request.binding,
+                expiresAt: Date().addingTimeInterval(60)
+            )
+        },
+        relayProvider: { _ in throw DeviceIPCFailure.serviceUnavailable },
+        rotationProvider: { _ in throw DeviceIPCFailure.serviceUnavailable }
+    )
+    let request = try envelope(payload: JSONEncoder().encode(BrokerClaimRequest(
+        toolSessionID: session.binding.toolSessionID
+    ))).encoded() as NSData
+
+    let result = await withCheckedContinuation { continuation in
+        broker.claimSession(request) { data, error in
+            continuation.resume(returning: (data == nil, error?.code))
+        }
+    }
+
+    #expect(result.0)
+    #expect(result.1 == DeviceIPCFailure.serviceUnavailable.rawValue)
+    #expect(executor.stoppedRequest() != nil)
+    #expect(await lifecycleRecorder.abortCount == 1)
+    #expect(await lifecycleRecorder.abortRequest?.binding == session.binding)
+}
+
+@Test func fullTrustClaimRotationRejectsChangedAuthorizationScope() async throws {
+    let executor = ExecutorStub()
+    let session = fullTrustConfiguration(leaseUntil: Date().addingTimeInterval(60))
+    let lifecycleRecorder = LifecycleRecorder()
+    let relayAttempts = RelayAttemptRecorder()
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        claimProvider: { _ in
+            BrokerPendingSession(
+                binding: session.binding,
+                expiresAt: session.leaseUntil.addingTimeInterval(1),
+                activationConfiguration: session
+            )
+        },
+        abortProvider: { request in
+            await lifecycleRecorder.recordAbort(request)
+            return BrokerPendingSession(
+                binding: request.binding,
+                expiresAt: Date().addingTimeInterval(60)
+            )
+        },
+        relayProvider: { configuration in
+            _ = await relayAttempts.record(configuration)
+            throw DeviceIPCFailure.serviceUnavailable
+        },
+        rotationProvider: { previous in
+            let binding = DeviceSessionBinding(
+                userID: previous.binding.userID,
+                deviceID: previous.binding.deviceID,
+                toolSessionID: previous.binding.toolSessionID,
+                deviceSessionID: previous.binding.deviceSessionID,
+                nodeID: previous.binding.nodeID,
+                platform: previous.binding.platform,
+                generation: previous.binding.generation + 1
+            )
+            var exclusions = try #require(previous.authorization).excludedBundleIdentifiers
+            exclusions.insert("com.example.changed-scope")
+            return ExecutorSessionConfiguration(
+                binding: binding,
+                leaseUntil: Date().addingTimeInterval(60),
+                approvals: [],
+                authorization: SessionAuthorization(
+                    excludedBundleIdentifiers: exclusions,
+                    generation: binding.generation
+                ),
+                capabilities: previous.capabilities
+            )
+        }
+    )
+    let request = try envelope(payload: JSONEncoder().encode(BrokerClaimRequest(
+        toolSessionID: session.binding.toolSessionID
+    ))).encoded() as NSData
+
+    let error = await withCheckedContinuation { continuation in
+        broker.claimSession(request) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+
+    #expect(error == DeviceIPCFailure.invalidMessage.rawValue)
+    #expect(await relayAttempts.generations == [session.binding.generation])
+    #expect(executor.sessionUpdateCount() == 1)
+    #expect(await lifecycleRecorder.abortCount == 1)
 }
 
 @Test func unavailableExecutorRejectsApprovalBeforeRelayOrRotation() async throws {
@@ -4254,6 +4577,25 @@ private func configuration(leaseUntil: Date) -> ExecutorSessionConfiguration {
     )
 }
 
+private func fullTrustConfiguration(leaseUntil: Date) -> ExecutorSessionConfiguration {
+    let base = configuration(leaseUntil: leaseUntil)
+    return ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: leaseUntil,
+        approvals: [],
+        authorization: SessionAuthorization(generation: base.binding.generation),
+        capabilities: [
+            capabilityObservationModeV2,
+            capabilityAXStateV2,
+            capabilityAdaptiveSettleV2,
+            capabilityClipboardPayloadV2,
+            capabilitySessionFullTrustV1,
+            capabilityApplicationLaunchV1,
+            capabilityGlobalClipboardV1,
+        ]
+    )
+}
+
 private func envelope(payload: Data) throws -> DeviceIPCEnvelope {
     try DeviceIPCEnvelope(requestID: UUID(), payload: payload)
 }
@@ -4364,6 +4706,7 @@ private actor RuntimeRecorder {
     private(set) var preferredWindowIDs: [[UInt32]] = []
     private(set) var windowContextPreferredWindowIDs: [[UInt32]] = []
     private(set) var clipboardMaximumBytes: [Int] = []
+    private(set) var launchedApplications: [String] = []
     private(set) var valueFreshnessCalls: [(
         target: ElementTarget,
         expectedValue: String,
@@ -4390,6 +4733,10 @@ private actor RuntimeRecorder {
 
     func readClipboard(maximumBytes: Int) {
         clipboardMaximumBytes.append(maximumBytes)
+    }
+
+    func launched(application: String) {
+        launchedApplications.append(application)
     }
 
     func executed(_ action: Action) {
@@ -4771,6 +5118,8 @@ private actor RuntimeStub: GUIActionRuntime {
     private let recorder: RuntimeRecorder
     private var observationValues: [String?]
     private let contextActionFailure: CaptureFailure?
+    private let clipboardFailure: ExecutionFailure?
+    private let launchFailure: CaptureFailure?
     private var windowContextFailures: [CaptureFailure?]
     private let valueFreshnessConfirmed: Bool
     private let settleObservedMeaningfulChange: Bool
@@ -4788,6 +5137,8 @@ private actor RuntimeStub: GUIActionRuntime {
         recorder: RuntimeRecorder,
         observationValues: [String?] = [],
         contextActionFailure: CaptureFailure? = nil,
+        clipboardFailure: ExecutionFailure? = nil,
+        launchFailure: CaptureFailure? = nil,
         windowContextFailures: [CaptureFailure?] = [],
         valueFreshnessConfirmed: Bool = true,
         settleObservedMeaningfulChange: Bool = false,
@@ -4804,6 +5155,8 @@ private actor RuntimeStub: GUIActionRuntime {
         self.recorder = recorder
         self.observationValues = observationValues
         self.contextActionFailure = contextActionFailure
+        self.clipboardFailure = clipboardFailure
+        self.launchFailure = launchFailure
         self.windowContextFailures = windowContextFailures
         self.valueFreshnessConfirmed = valueFreshnessConfirmed
         self.settleObservedMeaningfulChange = settleObservedMeaningfulChange
@@ -4815,6 +5168,35 @@ private actor RuntimeStub: GUIActionRuntime {
         self.windowContextFrames = windowContextFrames
         self.windowContextWindowIDs = windowContextWindowIDs
         self.windowContextDelays = windowContextDelays
+    }
+
+    func resolveApplication(
+        targetApplication _: String?,
+        excludedBundleIdentifiers _: Set<String>
+    ) async throws -> ApplicationIdentity {
+        ApplicationIdentity(
+            bundleIdentifier: "com.apple.Safari",
+            signingIdentifier: "com.apple.Safari"
+        )
+    }
+
+    func launchApplication(
+        _ application: String,
+        excludedBundleIdentifiers _: Set<String>,
+        deadline _: Date
+    ) async throws -> WindowContext {
+        await recorder.launched(application: application)
+        if let launchFailure { throw launchFailure }
+        return WindowContext(
+            windowID: 7,
+            windowFrame: CGRect(x: 0, y: 0, width: 100, height: 100),
+            processID: 42,
+            application: ApplicationIdentity(
+                bundleIdentifier: "com.apple.Safari",
+                signingIdentifier: "com.apple.Safari"
+            ),
+            displayFingerprint: "display-layout"
+        )
     }
 
     func capture(
@@ -5068,7 +5450,18 @@ private actor RuntimeStub: GUIActionRuntime {
             application: context.application
         )
         guard "clipboard text".utf8.count <= maximumBytes else {
-            throw ExecutionFailure.clipboardContentTooLarge
+            throw ExecutionFailure.clipboardTooLarge
+        }
+        try await guardState.accept(sequence: sequence)
+        return "clipboard text"
+    }
+
+    func readGlobalClipboard(sequence: UInt64, maximumBytes: Int) async throws -> String {
+        await recorder.readClipboard(maximumBytes: maximumBytes)
+        try await guardState.authorizeGlobalClipboard(sequence: sequence)
+        if let clipboardFailure { throw clipboardFailure }
+        guard "clipboard text".utf8.count <= maximumBytes else {
+            throw ExecutionFailure.clipboardTooLarge
         }
         try await guardState.accept(sequence: sequence)
         return "clipboard text"

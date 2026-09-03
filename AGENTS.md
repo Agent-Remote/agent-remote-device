@@ -33,7 +33,8 @@ Before making changes, identify the task domain and read the matching rule docum
 - Keep device authentication and network transport in the Network Broker; keep TCC-backed GUI operations in the GUI Executor.
 - Preserve code-signature-validated, versioned XPC boundaries and fail closed on peer loss, timeout, identity mismatch, or incomplete cleanup.
 - Treat every remote frame, identifier, coordinate, image, path, credential file, and release artifact as untrusted input.
-- Bind actions to the approved application, exact session generation, monotonic sequence, current lease, and model-visible state.
+- Bind actions to the current session authorization, exact resolved application identity, session generation,
+  monotonic sequence, current lease, and model-visible state.
 - Preserve protocol v1 fallback whenever v2 capabilities are not fully negotiated.
 - Prefer narrow, explicit types and existing modules over speculative abstractions.
 

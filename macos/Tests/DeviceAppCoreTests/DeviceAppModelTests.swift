@@ -1,106 +1,8 @@
 import DeviceAppCore
 import DeviceIPC
-import DeviceProtocol
-import DeviceSecurity
 import Foundation
 import GUIExecutor
 import Testing
-
-@Test func approvalPresentationRejectsDuplicateApplications() throws {
-    let candidate = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    #expect(throws: ApprovalModelFailure.duplicateApplication) {
-        try ApprovalPresentation(
-            generation: 1,
-            applications: [candidate, candidate]
-        )
-    }
-}
-
-@Test func approvalPresentationRejectsNonactiveGenerations() throws {
-    let application = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    for generation in [UInt64(0), maximumDeviceSessionGeneration, UInt64.max] {
-        #expect(throws: ApprovalModelFailure.invalidGeneration) {
-            try ApprovalPresentation(
-                generation: generation,
-                applications: [application]
-            )
-        }
-    }
-    #expect(throws: Never.self) {
-        try ApprovalPresentation(
-            generation: maximumActiveDeviceSessionGeneration,
-            applications: [application]
-        )
-    }
-}
-
-@Test func unknownApplicationUsesOnlyTheCurrentRequestLevel() throws {
-    let unknown = candidate(bundleIdentifier: "dev.example.Unknown", requested: .clickOnly)
-    let presentation = try ApprovalPresentation(
-        generation: 7,
-        applications: [unknown]
-    )
-    let approvals = presentation.approvals(
-        applicationSelections: [unknown.id],
-        clipboardSelections: [unknown.id],
-        controlLevelSelections: [unknown.id: .clickOnly]
-    )
-
-    #expect(unknown.classification.source == .pendingConfirmation)
-    #expect(unknown.classification.controlLevel == nil)
-    #expect(approvals.first?.controlLevel == .clickOnly)
-    #expect(approvals.first?.generation == 7)
-    #expect(approvals.first?.clipboardAllowed == true)
-}
-
-@Test func clipboardIsDeniedUnlessRequestedAndSelected() throws {
-    let browser = candidate(
-        bundleIdentifier: "com.apple.Safari",
-        requested: .fullControl,
-        clipboardRequested: false
-    )
-    let presentation = try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    )
-    let approval = try #require(
-        presentation.approvals(
-            applicationSelections: [browser.id],
-            clipboardSelections: [browser.id],
-            controlLevelSelections: [:]
-        ).first
-    )
-
-    #expect(approval.controlLevel == .viewOnly)
-    #expect(approval.clipboardAllowed == false)
-}
-
-@Test func applicationsRequireExplicitPerSessionSelection() throws {
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    let presentation = try ApprovalPresentation(
-        generation: 7,
-        applications: [browser]
-    )
-
-    #expect(presentation.approvals(
-        applicationSelections: [],
-        clipboardSelections: [browser.id],
-        controlLevelSelections: [:]
-    ).isEmpty)
-}
-
-@MainActor
-@Test func approvalDoesNotPreselectClipboardAccess() throws {
-    let model = DeviceAppModel(permissionsGranted: { true })
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-
-    #expect(model.clipboardSelections.isEmpty)
-}
 
 @MainActor
 @Test func unavailableSecureIPCChangesOnlyTheReadyStateToFailed() {
@@ -128,21 +30,14 @@ import Testing
         permissionsGranted: { true },
         controlNotifier: {}
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in events.append("approve") }
-
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
+    model.onClaimSession = { _ in
+        events.append("claim")
+        return true
     }
+    try await claimAndWaitForActivation(model)
 
     #expect(model.state == .active)
-    #expect(events.values().prefix(2) == ["monitor", "approve"])
+    #expect(events.values().prefix(2) == ["claim", "monitor"])
     #expect(!events.values().contains("hide"))
 }
 
@@ -156,18 +51,9 @@ import Testing
         permissionsGranted: { permissionsGranted },
         controlNotifier: {}
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in }
+    model.onClaimSession = { _ in true }
     model.onEndSession = { events.append("end") }
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    try await claimAndWaitForActivation(model)
 
     permissionsGranted = false
     model.enforceCurrentPermissions()
@@ -190,18 +76,9 @@ import Testing
         permissionsGranted: { permissionsGranted },
         controlNotifier: {}
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in }
+    model.onClaimSession = { _ in true }
     model.onEndSession = { events.append("end") }
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    try await claimAndWaitForActivation(model)
 
     permissionsGranted = false
     model.enforceCurrentPermissions()
@@ -222,16 +99,9 @@ import Testing
         permissionsGranted: { permissionsGranted },
         controlNotifier: {}
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    let presentation = try ApprovalPresentation(generation: 1, applications: [browser])
-    model.onApprove = { _ in }
+    model.onClaimSession = { _ in true }
     model.onEndSession = { events.append("end") }
-    model.presentApproval(presentation)
-    model.applicationSelections = [browser.id]
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    try await claimAndWaitForActivation(model)
 
     permissionsGranted = false
     model.enforceCurrentPermissions()
@@ -239,12 +109,7 @@ import Testing
 
     try model.handleRuntimeEvent(.sessionEnded)
     permissionsGranted = true
-    model.presentApproval(presentation)
-    model.applicationSelections = [browser.id]
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    try await claimAndWaitForActivation(model, candidate: sessionCandidate(displayName: "Replacement"))
 
     permissionsGranted = false
     model.enforceCurrentPermissions()
@@ -280,7 +145,10 @@ import Testing
         controllable: true
     )
     var claimed = false
-    model.onClaimSession = { _ in claimed = true }
+    model.onClaimSession = { _ in
+        claimed = true
+        return false
+    }
 
     model.presentSessionCandidates([remote])
     #expect(model.state == .permissionRequired)
@@ -298,6 +166,77 @@ import Testing
 }
 
 @MainActor
+@Test func claimedFullTrustSessionIsAbortedWhenSafetyMonitoringCannotStart() async throws {
+    let events = EventRecorder()
+    let model = DeviceAppModel(
+        safetyMonitorFactory: { _ in
+            FailingSafetyMonitor(events: events)
+        },
+        permissionsGranted: { true },
+        controlNotifier: {}
+    )
+    let remote = sessionCandidate(displayName: "Workspace")
+    model.onClaimSession = { _ in
+        events.append("claim")
+        return true
+    }
+    model.onAbort = { reason in
+        events.append("abort:\(reason.rawValue)")
+    }
+
+    model.presentSessionCandidates([remote])
+    model.claimSession(remote)
+    for _ in 0 ..< 100 where !events.values().contains("abort:network_disconnected") {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    #expect(events.values() == ["claim", "monitor", "abort:network_disconnected"])
+    #expect(model.state == .selectingSession)
+    #expect(model.failureMessage != nil)
+}
+
+@MainActor
+@Test func fullTrustClaimKeepsSelectedSessionVisibleThroughActivation() async throws {
+    let events = EventRecorder()
+    let model = DeviceAppModel(
+        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
+        permissionsGranted: { true },
+        controlNotifier: {}
+    )
+    let remote = sessionCandidate(displayName: "Selected Workspace")
+    model.onClaimSession = { _ in true }
+
+    model.presentSessionCandidates([remote])
+    model.claimSession(remote)
+    #expect(model.state == .claimingSession)
+    #expect(model.selectedSession == remote)
+    for _ in 0 ..< 100 where model.state != .active {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    #expect(model.state == .active)
+    #expect(model.selectedSession == remote)
+}
+
+@MainActor
+@Test func legacyClaimReturnsToListWithExplicitFullTrustFailure() async throws {
+    let model = DeviceAppModel(permissionsGranted: { true })
+    let remote = sessionCandidate(displayName: "Legacy Workspace")
+    model.onClaimSession = { _ in false }
+
+    model.presentSessionCandidates([remote])
+    model.claimSession(remote)
+    for _ in 0 ..< 100 where model.failureCode == nil {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+
+    #expect(model.state == .selectingSession)
+    #expect(model.selectedSession == nil)
+    #expect(model.failureCode == "full_trust_not_supported")
+    #expect(model.failureMessage != nil)
+}
+
+@MainActor
 @Test func switchingAnActiveSessionCleansUpBeforeShowingCandidates() async throws {
     let events = EventRecorder()
     let model = DeviceAppModel(
@@ -306,17 +245,8 @@ import Testing
         permissionsGranted: { true },
         controlNotifier: {}
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in }
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    model.onClaimSession = { _ in true }
+    try await claimAndWaitForActivation(model)
     let remote = BrokerSessionCandidate(
         toolSessionID: UUID(),
         toolType: "claude",
@@ -351,131 +281,34 @@ import Testing
 }
 
 @MainActor
-@Test func switchingAPendingApprovalEndsBindingBeforeShowingCandidates() async throws {
+@Test func staleClaimCompletionCannotReactivateTheSession() async throws {
     let events = EventRecorder()
+    let claimGate = AsyncGate()
     let model = DeviceAppModel(
-        visibilityController: RecordingVisibilityController(events: events),
-        permissionsGranted: { true }
-    )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    let remote = BrokerSessionCandidate(
-        toolSessionID: UUID(),
-        toolType: "claude",
-        toolAccountID: UUID(),
-        workspaceID: UUID(),
-        projectKey: "Workspace",
-        displayName: "Workspace",
-        status: .running,
-        nodeID: UUID(),
-        runtimeBackend: "native",
-        currentDeviceID: nil,
-        currentDeviceName: nil,
-        deviceSessionID: nil,
-        controllable: true
-    )
-    model.onEndSession = { events.append("end") }
-    model.onRefreshSessionCandidates = {
-        events.append("candidates")
-        return [remote]
-    }
-
-    model.switchSession()
-    for _ in 0 ..< 100 where model.state != .selectingSession {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-
-    #expect(model.state == .selectingSession)
-    #expect(model.approvalPresentation == nil)
-    #expect(model.sessionCandidates == [remote])
-    let values = events.values()
-    #expect(values.firstIndex(of: "restore")! < values.firstIndex(of: "end")!)
-    #expect(values.firstIndex(of: "end")! < values.firstIndex(of: "candidates")!)
-}
-
-@MainActor
-@Test func switchingDuringActivationCannotBeOverwrittenByLateApproval() async throws {
-    let events = EventRecorder()
-    let approvalGate = ApprovalGate()
-    let model = DeviceAppModel(
-        visibilityController: RecordingVisibilityController(events: events),
-        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
         permissionsGranted: { true },
         controlNotifier: { events.append("notify") }
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in
-        events.append("approve")
-        await approvalGate.wait()
+    let remote = sessionCandidate(displayName: "Workspace")
+    model.onClaimSession = { _ in
+        events.append("claim")
+        await claimGate.wait()
+        return true
     }
-    model.onEndSession = { events.append("end") }
-    model.onRefreshSessionCandidates = {
-        events.append("candidates")
-        return []
-    }
+    model.onAbort = { _ in events.append("abort") }
+    model.onRefreshSessionCandidates = { [] }
 
-    model.allowForSession()
-    for _ in 0 ..< 100 where !events.values().contains("approve") {
+    model.presentSessionCandidates([remote])
+    model.claimSession(remote)
+    for _ in 0 ..< 100 where !events.values().contains("claim") {
         try await Task.sleep(for: .milliseconds(5))
     }
-    model.switchSession()
-    for _ in 0 ..< 100 where model.state != .selectingSession {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-    await approvalGate.release()
-    try await Task.sleep(for: .milliseconds(20))
-
-    #expect(model.state == .selectingSession)
-    #expect(events.values().contains("end"))
-    #expect(!events.values().contains("notify"))
-}
-
-@MainActor
-@Test func stopDuringBrokerApprovalCannotReactivateTheSession() async throws {
-    let events = EventRecorder()
-    let approvalGate = ApprovalGate()
-    let model = DeviceAppModel(
-        visibilityController: RecordingVisibilityController(events: events),
-        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
-        permissionsGranted: { true },
-        controlNotifier: { events.append("notify") }
-    )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in
-        events.append("approve")
-        await approvalGate.wait()
-    }
-    model.onAbort = { reason in
-        #expect(reason == .screenLocked)
-        events.append("abort")
-    }
-
-    model.allowForSession()
-    for _ in 0 ..< 100 where !events.values().contains("approve") {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-    model.stopCurrentAction(reason: .screenLocked)
-    await approvalGate.release()
+    model.returnToSessionSelection()
+    await claimGate.release()
     for _ in 0 ..< 100 where !events.values().contains("abort") {
         try await Task.sleep(for: .milliseconds(5))
     }
 
-    #expect(model.state == .paused)
-    #expect(model.lastUnsafeTransition == .screenLocked)
-    #expect(events.values().contains("restore"))
+    #expect(model.state == .selectingSession)
     #expect(events.values().contains("abort"))
     #expect(!events.values().contains("notify"))
 }
@@ -489,17 +322,8 @@ import Testing
         permissionsGranted: { true },
         controlNotifier: {}
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in }
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    model.onClaimSession = { _ in true }
+    try await claimAndWaitForActivation(model)
 
     try model.handleRuntimeEvent(.turnStopped)
     #expect(model.state == .paused)
@@ -517,44 +341,9 @@ import Testing
 }
 
 @MainActor
-@Test func remoteSessionEndDuringActivationCannotBeOverwritten() async throws {
-    let events = EventRecorder()
-    let approvalGate = ApprovalGate()
-    let model = DeviceAppModel(
-        visibilityController: RecordingVisibilityController(events: events),
-        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
-        permissionsGranted: { true },
-        controlNotifier: { events.append("notify") }
-    )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in
-        events.append("approve")
-        await approvalGate.wait()
-    }
-
-    model.allowForSession()
-    for _ in 0 ..< 100 where !events.values().contains("approve") {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-    try model.handleRuntimeEvent(.sessionEnded)
-    await approvalGate.release()
-    try await Task.sleep(for: .milliseconds(10))
-
-    #expect(model.state == .selectingSession)
-    #expect(model.approvalPresentation == nil)
-    #expect(events.values().contains("restore"))
-    #expect(!events.values().contains("notify"))
-}
-
-@MainActor
 @Test func stoppingAnActiveActionWaitsForBindingSynchronization() async throws {
     let events = EventRecorder()
-    let abortGate = ApprovalGate()
+    let abortGate = AsyncGate()
     let model = try await activatedModel(visibilityController: RecordingVisibilityController(
         events: events
     ))
@@ -582,7 +371,7 @@ import Testing
 @MainActor
 @Test func endingControlReturnsToSessionListWithoutTerminalScreen() async throws {
     let events = EventRecorder()
-    let endGate = ApprovalGate()
+    let endGate = AsyncGate()
     let model = try await activatedModel(visibilityController: RecordingVisibilityController(
         events: events
     ))
@@ -627,36 +416,22 @@ import Testing
 }
 
 @MainActor
-@Test func staleApprovalBindingAutomaticallyReturnsToSessionSelection() async throws {
-    let events = EventRecorder()
-    let model = DeviceAppModel(
-        visibilityController: RecordingVisibilityController(events: events),
-        safetyMonitorFactory: { _ in RecordingSafetyMonitor(events: events) },
-        permissionsGranted: { true }
-    )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    let replacement = sessionCandidate(displayName: "Replacement")
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in throw StaleSessionBindingError() }
-    model.onRefreshSessionCandidates = { [replacement] }
+@Test func staleClaimBindingReturnsToSessionSelection() async throws {
+    let model = DeviceAppModel(permissionsGranted: { true })
+    let remote = sessionCandidate(displayName: "Stale")
+    model.onClaimSession = { _ in throw StaleSessionBindingError() }
 
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .selectingSession
-        || model.isRefreshingSessionCandidates
-    {
+    model.presentSessionCandidates([remote])
+    model.claimSession(remote)
+    for _ in 0 ..< 100 where model.state != .selectingSession {
         try await Task.sleep(for: .milliseconds(5))
     }
 
     #expect(model.state == .selectingSession)
-    #expect(model.approvalPresentation == nil)
-    #expect(model.sessionCandidates == [replacement])
-    #expect(model.failureMessage == nil)
+    #expect(model.selectedSession == nil)
+    #expect(model.failureCode == "session_binding_changed")
+    #expect(model.failureMessage != nil)
     #expect(model.failureRecovery == nil)
-    #expect(events.values().contains("restore"))
 }
 
 @MainActor
@@ -679,28 +454,8 @@ import Testing
 }
 
 @MainActor
-@Test func denyingApprovalReturnsToSessionList() async throws {
-    let model = DeviceAppModel(permissionsGranted: { true })
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.onDeny = { _ in }
-    model.onRefreshSessionCandidates = { [] }
-
-    model.deny()
-    for _ in 0 ..< 100 where model.state != .selectingSession {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-
-    #expect(model.state == .selectingSession)
-    #expect(model.completionMessage == "The device-control request was denied.")
-}
-
-@MainActor
 @Test func staleCandidateRefreshCannotOverwriteNewerResults() async throws {
-    let firstGate = ApprovalGate()
+    let firstGate = AsyncGate()
     let calls = EventRecorder()
     let stale = sessionCandidate(displayName: "Stale")
     let current = sessionCandidate(displayName: "Current")
@@ -768,10 +523,7 @@ import Testing
         try endModel.handleRuntimeEvent(.sessionEnded)
     }
     #expect(endModel.state == .failed)
-    #expect(endModel.approvalPresentation == nil)
-    #expect(endModel.applicationSelections.isEmpty)
-    #expect(endModel.clipboardSelections.isEmpty)
-    #expect(endModel.controlLevelSelections.isEmpty)
+    #expect(endModel.selectedSession == nil)
 }
 
 @MainActor
@@ -784,21 +536,25 @@ private func activatedModel(
         permissionsGranted: { true },
         controlNotifier: {}
     )
-    let browser = candidate(bundleIdentifier: "com.apple.Safari", requested: .viewOnly)
-    model.presentApproval(try ApprovalPresentation(
-        generation: 1,
-        applications: [browser]
-    ))
-    model.applicationSelections = [browser.id]
-    model.onApprove = { _ in }
-    model.allowForSession()
-    for _ in 0 ..< 100 where model.state != .active {
-        try await Task.sleep(for: .milliseconds(5))
-    }
+    model.onClaimSession = { _ in true }
+    try await claimAndWaitForActivation(model)
     return model
 }
 
-private actor ApprovalGate {
+@MainActor
+private func claimAndWaitForActivation(
+    _ model: DeviceAppModel,
+    candidate: BrokerSessionCandidate = sessionCandidate(displayName: "Workspace")
+) async throws {
+    model.presentSessionCandidates([candidate])
+    model.claimSession(candidate)
+    for _ in 0 ..< 100 where model.state != .active {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    #expect(model.state == .active)
+}
+
+private actor AsyncGate {
     private var continuation: CheckedContinuation<Void, Never>?
     private var released = false
 
@@ -870,21 +626,22 @@ private final class RecordingSafetyMonitor: SessionSafetyMonitoring {
     }
 }
 
-private func candidate(
-    bundleIdentifier: String,
-    requested: ControlLevel,
-    clipboardRequested: Bool = true
-) -> ApprovalCandidate {
-    ApprovalCandidate(
-        application: ApplicationIdentity(
-            bundleIdentifier: bundleIdentifier,
-            signingIdentifier: bundleIdentifier
-        ),
-        displayName: bundleIdentifier,
-        requestedControlLevel: requested,
-        classification: ApplicationPolicy.classify(bundleIdentifier: bundleIdentifier),
-        clipboardRequested: clipboardRequested
-    )
+@MainActor
+private final class FailingSafetyMonitor: SessionSafetyMonitoring {
+    private let events: EventRecorder
+
+    init(events: EventRecorder) {
+        self.events = events
+    }
+
+    func start() throws {
+        events.append("monitor")
+        throw DeviceAppFailure.transportUnavailable
+    }
+
+    func stop() {
+        events.append("stop-monitor")
+    }
 }
 
 private func sessionCandidate(displayName: String) -> BrokerSessionCandidate {

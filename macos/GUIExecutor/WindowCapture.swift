@@ -163,6 +163,12 @@ public enum CaptureFailure: Error, Equatable, Sendable {
     case invalidCaptureSize
     case encodingFailed
     case cropOutOfBounds
+    case applicationAmbiguous
+    case applicationNotFound
+    case applicationNotRunning
+    case protectedApplication
+    case applicationLaunchTimeout
+    case applicationLaunchResultUnknown
 
     public var diagnosticCode: String {
         switch self {
@@ -180,6 +186,12 @@ public enum CaptureFailure: Error, Equatable, Sendable {
         case .invalidCaptureSize: "invalid_capture_size"
         case .encodingFailed: "screenshot_png_encoding_failed"
         case .cropOutOfBounds: "zoom_region_out_of_bounds"
+        case .applicationAmbiguous: "ambiguous_application"
+        case .applicationNotFound: "application_not_found"
+        case .applicationNotRunning: "application_not_running"
+        case .protectedApplication: "protected_application"
+        case .applicationLaunchTimeout: "application_launch_timeout"
+        case .applicationLaunchResultUnknown: "application_launch_result_unknown"
         }
     }
 
@@ -188,19 +200,19 @@ public enum CaptureFailure: Error, Equatable, Sendable {
         case .screenRecordingPermissionMissing:
             "Mac screen recording permission is missing for Agent Remote Device."
         case .approvedApplicationNotFrontmost:
-            "The approved application is not the frontmost Mac application."
+            "The target application is not the frontmost Mac application."
         case .requestedApplicationNotApprovedOrAmbiguous:
-            "The requested application does not uniquely match a running approved application."
+            "The requested application does not uniquely match a running eligible application."
         case .approvedApplicationNotRunning:
-            "The approved application is not currently running on the Mac."
+            "The target application is not currently running on the Mac."
         case .applicationActivationRejected:
-            "macOS rejected the request to bring the approved application to the foreground."
+            "macOS rejected the request to bring the target application to the foreground."
         case .applicationActivationTimedOut:
-            "The approved application did not become frontmost within five seconds."
+            "The target application did not become frontmost within five seconds."
         case .signingIdentifierMismatch:
             "The frontmost application does not match the approved code identity."
         case .approvedWindowMissing:
-            "No visible window was found for the approved application."
+            "No visible window was found for the target application."
         case .displayMissing:
             "The approved window is not attached to an active display."
         case .operationTimedOut:
@@ -211,6 +223,18 @@ public enum CaptureFailure: Error, Equatable, Sendable {
             "The Mac screenshot could not be encoded as PNG."
         case .cropOutOfBounds:
             "The requested zoom region is outside the latest screenshot."
+        case .applicationAmbiguous:
+            "The application name matches more than one eligible GUI application. Use a Bundle ID."
+        case .applicationNotFound:
+            "No eligible installed GUI application matches the requested Bundle ID or name."
+        case .applicationNotRunning:
+            "The requested application is installed but is not currently running."
+        case .protectedApplication:
+            "The requested application is excluded from this device session."
+        case .applicationLaunchTimeout:
+            "The application did not expose an eligible window before the launch deadline."
+        case .applicationLaunchResultUnknown:
+            "macOS accepted the launch request, but the resulting application state could not be verified."
         }
     }
 }
@@ -306,11 +330,13 @@ public struct WindowCapture: Sendable {
     @MainActor
     public func context(
         application: ApplicationIdentity,
-        requiredWindowID: CGWindowID? = nil
+        requiredWindowID: CGWindowID? = nil,
+        requiredProcessID: pid_t? = nil
     ) async throws -> WindowContext {
         let resolved = try await resolve(
             application: application,
-            requiredWindowID: requiredWindowID
+            requiredWindowID: requiredWindowID,
+            requiredProcessID: requiredProcessID
         )
         return WindowContext(
             windowID: resolved.windowID,
@@ -328,7 +354,8 @@ public struct WindowCapture: Sendable {
     @MainActor
     private func resolve(
         application: ApplicationIdentity,
-        requiredWindowID: CGWindowID?
+        requiredWindowID: CGWindowID?,
+        requiredProcessID: pid_t? = nil
     ) async throws -> ResolvedWindow {
         guard application.bundleIdentifier != excludedBundleIdentifier else {
             throw CaptureFailure.applicationActivationRejected
@@ -339,13 +366,16 @@ public struct WindowCapture: Sendable {
         guard !running.isEmpty else {
             throw CaptureFailure.approvedApplicationNotRunning
         }
-        let matching = running.filter {
-            Self.signingIdentifier(for: $0) == application.signingIdentifier
-        }
-        guard !matching.isEmpty else {
-            throw CaptureFailure.signingIdentifierMismatch
-        }
-        let matchingProcessIDs = Set(matching.map(\.processIdentifier))
+        let matchingProcessIDs = try Self.matchingProcessIDs(
+            running.map {
+                (
+                    processID: $0.processIdentifier,
+                    signingIdentifier: Self.signingIdentifier(for: $0)
+                )
+            },
+            expectedSigningIdentifier: application.signingIdentifier,
+            requiredProcessID: requiredProcessID
+        )
         let content = try await Self.withOperationTimeout {
             // Approved full-screen windows can live on another Space while the user
             // keeps a terminal frontmost.
@@ -682,6 +712,26 @@ public struct WindowCapture: Sendable {
 
     private static func signingIdentifier(for application: NSRunningApplication) -> String? {
         RunningCodeIdentity.signingIdentifier(processID: application.processIdentifier)
+    }
+
+    static func matchingProcessIDs(
+        _ candidates: [(processID: pid_t, signingIdentifier: String?)],
+        expectedSigningIdentifier: String,
+        requiredProcessID: pid_t?
+    ) throws -> Set<pid_t> {
+        let eligible = candidates.filter {
+            requiredProcessID == nil || $0.processID == requiredProcessID
+        }
+        guard !eligible.isEmpty else {
+            throw CaptureFailure.approvedApplicationNotRunning
+        }
+        let matching = eligible.filter {
+            $0.signingIdentifier == expectedSigningIdentifier
+        }
+        guard !matching.isEmpty else {
+            throw CaptureFailure.signingIdentifierMismatch
+        }
+        return Set(matching.map(\.processID))
     }
 
     static func displayFingerprint(_ displays: [SCDisplay], selected: SCDisplay) -> String {

@@ -25,6 +25,11 @@ public enum ControlPlaneSessionStatus: String, Codable, Sendable {
     }
 }
 
+public enum ControlPlaneAuthorizationMode: String, Codable, Sendable {
+    case perApplicationApproval = "per_application_approval"
+    case sessionFullTrust = "session_full_trust"
+}
+
 public struct ControlPlaneDeviceSession: Codable, Equatable, Sendable {
     public let id: UUID
     public let userID: UUID
@@ -34,6 +39,9 @@ public struct ControlPlaneDeviceSession: Codable, Equatable, Sendable {
     public let platform: Platform
     public let status: ControlPlaneSessionStatus
     public let generation: UInt64
+    public let authorizationMode: ControlPlaneAuthorizationMode
+    public let authorizationPolicyVersion: UInt16
+    public let authorizedAt: Date?
     public let leaseUntil: Date?
     public let expiresAt: Date
     public let lockAcquiredAt: Date?
@@ -48,6 +56,9 @@ public struct ControlPlaneDeviceSession: Codable, Equatable, Sendable {
         case toolSessionID = "tool_session_id"
         case nodeID = "node_id"
         case platform, status, generation
+        case authorizationMode = "authorization_mode"
+        case authorizationPolicyVersion = "authorization_policy_version"
+        case authorizedAt = "authorized_at"
         case leaseUntil = "lease_until"
         case expiresAt = "expires_at"
         case lockAcquiredAt = "lock_acquired_at"
@@ -252,9 +263,13 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
 
     public func claim(
         toolSessionID: UUID,
+        deviceCapabilities: Set<String> = [capabilitySessionFullTrustV1],
         now: Date = Date()
     ) async throws -> ControlPlaneDeviceSession {
-        let claim = BrokerClaimRequest(toolSessionID: toolSessionID)
+        let claim = BrokerClaimRequest(
+            toolSessionID: toolSessionID,
+            deviceCapabilities: deviceCapabilities
+        )
         try claim.validate()
         let body = try JSONEncoder().encode(claim)
         let request = try makeRequest(
@@ -309,8 +324,12 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
         try validateSessionObject(item)
         let envelope = try decoder().decode(DeviceSessionEnvelope.self, from: data)
         try validate(envelope.data, now: now)
-        guard envelope.data.binding == session.binding,
-              envelope.data.status == .pendingUserApproval
+        guard sameIdentity(envelope.data, session),
+              (envelope.data.status == .pendingUserApproval
+                  && session.authorizationMode == .perApplicationApproval
+                  || envelope.data.status == .active
+                  && session.authorizationMode == .sessionFullTrust
+                  && envelope.data.leaseUntil.map({ $0 > now }) == true)
         else {
             throw NetworkBrokerControlPlaneFailure.bindingMismatch
         }
@@ -326,6 +345,7 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
         try validate(session, now: now)
         guard session.deviceID.uuidString.lowercased() == credential.deviceID,
               session.status == .pendingUserApproval,
+              session.authorizationMode == .perApplicationApproval,
               !approvals.isEmpty,
               approvals.count <= maximumInboxItems,
               approvals.allSatisfy({ $0.generation == session.generation }),
@@ -360,7 +380,7 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
         try validateSessionObject(item)
         let envelope = try decoder().decode(DeviceSessionEnvelope.self, from: data)
         try validate(envelope.data, now: now)
-        guard envelope.data.binding == session.binding else {
+        guard sameIdentity(envelope.data, session) else {
             throw NetworkBrokerControlPlaneFailure.bindingMismatch
         }
         switch result {
@@ -527,7 +547,7 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
             body: body,
             now: now
         )
-        guard updated.binding == session.binding,
+        guard sameIdentity(updated, session),
               updated.status == .active,
               updated.lockAcquiredAt != nil,
               let leaseUntil = updated.leaseUntil,
@@ -559,7 +579,7 @@ public struct NetworkBrokerControlPlaneClient: Sendable {
             body: body,
             now: now
         )
-        guard updated.binding == session.binding,
+        guard sameIdentity(updated, session),
               updated.status == .active,
               updated.lockAcquiredAt == session.lockAcquiredAt,
               let leaseUntil = updated.leaseUntil,
@@ -782,7 +802,8 @@ private func validateSessionObject(_ object: [String: Any]) throws {
     let expected = Set([
         "id", "user_id", "device_id", "tool_session_id", "node_id", "platform", "status",
         "generation", "lease_until", "expires_at", "lock_acquired_at", "stopped_at",
-        "stop_reason", "created_at",
+        "stop_reason", "created_at", "authorization_mode", "authorization_policy_version",
+        "authorized_at",
     ])
     guard exactKeys(object, expected) else {
         throw NetworkBrokerControlPlaneFailure.invalidResponse
@@ -844,6 +865,9 @@ private func validateCandidateObject(_ object: [String: Any]) throws {
 private func validate(_ session: ControlPlaneDeviceSession, now: Date) throws {
     guard session.platform == .macos,
           (1 ... maximumActiveDeviceSessionGeneration).contains(session.generation),
+          session.authorizationPolicyVersion == 1,
+          (session.authorizationMode == .sessionFullTrust) == (session.authorizedAt != nil),
+          session.authorizedAt.map({ $0 <= now.addingTimeInterval(maximumControlPlaneClockSkewSeconds) }) ?? true,
           session.expiresAt > now,
           session.createdAt <= session.expiresAt,
           session.stopReason.map({ $0.utf8.count <= 128 }) ?? true,
@@ -856,6 +880,8 @@ private func validate(_ session: ControlPlaneDeviceSession, now: Date) throws {
 private func validateTerminal(_ session: ControlPlaneDeviceSession, now: Date) throws {
     guard session.platform == .macos,
           (1 ... maximumDeviceSessionGeneration).contains(session.generation),
+          session.authorizationPolicyVersion == 1,
+          (session.authorizationMode == .sessionFullTrust) == (session.authorizedAt != nil),
           session.createdAt <= session.expiresAt,
           session.stoppedAt.map({ $0 <= now }) ?? false,
           session.stopReason.map({ $0.utf8.count <= 128 }) ?? false
@@ -874,4 +900,7 @@ private func sameIdentity(
         && lhs.toolSessionID == rhs.toolSessionID
         && lhs.nodeID == rhs.nodeID
         && lhs.platform == rhs.platform
+        && lhs.authorizationMode == rhs.authorizationMode
+        && lhs.authorizationPolicyVersion == rhs.authorizationPolicyVersion
+        && lhs.authorizedAt == rhs.authorizedAt
 }

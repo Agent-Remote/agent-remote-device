@@ -59,10 +59,17 @@ public actor GUIExecutorSessionController {
 
         let guardState = SessionGuard(generation: configuration.binding.generation)
         try await guardState.deviceConnected()
-        try await guardState.activate(
-            approvals: configuration.approvals,
-            leaseUntil: configuration.leaseUntil
-        )
+        if let authorization = configuration.authorization {
+            try await guardState.activateFullTrust(
+                authorizationGeneration: authorization.generation,
+                leaseUntil: configuration.leaseUntil
+            )
+        } else {
+            try await guardState.activate(
+                approvals: configuration.approvals,
+                leaseUntil: configuration.leaseUntil
+            )
+        }
         let runtime = await runtimeFactory(guardState)
         self.configuration = configuration
         self.guardState = guardState
@@ -114,7 +121,8 @@ public actor GUIExecutorSessionController {
                     message: failure.userMessage
                 )
             case .accessibilityPermissionMissing, .eventCreationFailed, .unsupportedKey,
-                 .clipboardContentUnavailable, .clipboardContentTooLarge:
+                 .clipboardEmpty, .clipboardNonText, .clipboardUnavailable, .clipboardTooLarge,
+                 .protectedSystemSurface:
                 return try failureResponse(
                     for: data,
                     code: failure.diagnosticCode,
@@ -158,6 +166,7 @@ public actor GUIExecutorSessionController {
               let guardState,
               renewed.binding == configuration.binding,
               renewed.approvals == configuration.approvals,
+              renewed.authorization == configuration.authorization,
               renewed.capabilities == configuration.capabilities,
               renewed.leaseUntil >= configuration.leaseUntil
         else {
@@ -469,14 +478,49 @@ public actor GUIExecutorSessionController {
                 message: "The request does not reference the current GUI state. Observe again."
             )
         }
+        if case .readClipboard = request.action, configuration.authorization != nil {
+            return try await performGlobalClipboard(
+                request: request,
+                currentState: currentState,
+                currentStateGeneration: currentStateGeneration,
+                currentScreenshotGeneration: currentScreenshotGeneration,
+                runtime: runtime
+            )
+        }
+        let launchesApplication: Bool = if case .launchApplication = request.action {
+            true
+        } else {
+            false
+        }
+        if launchesApplication, configuration.authorization == nil {
+            return try failureResponseV2(
+                request: request,
+                code: "unsupported_capability",
+                message: "Application launch requires a full-trust device session."
+            )
+        }
+        if launchesApplication,
+           ![ObservationMode.axFull, .both, .auto].contains(request.observation.mode)
+        {
+            return try failureResponseV2(
+                request: request,
+                code: "invalid_parameters",
+                message: "Application launch requires a full accessibility observation."
+            )
+        }
         let nextStateGeneration = try incremented(currentStateGeneration)
-        let approvedApplications = configuration.approvals.map(\.application)
+        var approvedApplications = configuration.approvals.map(\.application)
         let targetApplication: String? = switch request.action {
         case let .observe(application): application
+        case let .launchApplication(application): application
         default: nil
         }
 
-        let isObservationOnly: Bool = if case .observe = request.action { true } else { false }
+        let isObservationOnly: Bool = if case .observe = request.action {
+            true
+        } else {
+            launchesApplication
+        }
         let elementApplicationDigest: String? = switch request.action {
         case let .press(target),
              let .setValue(target, _),
@@ -491,10 +535,36 @@ public actor GUIExecutorSessionController {
             || request.observation.mode == .both
         var prefetchedCapture: CapturedWindow?
         var observationAuthorized = false
+        var sequenceAcceptedDuringDispatch = false
 
         var windowContext: WindowContext
         do {
-            if isObservationOnly, explicitlyRequestsImage {
+            if case let .launchApplication(application) = request.action,
+               let authorization = configuration.authorization
+            {
+                try await guardState.authorizeFullTrustAction(
+                    request.action,
+                    sequence: request.context.monotonicSequence
+                )
+                windowContext = try await runtime.launchApplication(
+                    application,
+                    excludedBundleIdentifiers: authorization.excludedBundleIdentifiers,
+                    deadline: min(
+                        request.leaseUntil,
+                        Date().addingTimeInterval(Self.windowContextRefreshTimeoutSeconds)
+                    )
+                )
+                try await guardState.accept(sequence: request.context.monotonicSequence)
+                sequenceAcceptedDuringDispatch = true
+                approvedApplications = [windowContext.application]
+            } else {
+                if let authorization = configuration.authorization, isObservationOnly {
+                    approvedApplications = [try await runtime.resolveApplication(
+                        targetApplication: targetApplication,
+                        excludedBundleIdentifiers: authorization.excludedBundleIdentifiers
+                    )]
+                }
+                if isObservationOnly, explicitlyRequestsImage {
                 try await guardState.authorizeScreenshot(
                     sequence: request.context.monotonicSequence
                 )
@@ -511,26 +581,40 @@ public actor GUIExecutorSessionController {
                 )
                 prefetchedCapture = capture
                 windowContext = capture.windowContext
-            } else if case .observe = request.action {
-                windowContext = try await runtime.windowContext(
-                    approvedApplications: approvedApplications,
-                    targetApplication: targetApplication,
-                    preferredWindowContexts: Array(windowContextsByApplication.values)
-                )
-            } else if let elementApplicationDigest,
-                      let elementContext = windowContextsByApplication[elementApplicationDigest]
-            {
-                windowContext = elementContext
-            } else if let latestWindowContext {
-                windowContext = latestWindowContext
-            } else {
-                return try failureResponseV2(
-                    request: request,
-                    code: "fresh_observation_required",
-                    message: "A successful observation is required before this action."
-                )
+                } else if case .observe = request.action {
+                    windowContext = try await runtime.windowContext(
+                        approvedApplications: approvedApplications,
+                        targetApplication: targetApplication,
+                        preferredWindowContexts: Array(windowContextsByApplication.values)
+                    )
+                } else if let elementApplicationDigest,
+                          let elementContext = windowContextsByApplication[elementApplicationDigest]
+                {
+                    windowContext = elementContext
+                } else if let latestWindowContext {
+                    windowContext = latestWindowContext
+                } else {
+                    return try failureResponseV2(
+                        request: request,
+                        code: "fresh_observation_required",
+                        message: "A successful observation is required before this action."
+                    )
+                }
+            }
+            if configuration.authorization != nil {
+                approvedApplications = [windowContext.application]
             }
         } catch let failure as CaptureFailure {
+            if launchesApplication,
+               failure == .applicationLaunchTimeout
+                   || failure == .applicationLaunchResultUnknown
+            {
+                return try await failClosedResponseV2(
+                    request: request,
+                    code: failure.diagnosticCode,
+                    message: failure.userMessage
+                )
+            }
             return try failureResponseV2(
                 request: request,
                 code: failure.diagnosticCode,
@@ -602,6 +686,8 @@ public actor GUIExecutorSessionController {
                     sequence: request.context.monotonicSequence,
                     context: windowContext
                 )
+            case .launchApplication:
+                break
             case .readClipboard:
                 let supportsClipboardPayload = configuration.supportsClipboardPayloadV2
                 let text = try await runtime.readClipboardV2(
@@ -726,7 +812,8 @@ public actor GUIExecutorSessionController {
                 )
             }
         }
-        let refreshBeforeSettle = mayChangeFrontmostWindow
+        let refreshBeforeSettle = !isObservationOnly
+            && mayChangeFrontmostWindow
             && request.observation.settle == .auto
         var settlePreparationForContext = settlePreparation
 
@@ -849,7 +936,7 @@ public actor GUIExecutorSessionController {
                         && Self.mayCloseOrReplaceWindow(request.action)
                 {
                     // An AX press or named action may have closed the bound
-                    // window. Re-resolve within the approved application once
+                    // window. Re-resolve within the target application once
                     // without forcing the stale window ID; a second failure
                     // remains terminal because the action already ran.
                     refreshed = try await Self.boundedWindowContext(
@@ -1081,7 +1168,7 @@ public actor GUIExecutorSessionController {
         try await guardState.recordState(stateContext)
         latestWindowContext = windowContext
         windowContextsByApplication[stateContext.applicationDigest] = windowContext
-        if isObservationOnly {
+        if isObservationOnly, !sequenceAcceptedDuringDispatch {
             try await guardState.accept(sequence: request.context.monotonicSequence)
         }
 
@@ -1106,6 +1193,54 @@ public actor GUIExecutorSessionController {
             throw DeviceIPCFailure.messageTooLarge
         }
         return encoded
+    }
+
+    private func performGlobalClipboard(
+        request: ActionRequestV2,
+        currentState: AccessibilityStateContext?,
+        currentStateGeneration: UInt64,
+        currentScreenshotGeneration: UInt64,
+        runtime: any GUIActionRuntime
+    ) async throws -> Data {
+        do {
+            let text = try await runtime.readGlobalClipboard(
+                sequence: request.context.monotonicSequence,
+                maximumBytes: maximumClipboardTextBytesV2
+            )
+            return try JSONEncoder().encode(ActionResponseV2(
+                requestID: request.requestID,
+                monotonicSequence: request.context.monotonicSequence,
+                stateGeneration: currentStateGeneration,
+                screenshotGeneration: currentScreenshotGeneration,
+                stateID: currentState?.stateID,
+                applicationDigest: currentState?.applicationDigest,
+                windowID: currentState?.windowID,
+                displayFingerprint: currentState?.displayFingerprint,
+                baseStateID: nil,
+                status: .success,
+                message: "Clipboard read.",
+                clipboard: text,
+                observation: nil,
+                settle: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
+                image: nil
+            ))
+        } catch let failure as ExecutionFailure {
+            return try failureResponseV2(
+                request: request,
+                code: failure.diagnosticCode,
+                message: failure.userMessage
+            )
+        } catch let failure as GuardFailure {
+            if let diagnostic = recoverableGuardFailureV2(failure) {
+                return try failureResponseV2(
+                    request: request,
+                    code: diagnostic.code,
+                    message: diagnostic.message
+                )
+            }
+            await failCurrentSession()
+            throw failure
+        }
     }
 
     private static func observation(
@@ -1284,7 +1419,7 @@ public actor GUIExecutorSessionController {
         case .controlLevelDenied:
             ("control_level_denied", "This session was not approved for the requested control level.")
         case .clipboardAccessDenied:
-            ("clipboard_access_denied", "Clipboard access was not approved for this application in the current session.")
+            ("clipboard_access_denied", "The current device session does not authorize clipboard access.")
         case .coordinateOutOfBounds:
             ("coordinate_out_of_bounds", "The coordinate is outside the model-visible screenshot.")
         case .invalidParameters:
@@ -1355,7 +1490,7 @@ public actor GUIExecutorSessionController {
         case .controlLevelDenied:
             ("control_level_denied", "This session was not approved for the requested control level.")
         case .clipboardAccessDenied:
-            ("clipboard_access_denied", "Clipboard access was not approved for this application in the current session.")
+            ("clipboard_access_denied", "The current device session does not authorize clipboard access.")
         case .coordinateOutOfBounds:
             ("coordinate_out_of_bounds", "The requested coordinate is outside the latest screenshot.")
         case .invalidParameters:

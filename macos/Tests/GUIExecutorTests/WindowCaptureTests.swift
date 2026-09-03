@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import DeviceProtocol
 import DeviceSecurity
@@ -6,6 +7,145 @@ import ImageIO
 import Testing
 import UniformTypeIdentifiers
 @testable import GUIExecutor
+
+@Test func dynamicApplicationResolutionRejectsAmbiguousAndExcludedTargets() async throws {
+    let first = InstalledApplicationTarget(
+        identity: ApplicationIdentity(
+            bundleIdentifier: "com.example.First",
+            signingIdentifier: "com.example.First"
+        ),
+        bundleURL: URL(fileURLWithPath: "/Applications/First.app")
+    )
+    let second = InstalledApplicationTarget(
+        identity: ApplicationIdentity(
+            bundleIdentifier: "com.example.Second",
+            signingIdentifier: "com.example.Second"
+        ),
+        bundleURL: URL(fileURLWithPath: "/Applications/Second.app")
+    )
+    #expect(throws: CaptureFailure.applicationAmbiguous) {
+        try ApplicationResolver.uniqueInstalledApplication([first, second])
+    }
+    let duplicateIdentity = InstalledApplicationTarget(
+        identity: first.identity,
+        bundleURL: URL(fileURLWithPath: "/Applications/First Copy.app")
+    )
+    #expect(throws: CaptureFailure.applicationAmbiguous) {
+        try ApplicationResolver.uniqueInstalledApplication([first, duplicateIdentity])
+    }
+    let samePath = try ApplicationResolver.uniqueInstalledApplication([first, first])
+    #expect(samePath.bundleURL == first.bundleURL)
+    #expect(throws: CaptureFailure.applicationNotFound) {
+        try ApplicationResolver.uniqueInstalledApplication([])
+    }
+    await #expect(throws: CaptureFailure.protectedApplication) {
+        try await MainActor.run {
+            try ApplicationResolver.installedApplication(
+                matching: "dev.agentremote.device",
+                excludedBundleIdentifiers: ["dev.agentremote.device"]
+            )
+        }
+    }
+    for bundleIdentifier in [
+        "com.apple.authorizationhost",
+        "com.apple.CoreServicesUIAgent",
+        "com.apple.loginwindow",
+        "com.apple.SecurityAgent",
+        "com.apple.UserConsentDialog",
+    ] {
+        await #expect(throws: CaptureFailure.protectedApplication) {
+            try await MainActor.run {
+                try ApplicationResolver.installedApplication(
+                    matching: bundleIdentifier,
+                    excludedBundleIdentifiers: []
+                )
+            }
+        }
+    }
+}
+
+@Test func dynamicApplicationResolutionExcludesBundleAndSigningIdentityNamespaces() {
+    let exclusions: Set<String> = ["dev.agentremote.device"]
+    #expect(ApplicationResolver.isExcluded(
+        ApplicationIdentity(
+            bundleIdentifier: "dev.agentremote.device.helper",
+            signingIdentifier: "com.example.Helper"
+        ),
+        exclusions: exclusions
+    ))
+    #expect(ApplicationResolver.isExcluded(
+        ApplicationIdentity(
+            bundleIdentifier: "com.example.Disguised",
+            signingIdentifier: "dev.agentremote.device.gui-executor"
+        ),
+        exclusions: exclusions
+    ))
+    #expect(!ApplicationResolver.isExcluded(
+        ApplicationIdentity(
+            bundleIdentifier: "com.example.Eligible",
+            signingIdentifier: "com.example.Eligible"
+        ),
+        exclusions: exclusions
+    ))
+}
+
+@Test func installedApplicationDiscoveryFindsNestedAppsAndFailsClosedAtItsBound() throws {
+    let manager = FileManager.default
+    let root = manager.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? manager.removeItem(at: root) }
+    let nested = root.appendingPathComponent("Vendor/Product.app", isDirectory: true)
+    let second = root.appendingPathComponent("Second.app", isDirectory: true)
+    try manager.createDirectory(at: nested, withIntermediateDirectories: true)
+    try manager.createDirectory(at: second, withIntermediateDirectories: true)
+
+    let applications = try ApplicationResolver.installedApplicationURLs(
+        in: [root],
+        maximumApplications: 2
+    )
+    #expect(Set(applications.map { $0.resolvingSymlinksInPath() }) == [
+        nested.resolvingSymlinksInPath(),
+        second.resolvingSymlinksInPath(),
+    ])
+    #expect(throws: CaptureFailure.applicationAmbiguous) {
+        try ApplicationResolver.installedApplicationURLs(
+            in: [root],
+            maximumApplications: 1
+        )
+    }
+}
+
+@Test func launchedWindowResolutionRequiresTheExactValidatedProcess() throws {
+    let candidates: [(processID: pid_t, signingIdentifier: String?)] = [
+        (101, "com.example.Target"),
+        (202, "com.example.Target"),
+        (303, "com.example.Other"),
+    ]
+    #expect(try WindowCapture.matchingProcessIDs(
+        candidates,
+        expectedSigningIdentifier: "com.example.Target",
+        requiredProcessID: nil
+    ) == [101, 202])
+    #expect(try WindowCapture.matchingProcessIDs(
+        candidates,
+        expectedSigningIdentifier: "com.example.Target",
+        requiredProcessID: 202
+    ) == [202])
+    #expect(throws: CaptureFailure.approvedApplicationNotRunning) {
+        try WindowCapture.matchingProcessIDs(
+            candidates,
+            expectedSigningIdentifier: "com.example.Target",
+            requiredProcessID: 404
+        )
+    }
+    #expect(throws: CaptureFailure.signingIdentifierMismatch) {
+        try WindowCapture.matchingProcessIDs(
+            candidates,
+            expectedSigningIdentifier: "com.example.Target",
+            requiredProcessID: 303
+        )
+    }
+}
 
 @Test @MainActor func captureOperationTimeoutReturnsWithoutWaitingForHungWork() async throws {
     let started = ContinuousClock.now
@@ -261,6 +401,78 @@ private func synchronouslyBlock(for seconds: Double) {
     for key in ["CMD+A", "CMD+TAB", "CMD+ALT+N", "N"] {
         #expect(!ActionExecutor.usesFrontmostHIDRouting(for: key))
     }
+}
+
+@Test @MainActor func secureInputBlocksInteractiveActionsButNotPassiveOperations() {
+    #expect(ActionExecutor.requiresSecureInputClear(.type("text")))
+    #expect(ActionExecutor.requiresSecureInputClear(.leftClick(Point(x: 1, y: 1))))
+    #expect(!ActionExecutor.requiresSecureInputClear(.wait(1)))
+    #expect(!ActionExecutor.requiresSecureInputClear(Action.readClipboard))
+
+    let target = ElementTarget(
+        stateID: UUID(),
+        stateGeneration: 1,
+        applicationDigest: String(repeating: "a", count: 64),
+        windowID: 1,
+        displayFingerprint: String(repeating: "b", count: 64),
+        elementIndex: 1
+    )
+    #expect(ActionExecutor.requiresSecureInputClear(.press(target)))
+    #expect(!ActionExecutor.requiresSecureInputClear(.observe(application: nil)))
+    #expect(!ActionExecutor.requiresSecureInputClear(.launchApplication("com.apple.TextEdit")))
+    #expect(!ActionExecutor.requiresSecureInputClear(ActionV2.readClipboard))
+    #expect(ExecutionFailure.protectedSystemSurface.diagnosticCode == "protected_system_surface")
+}
+
+@Test @MainActor func clipboardTextDistinguishesEmptyNonTextAndOversizedContent() throws {
+    let pasteboard = NSPasteboard(name: .init("device-tests-\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    #expect(throws: ExecutionFailure.clipboardEmpty) {
+        try ActionExecutor.clipboardText(from: pasteboard, maximumBytes: 64 * 1_024)
+    }
+
+    let binaryType = NSPasteboard.PasteboardType("dev.agentremote.tests.binary")
+    pasteboard.setData(Data([0x01]), forType: binaryType)
+    #expect(throws: ExecutionFailure.clipboardNonText) {
+        try ActionExecutor.clipboardText(from: pasteboard, maximumBytes: 64 * 1_024)
+    }
+
+    pasteboard.clearContents()
+    let unavailableItem = NSPasteboardItem()
+    let unavailableProvider = EmptyPasteboardProvider()
+    unavailableItem.setDataProvider(unavailableProvider, forTypes: [.string])
+    #expect(pasteboard.writeObjects([unavailableItem]))
+    #expect(throws: ExecutionFailure.clipboardUnavailable) {
+        try ActionExecutor.clipboardText(from: pasteboard, maximumBytes: 64 * 1_024)
+    }
+
+    pasteboard.clearContents()
+    #expect(pasteboard.setString("clipboard text", forType: .string))
+    #expect(try ActionExecutor.clipboardText(
+        from: pasteboard,
+        maximumBytes: 64 * 1_024
+    ) == "clipboard text")
+
+    pasteboard.clearContents()
+    #expect(pasteboard.setString("", forType: .string))
+    #expect(throws: ExecutionFailure.clipboardEmpty) {
+        try ActionExecutor.clipboardText(from: pasteboard, maximumBytes: 64 * 1_024)
+    }
+
+    pasteboard.clearContents()
+    #expect(pasteboard.setString("large", forType: .string))
+    #expect(throws: ExecutionFailure.clipboardTooLarge) {
+        try ActionExecutor.clipboardText(from: pasteboard, maximumBytes: 4)
+    }
+    pasteboard.clearContents()
+}
+
+private final class EmptyPasteboardProvider: NSObject, NSPasteboardItemDataProvider {
+    func pasteboard(
+        _: NSPasteboard?,
+        item _: NSPasteboardItem,
+        provideDataForType _: NSPasteboard.PasteboardType
+    ) {}
 }
 
 @Test func captureScalingPreservesAspectRatioWithoutUpscaling() {

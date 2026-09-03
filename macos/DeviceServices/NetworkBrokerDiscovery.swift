@@ -1,4 +1,5 @@
 import DeviceIPC
+import DeviceProtocol
 import DeviceSecurity
 import Foundation
 
@@ -41,17 +42,11 @@ public actor NetworkBrokerDiscoveryCoordinator {
             switch refreshed.status {
             case .pendingDevice:
                 let connected = try await client.markDeviceConnected(refreshed, now: now)
-                self.pendingSession = connected
-                return BrokerPendingSession(
-                    binding: connected.binding,
-                    expiresAt: connected.expiresAt
-                )
+                return try recordPendingRepresentation(connected)
             case .pendingUserApproval:
-                self.pendingSession = refreshed
-                return BrokerPendingSession(
-                    binding: refreshed.binding,
-                    expiresAt: refreshed.expiresAt
-                )
+                return try recordPendingRepresentation(refreshed)
+            case .active where refreshed.authorizationMode == .sessionFullTrust:
+                return try recordPendingRepresentation(refreshed)
             default:
                 self.pendingSession = nil
                 throw NetworkBrokerControlPlaneFailure.bindingMismatch
@@ -62,20 +57,14 @@ public actor NetworkBrokerDiscoveryCoordinator {
         if let active = inbox.first(where: { $0.status == .active }) {
             let pending = try await client.abort(active, reason: .disconnect, now: now)
             let connected = try await client.markDeviceConnected(pending, now: now)
-            pendingSession = connected
-            return BrokerPendingSession(binding: connected.binding, expiresAt: connected.expiresAt)
+            return try recordPendingRepresentation(connected)
         }
         if let awaitingApproval = inbox.first(where: { $0.status == .pendingUserApproval }) {
-            pendingSession = awaitingApproval
-            return BrokerPendingSession(
-                binding: awaitingApproval.binding,
-                expiresAt: awaitingApproval.expiresAt
-            )
+            return try recordPendingRepresentation(awaitingApproval)
         }
         guard let selected = inbox.first(where: { $0.status == .pendingDevice }) else { return nil }
         let connected = try await client.markDeviceConnected(selected, now: now)
-        pendingSession = connected
-        return BrokerPendingSession(binding: connected.binding, expiresAt: connected.expiresAt)
+        return try recordPendingRepresentation(connected)
     }
 
     public func sessionCandidates(now: Date = Date()) async throws -> [BrokerSessionCandidate] {
@@ -96,7 +85,11 @@ public actor NetworkBrokerDiscoveryCoordinator {
             pendingSession = nil
             _ = try await client.stop(session, now: now)
         }
-        let claimed = try await client.claim(toolSessionID: request.toolSessionID, now: now)
+        let claimed = try await client.claim(
+            toolSessionID: request.toolSessionID,
+            deviceCapabilities: request.deviceCapabilities,
+            now: now
+        )
         let credential = try credentialLoader.loadCredential(now: now)
         guard claimed.deviceID.uuidString.lowercased() == credential.deviceID
         else {
@@ -285,7 +278,9 @@ public actor NetworkBrokerDiscoveryCoordinator {
         return ExecutorSessionConfiguration(
             binding: renewed.binding,
             leaseUntil: leaseUntil,
-            approvals: configuration.approvals
+            approvals: configuration.approvals,
+            authorization: configuration.authorization,
+            capabilities: configuration.capabilities
         )
     }
 
@@ -318,6 +313,37 @@ public actor NetworkBrokerDiscoveryCoordinator {
         self.activeSession = nil
         let connected = try await client.markDeviceConnected(pending, now: now)
         pendingSession = connected
+        if let authorization = configuration.authorization {
+            guard connected.status == .active,
+                  connected.authorizationMode == .sessionFullTrust,
+                  connected.authorizationPolicyVersion == authorization.policyVersion,
+                  connected.authorizedAt == activeSession.authorizedAt,
+                  let leaseUntil = connected.leaseUntil
+            else {
+                throw NetworkBrokerControlPlaneFailure.bindingMismatch
+            }
+            let rotatedAuthorization = SessionAuthorization(
+                mode: authorization.mode,
+                policyVersion: authorization.policyVersion,
+                applicationScope: authorization.applicationScope,
+                controlLevel: authorization.controlLevel,
+                clipboardScope: authorization.clipboardScope,
+                applicationLaunch: authorization.applicationLaunch,
+                excludedBundleIdentifiers: authorization.excludedBundleIdentifiers,
+                generation: connected.generation
+            )
+            let replacement = ExecutorSessionConfiguration(
+                binding: connected.binding,
+                leaseUntil: leaseUntil,
+                approvals: [],
+                authorization: rotatedAuthorization,
+                capabilities: configuration.capabilities
+            )
+            try replacement.validate(now: now)
+            pendingSession = nil
+            self.activeSession = connected
+            return replacement
+        }
         let approvals = configuration.approvals.map {
             LocalApproval(
                 application: $0.application,
@@ -357,6 +383,61 @@ public actor NetworkBrokerDiscoveryCoordinator {
             transport: transport,
             now: now
         )
+    }
+
+    private func pendingRepresentation(
+        of session: ControlPlaneDeviceSession
+    ) throws -> BrokerPendingSession {
+        switch session.authorizationMode {
+        case .perApplicationApproval:
+            guard session.status == .pendingUserApproval else {
+                throw NetworkBrokerControlPlaneFailure.bindingMismatch
+            }
+            return BrokerPendingSession(binding: session.binding, expiresAt: session.expiresAt)
+        case .sessionFullTrust:
+            guard session.status == .active,
+                  session.authorizationPolicyVersion == 1,
+                  session.authorizedAt != nil,
+                  let leaseUntil = session.leaseUntil
+            else {
+                throw NetworkBrokerControlPlaneFailure.bindingMismatch
+            }
+            let authorization = SessionAuthorization(generation: session.generation)
+            let configuration = ExecutorSessionConfiguration(
+                binding: session.binding,
+                leaseUntil: leaseUntil,
+                approvals: [],
+                authorization: authorization,
+                capabilities: [
+                    capabilityObservationModeV2,
+                    capabilityAXStateV2,
+                    capabilityAdaptiveSettleV2,
+                    capabilityClipboardPayloadV2,
+                    capabilitySessionFullTrustV1,
+                    capabilityApplicationLaunchV1,
+                    capabilityGlobalClipboardV1,
+                ]
+            )
+            try configuration.validate()
+            return BrokerPendingSession(
+                binding: session.binding,
+                expiresAt: session.expiresAt,
+                activationConfiguration: configuration
+            )
+        }
+    }
+
+    private func recordPendingRepresentation(
+        _ session: ControlPlaneDeviceSession
+    ) throws -> BrokerPendingSession {
+        let pending = try pendingRepresentation(of: session)
+        if pending.activationConfiguration != nil {
+            activeSession = session
+            pendingSession = nil
+        } else {
+            pendingSession = session
+        }
+        return pending
     }
 
     private func verifyOutboundPolicy(

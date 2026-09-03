@@ -71,15 +71,22 @@ public struct DeviceSessionBinding: Codable, Equatable, Sendable {
 public struct BrokerPendingSession: Codable, Equatable, Sendable {
     public let binding: DeviceSessionBinding
     public let expiresAt: Date
+    public let activationConfiguration: ExecutorSessionConfiguration?
 
     enum CodingKeys: String, CodingKey {
         case binding
         case expiresAt = "expires_at"
+        case activationConfiguration = "activation_configuration"
     }
 
-    public init(binding: DeviceSessionBinding, expiresAt: Date) {
+    public init(
+        binding: DeviceSessionBinding,
+        expiresAt: Date,
+        activationConfiguration: ExecutorSessionConfiguration? = nil
+    ) {
         self.binding = binding
         self.expiresAt = expiresAt
+        self.activationConfiguration = activationConfiguration
     }
 
     public func validate(now: Date = Date()) throws {
@@ -88,6 +95,15 @@ public struct BrokerPendingSession: Codable, Equatable, Sendable {
               expiresAt > now
         else {
             throw DeviceIPCFailure.invalidMessage
+        }
+        if let activationConfiguration {
+            try activationConfiguration.validate(now: now)
+            guard activationConfiguration.binding == binding,
+                  activationConfiguration.leaseUntil <= expiresAt,
+                  activationConfiguration.authorization != nil
+            else {
+                throw DeviceIPCFailure.invalidMessage
+            }
         }
     }
 }
@@ -196,17 +212,27 @@ public struct BrokerSessionCandidateList: Codable, Equatable, Sendable {
 
 public struct BrokerClaimRequest: Codable, Equatable, Sendable {
     public let toolSessionID: UUID
+    public let deviceCapabilities: Set<String>
 
     enum CodingKeys: String, CodingKey {
         case toolSessionID = "tool_session_id"
+        case deviceCapabilities = "device_capabilities"
     }
 
-    public init(toolSessionID: UUID) {
+    public init(
+        toolSessionID: UUID,
+        deviceCapabilities: Set<String> = [capabilitySessionFullTrustV1]
+    ) {
         self.toolSessionID = toolSessionID
+        self.deviceCapabilities = deviceCapabilities
     }
 
     public func validate() throws {
-        guard toolSessionID != UUID() else { throw DeviceIPCFailure.invalidMessage }
+        guard toolSessionID != UUID(),
+              deviceCapabilities == [capabilitySessionFullTrustV1]
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
     }
 }
 
@@ -301,22 +327,107 @@ public struct BrokerRuntimeEvent: Codable, Equatable, Sendable {
     }
 }
 
+public enum SessionAuthorizationMode: String, Codable, Sendable {
+    case sessionFullTrust = "session_full_trust"
+}
+
+public enum SessionApplicationScope: String, Codable, Sendable {
+    case allUserGUIApplications = "all_user_gui_applications"
+}
+
+public enum SessionClipboardScope: String, Codable, Sendable {
+    case globalPlainText = "global_plain_text"
+}
+
+public enum SessionApplicationLaunch: String, Codable, Sendable {
+    case allowed
+}
+
+public struct SessionAuthorization: Codable, Equatable, Sendable {
+    public let mode: SessionAuthorizationMode
+    public let policyVersion: UInt16
+    public let applicationScope: SessionApplicationScope
+    public let controlLevel: ControlLevel
+    public let clipboardScope: SessionClipboardScope
+    public let applicationLaunch: SessionApplicationLaunch
+    public let excludedBundleIdentifiers: Set<String>
+    public let generation: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case mode, generation
+        case policyVersion = "policy_version"
+        case applicationScope = "application_scope"
+        case controlLevel = "control_level"
+        case clipboardScope = "clipboard_scope"
+        case applicationLaunch = "application_launch"
+        case excludedBundleIdentifiers = "excluded_bundle_identifiers"
+    }
+
+    public init(
+        mode: SessionAuthorizationMode = .sessionFullTrust,
+        policyVersion: UInt16 = 1,
+        applicationScope: SessionApplicationScope = .allUserGUIApplications,
+        controlLevel: ControlLevel = .fullControl,
+        clipboardScope: SessionClipboardScope = .globalPlainText,
+        applicationLaunch: SessionApplicationLaunch = .allowed,
+        excludedBundleIdentifiers: Set<String> = [
+            DeviceIPCServiceIdentifier.approvalUI,
+            DeviceIPCServiceIdentifier.networkBroker,
+            DeviceIPCServiceIdentifier.guiExecutor,
+        ],
+        generation: UInt64
+    ) {
+        self.mode = mode
+        self.policyVersion = policyVersion
+        self.applicationScope = applicationScope
+        self.controlLevel = controlLevel
+        self.clipboardScope = clipboardScope
+        self.applicationLaunch = applicationLaunch
+        self.excludedBundleIdentifiers = excludedBundleIdentifiers
+        self.generation = generation
+    }
+
+    public func validate() throws {
+        let requiredExclusions: Set<String> = [
+            DeviceIPCServiceIdentifier.approvalUI,
+            DeviceIPCServiceIdentifier.networkBroker,
+            DeviceIPCServiceIdentifier.guiExecutor,
+        ]
+        guard policyVersion == 1,
+              controlLevel == .fullControl,
+              (1 ... maximumActiveDeviceSessionGeneration).contains(generation),
+              requiredExclusions.isSubset(of: excludedBundleIdentifiers),
+              excludedBundleIdentifiers.count <= 16,
+              excludedBundleIdentifiers.allSatisfy({ identifier in
+                  !identifier.isEmpty
+                      && identifier.utf8.count <= 255
+                      && identifier == identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+                      && !identifier.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+              })
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+    }
+}
+
 public struct ExecutorSessionConfiguration: Codable, Equatable, Sendable {
     public let binding: DeviceSessionBinding
     public let leaseUntil: Date
     public let approvals: [LocalApproval]
+    public let authorization: SessionAuthorization?
     public let capabilities: Set<String>
 
     enum CodingKeys: String, CodingKey {
         case binding
         case leaseUntil = "lease_until"
-        case approvals, capabilities
+        case approvals, authorization, capabilities
     }
 
     public init(
         binding: DeviceSessionBinding,
         leaseUntil: Date,
         approvals: [LocalApproval],
+        authorization: SessionAuthorization? = nil,
         capabilities: Set<String> = [
             capabilityObservationModeV2,
             capabilityAXStateV2,
@@ -327,16 +438,32 @@ public struct ExecutorSessionConfiguration: Codable, Equatable, Sendable {
         self.binding = binding
         self.leaseUntil = leaseUntil
         self.approvals = approvals
+        self.authorization = authorization
         self.capabilities = capabilities
     }
 
     public func validate(now: Date = Date()) throws {
+        let validLegacyCapabilities = capabilities.isEmpty
+            || capabilities == Self.requiredV2Capabilities
+            || capabilities == Self.legacyV2Capabilities
+        let validLegacyAuthorization = authorization == nil
+            && !approvals.isEmpty
+            && approvals.count <= 32
+            && approvals.allSatisfy({ $0.generation == binding.generation })
+            && Set(approvals.map(\.application.stableDigest)).count == approvals.count
+            && validLegacyCapabilities
+        let validFullTrustAuthorization: Bool
+        if let authorization {
+            validFullTrustAuthorization = approvals.isEmpty
+                && authorization.generation == binding.generation
+                && supportsSessionFullTrust
+                && (try? authorization.validate()) != nil
+        } else {
+            validFullTrustAuthorization = false
+        }
         guard binding.hasActiveGeneration,
               leaseUntil > now,
-              !approvals.isEmpty,
-              approvals.count <= 32,
-              approvals.allSatisfy({ $0.generation == binding.generation }),
-              Set(approvals.map(\.application.stableDigest)).count == approvals.count,
+              validLegacyAuthorization || validFullTrustAuthorization,
               capabilities.isSubset(of: Self.knownCapabilities)
         else {
             throw DeviceIPCFailure.invalidMessage
@@ -351,15 +478,28 @@ public struct ExecutorSessionConfiguration: Codable, Equatable, Sendable {
         capabilities.contains(capabilityClipboardPayloadV2)
     }
 
+    public var supportsSessionFullTrust: Bool {
+        Self.requiredFullTrustCapabilities.isSubset(of: capabilities)
+    }
+
     private static let requiredV2Capabilities: Set<String> = [
         capabilityObservationModeV2,
         capabilityAXStateV2,
         capabilityAdaptiveSettleV2,
     ]
 
-    private static let knownCapabilities = requiredV2Capabilities.union([
+    private static let requiredFullTrustCapabilities = requiredV2Capabilities.union([
+        capabilityClipboardPayloadV2,
+        capabilitySessionFullTrustV1,
+        capabilityApplicationLaunchV1,
+        capabilityGlobalClipboardV1,
+    ])
+
+    private static let legacyV2Capabilities = requiredV2Capabilities.union([
         capabilityClipboardPayloadV2,
     ])
+
+    private static let knownCapabilities = requiredFullTrustCapabilities
 }
 
 private extension DeviceSessionBinding {

@@ -1,10 +1,9 @@
 # Device protocol
 
 Protocol v2 is implemented as a capability-gated extension. Protocol v1 remains
-the mandatory compatibility fallback and the default whenever either peer lacks
-one of the required v2 capabilities. New generations use v2 by default after
-general production release verification; operators retain a Server-side emergency
-switch that forces v1.
+the compatibility fallback only for explicit legacy `per_application_approval`
+sessions. `session_full_trust` generations require the complete capability set
+defined below and fail closed rather than silently changing authorization semantics.
 
 ## Protocol v1 compatibility
 
@@ -53,18 +52,18 @@ The authoritative machine-readable request schema is
 `protocol/schema/action-request-v1.schema.json`. Cross-language fixtures live in
 `protocol/test-vectors`.
 
-`read_clipboard` returns bounded plain text and never mutates the Mac clipboard.
-V1 requires a current screenshot; v2 requires the current verified
-application/window state. Both paths require that application's explicit
-per-session clipboard approval. A successful read consumes the action sequence
-but does not create an image or advance the screenshot generation. Missing,
-non-text, oversized, and unapproved clipboard content return concrete device
-errors without dropping the encrypted channel.
-On the compact v2 surface it requests observation mode `none`. When
-`clipboard_payload_v2` is negotiated, `message` remains a bounded status and the
-`clipboard` field carries at most 64 KiB of UTF-8 text. A peer without the optional
-extension retains the legacy `message` payload with a 4 KiB UTF-8 limit. The result
-also preserves the unchanged `state_id` and `state_generation`.
+In a full-trust generation, `read_clipboard` returns bounded global plain text and
+never mutates the Mac clipboard. It requires no application, capture, state ID,
+window ID, or prior observation. A successful read consumes the exact next action
+sequence but does not advance application state or screenshot generation. Empty,
+non-text, oversized, unavailable, and authorization-denied reads return concrete
+`clipboard_empty`, `clipboard_non_text`, `clipboard_too_large`, `clipboard_unavailable`,
+and `clipboard_access_denied` errors without exposing content in the error or dropping
+the encrypted channel.
+On the compact v2 surface it requests observation mode `none`. With both
+`global_clipboard_v1` and `clipboard_payload_v2` negotiated, `message` remains a
+bounded status and the `clipboard` field carries at most 64 KiB of UTF-8 text.
+Legacy sessions retain their existing application-bound behavior.
 Because a read cannot mutate GUI state, existing element indexes remain valid without
 another `observe`. AX nodes, screenshot metadata, and settle fields are intentionally
 omitted.
@@ -77,6 +76,59 @@ are capped at `9223372036854775806` and `9223372036854775807` is reserved for
 terminal revocation. Action-sequence and screenshot-generation counters never wrap
 or saturate. A counter at its unsigned 64-bit maximum fails the generation before
 another action is sent or executed.
+
+### Session authorization
+
+The App, Broker, and Executor exchange an explicit versioned authorization object:
+
+```json
+{
+  "mode": "session_full_trust",
+  "policy_version": 1,
+  "application_scope": "all_user_gui_applications",
+  "control_level": "full_control",
+  "clipboard_scope": "global_plain_text",
+  "application_launch": "allowed",
+  "excluded_bundle_identifiers": ["dev.agentremote.device"],
+  "generation": 1
+}
+```
+
+Every field is closed to unknown values and unknown or duplicate fields. The
+authorization is valid only for the complete context binding and exact generation
+carried by the enclosing activation request. Rotation may copy the same object
+with only `generation` advanced; it must not change policy version, scopes,
+exclusions, or absolute DeviceSession expiry. No action request, MCP argument,
+project setting, or Node-supplied value may construct or modify this object.
+
+### Launch application
+
+Protocol v2 adds this action only when `application_launch_v1` is negotiated:
+
+```json
+{
+  "type": "launch_application",
+  "application": "com.apple.TextEdit"
+}
+```
+
+After trimming leading and trailing whitespace, `application` must be non-empty,
+at most 255 characters and at most 255 UTF-8 bytes. Control characters, NUL, `/`,
+`~`, file or network URLs, shell fragments, arrays, arguments, environment values,
+and unknown fields are rejected. The value is resolved through LaunchServices as
+an exact Bundle ID or an exact case-insensitive display name. Multiple matches
+return `ambiguous_application`; an installed but non-running observation returns
+`application_not_running`. Device processes, helpers, non-GUI applications,
+invalid code identities, and protected system targets are always rejected.
+
+The Executor launches through `NSWorkspace`, never a shell, `/usr/bin/open`,
+AppleScript, URL scheme, or direct binary execution. It verifies the launched
+process identity, waits for a bounded first actionable window, returns its first
+full observation, and restores the prior foreground application when the user did
+not switch independently. Timeout returns `application_launch_timeout`. Launch is
+an interactive action with unknown-result semantics. Once macOS launch has been
+attempted, a timeout or unverifiable result fails the local generation closed; the
+proxy poisons that transport and never replays the action across a generation boundary.
 
 ## Protocol v2: structured, token-efficient observations
 
@@ -96,19 +148,25 @@ capabilities needed by a request. The implemented capability names are:
 observation_mode_v2
 ax_state_v2
 adaptive_settle_v2
+clipboard_payload_v2
+session_full_trust_v1
+application_launch_v1
+global_clipboard_v1
 ```
 
-Those three capabilities are the required v2 base. The optional
-`clipboard_payload_v2` extension moves successful clipboard content out of the
-bounded response status message and raises its UTF-8 byte limit from 4 KiB to
-64 KiB. It does not change clipboard approval or state-binding requirements.
+The first three capabilities are the v2 observation base. A full-trust generation
+requires all seven names: `clipboard_payload_v2` defines the 64 KiB response
+payload, `session_full_trust_v1` defines authorization semantics,
+`application_launch_v1` enables launch, and `global_clipboard_v1` removes the
+legacy application-state dependency.
 
-Unknown capabilities, a missing capability, or a version mismatch selects the
-complete v1 behavior. The fallback is not allowed to accept a v2 frame and ignore
-unknown observation fields. Existing managed contexts with no capability list are
-read as v1 and upgraded on renewal. The Server enables the complete supported set by
-default and may force the empty v1 set for emergency rollback; it never sends an
-incomplete required base.
+Legacy authorization accepts only an empty set for complete v1, the exact three-name
+observation base, or that base plus `clipboard_payload_v2`; it rejects and never
+exposes `session_full_trust_v1`, `application_launch_v1`, or `global_clipboard_v1`.
+For full trust, any unknown/missing capability or policy version mismatch rejects
+activation with `unsupported_capability`; launch and global clipboard must not be
+hidden to create a partially functional session. The fallback is never allowed to
+accept a v2 frame and ignore unknown fields.
 
 ### Request observation policy
 
@@ -132,7 +190,7 @@ bounded by compile-time limits on the device:
 }
 ```
 
-`none` suppresses model-facing observation data. It does not suppress approval,
+`none` suppresses model-facing observation data. It does not suppress authorization,
 application/window/display identity checks, monotonic sequence validation, lease
 validation, or post-action context verification. The Executor must separate
 window/context observation from pixel capture and image encoding so a `none` or
@@ -176,14 +234,14 @@ observation or GUI-mutating action advances `state_generation`; a successful v2
 `read_clipboard` preserves it. `screenshot_generation`
 advances only when a new image is returned to the model and becomes a valid
 coordinate source. `state_id` is generated inside the device boundary and binds
-the full session generation, approved application, selected window, display
+the full session generation, resolved application, selected window, display
 fingerprint, and state generation. It is not a credential and is never accepted
 across a turn resume or device generation.
 
 `state_generation` remains a session-wide monotonic response counter, while
-element freshness is scoped to the approved application identified by the
+element freshness is scoped to the resolved application identified by the
 opaque `state_id`. The proxy and Executor retain at most one latest AX binding
-per approved application. Observing or acting in application B therefore does
+per resolved application. Observing or acting in application B therefore does
 not invalidate the latest model-visible element indexes for application A.
 A newer state for A, an A window/display change, a turn boundary, or a device
 generation change still invalidates A's prior binding. The Executor never
@@ -195,9 +253,9 @@ actions and on failed responses. The proxy validates the 64 KiB UTF-8 byte bound
 before exposing the text and poisons the generation on an unexpected, missing,
 or unnegotiated clipboard payload.
 
-Passive observations, screenshots, waits, zooms, and approved clipboard reads
+Passive observations, screenshots, waits, zooms, and global clipboard reads
 resolve the exact signed process and window without activating it. Window capture
-includes approved windows on another Space so observing a full-screen browser does
+includes the resolved target window on another Space so observing a full-screen browser does
 not pull the user away from a terminal. Before interactive input against a retained
 background binding, the Executor records the user's current foreground process,
 activates the exact signed target, and waits until macOS reports it as frontmost.
@@ -232,7 +290,7 @@ Keyboard actions accept `Backspace` as an alias for `Delete`, the backtick key, 
 modifier-only keys including `Shift`, `Cmd`/`Command`/`Super`, `Ctrl`/`Control`, and
 `Alt`/`Option`. Modifier combinations continue to use `+`.
 Window-management shortcuts such as `Cmd+N` and `Cmd+grave` are sent through normal HID
-routing after the exact approved process is frontmost, so macOS can create or select
+routing after the exact resolved process is frontmost, so macOS can create or select
 the intended application window instead of treating the shortcut as a PID-local key.
 
 ### Bounded accessibility state and diffs
@@ -256,7 +314,7 @@ AX state.
 
 Secure text values, password contents, invisible sensitive values, unbounded web
 subtrees, and redundant wrapper nodes are omitted or redacted. AX URLs describe
-only the approved browser window; they do not create a general navigation API.
+only the resolved browser window; they do not create a general navigation API.
 
 The first observation for an application/window/display context is full. Later
 observations may return added, changed, and removed nodes relative to
@@ -294,7 +352,7 @@ level. A stale, foreign, missing, or non-actionable element fails with a concret
 error. The device never substitutes a same-named element, neighboring index, or
 coordinate click.
 
-`set_value` and text selection require full-control approval. Secure fields and
+`set_value` and text selection require active full-trust authorization. Secure fields and
 credentials subject to hand-off policy cannot be set through AX. Coordinate
 actions remain available as a fallback and continue to require the latest
 model-visible `screenshot_generation` and exact returned image dimensions.
@@ -310,7 +368,7 @@ string; it avoids empty-string JSON serialization failures in model clients.
 
 ### Adaptive settle and image profiles
 
-Automatic settling verifies that the approved application, window, and display
+Automatic settling verifies that the resolved application, window, and display
 remain stable, then samples bounded AX loading/busy state and normalized tree
 hashes. In browser windows the settle hash follows page identity, editable controls,
 loading indicators, and the leading decision-relevant page text; late lazy-loaded
@@ -377,8 +435,8 @@ deadline; the legacy protocol v1 capture remains PNG.
 
 ### MCP mapping and sequence helpers
 
-The compact v2 MCP surface is `observe`, `act`, `input_text`, and
-`read_clipboard`, enabled for the managed proxy with `--compact-tools`. Existing
+The compact v2 MCP surface is `observe`, `act`, `input_text`,
+`launch_application`, and `read_clipboard`, enabled for the managed proxy with `--compact-tools`. Existing
 v1 tools remain compatibility wrappers. `observe`
 defaults to `auto` and diff output; `act` prefers a state-bound element target and
 requests a screenshot only when accessibility state is insufficient.
@@ -390,7 +448,7 @@ result identifies the completed prefix. Transport failures with unknown executio
 status are never replayed automatically, and consequential final actions remain
 separate observation and confirmation points.
 
-`none` responses preserve the last model-visible AX diff base while the approved
+`none` responses preserve the last model-visible AX diff base while the resolved
 application, window, and display remain unchanged. This lets a deterministic
 `input_text` prefix omit intermediate observations and still return one final AX
 diff. A context change clears the base. Explicit `ax_full` requests always send a
@@ -472,15 +530,15 @@ sequence or screenshot generation.
 The Broker acknowledges `turn_stop` only after the Executor has released pressed
 input and restored the prior foreground application when the remotely activated
 target is still frontmost. It retains the
-generation, lease, approvals, action sequence, and machine lock in a paused local
+generation, lease, authorization, action sequence, and machine lock in a paused local
 turn state. The next authenticated device action is treated as the start of the
 next turn: before forwarding that action, the Broker synchronously asks the
-Approval UI to restart its safety monitors, then resumes the Executor. The
+session UI to restart its safety monitors, then resumes the Executor. The
 Executor requires that first action to be a fresh
 `screenshot`; stale coordinates cannot cross the turn boundary. These
 `turn_started`, `turn_stopped`, and `session_ended` messages are generation-bound
 local XPC events and are not accepted from Claude, MCP arguments, or projects.
-Every safety-critical Broker request to the Executor or Approval UI has a
+Every safety-critical Broker request to the Executor or session UI has a
 bounded local reply deadline. Cancellation, timeout, or a missing callback
 fails the current relay and triggers fail-closed recovery.
 
@@ -490,7 +548,7 @@ notifier mode. The notifier validates the hook event name, sends one bounded
 strict local frame, and waits for the authenticated remote acknowledgement.
 Claude also emits `SessionEnd` with `reason=clear` for `/clear` while the same
 process and MCP servers remain alive. The notifier maps only that reason to
-`turn_stop`, preserving the existing lease and approvals for the cleared
+`turn_stop`, preserving the existing lease and authorization for the cleared
 conversation. Other `SessionEnd` reasons remain `session_end`. Repeated
 `turn_stop` notifications are idempotent at the Broker.
 
@@ -508,11 +566,11 @@ invalid frame, binding failure, explicit stop, or Executor loss still ends the
 current local UI generation and follows the fail-closed abort path so hidden
 applications are restored. A scheduled or disconnect-recovery identity rotation
 does not end the existing user authorization: the device advances the control
-plane generation, rebinds the exact approved application identities, control
-levels, and clipboard flags to that generation, resets Executor state, and opens a
-fresh mutually authenticated relay. It never widens the approval set or extends
+plane generation, rebinds the exact authorization mode, policy version, and scopes
+to that generation, resets Executor state, and opens a fresh mutually authenticated
+relay. It never widens the authorization or extends
 the device session's absolute expiry. Rotation failure performs a best-effort
-Executor stop, authenticated control-plane abort, and Approval UI cleanup so the
+Executor stop, authenticated control-plane abort, and session UI cleanup so the
 next recovery requires an explicit current binding instead of silently reusing a
 partially rotated generation.
 

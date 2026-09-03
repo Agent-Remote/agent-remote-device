@@ -3,6 +3,24 @@ import Foundation
 import Security
 
 public enum RunningCodeIdentity {
+    public static func signingIdentifier(bundleURL: URL) -> String? {
+        guard bundleURL.isFileURL, bundleURL.pathExtension.lowercased() == "app" else {
+            return nil
+        }
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode) == errSecSuccess,
+              let staticCode,
+              SecStaticCodeCheckValidity(
+                  staticCode,
+                  SecCSFlags(rawValue: kSecCSStrictValidate),
+                  nil
+              ) == errSecSuccess
+        else {
+            return nil
+        }
+        return signingIdentifier(staticCode: staticCode)
+    }
+
     public static func signingIdentifier(processID: pid_t) -> String? {
         guard processID > 0 else { return nil }
         let attributes = [
@@ -31,6 +49,10 @@ public enum RunningCodeIdentity {
         else {
             return nil
         }
+        return signingIdentifier(staticCode: staticCode)
+    }
+
+    private static func signingIdentifier(staticCode: SecStaticCode) -> String? {
         var information: CFDictionary?
         guard SecCodeCopySigningInformation(
             staticCode,

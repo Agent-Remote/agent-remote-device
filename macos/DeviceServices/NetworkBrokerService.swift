@@ -142,11 +142,22 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         let reply = DataReply(reply)
         Task {
             do {
-                guard let pending = try await pendingSessionProvider() else {
+                guard var pending = try await pendingSessionProvider() else {
                     reply.resolve(data: nil, error: nil)
                     return
                 }
                 try pending.validate()
+                if let configuration = pending.activationConfiguration {
+                    let active = try await activateFullTrustConfiguration(
+                        configuration,
+                        requestID: UUID()
+                    )
+                    pending = BrokerPendingSession(
+                        binding: active.binding,
+                        expiresAt: pending.expiresAt,
+                        activationConfiguration: active
+                    )
+                }
                 let payload = try JSONEncoder().encode(pending)
                 let envelope = try DeviceIPCEnvelope(
                     requestID: UUID(),
@@ -201,8 +212,19 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         }
         Task {
             do {
-                let pending = try await claimProvider(claimRequest)
+                var pending = try await claimProvider(claimRequest)
                 try pending.validate()
+                if let configuration = pending.activationConfiguration {
+                    let active = try await activateFullTrustConfiguration(
+                        configuration,
+                        requestID: UUID()
+                    )
+                    pending = BrokerPendingSession(
+                        binding: active.binding,
+                        expiresAt: pending.expiresAt,
+                        activationConfiguration: active
+                    )
+                }
                 let payload = try JSONEncoder().encode(pending)
                 let envelope = try DeviceIPCEnvelope(
                     requestID: UUID(),
@@ -585,6 +607,80 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         return true
     }
 
+    private func activateFullTrustConfiguration(
+        _ configuration: ExecutorSessionConfiguration,
+        requestID: UUID
+    ) async throws -> ExecutorSessionConfiguration {
+        try configuration.validate()
+        guard configuration.authorization != nil,
+              configuration.approvals.isEmpty,
+              let activationIdentifier = beginActivation(configuration.binding)
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+        var activeConfiguration = configuration
+        var activationStage = "full_trust_executor_update"
+        do {
+            _ = try await updateExecutorSession(configuration, requestID: requestID)
+            let relay: any NetworkBrokerRelayRunning
+            activationStage = "full_trust_initial_relay_establishment"
+            guard isPendingActivation(
+                activationIdentifier,
+                binding: configuration.binding
+            ) else {
+                throw DeviceIPCFailure.serviceUnavailable
+            }
+            do {
+                relay = try await relayProvider(configuration)
+            } catch {
+                guard isPendingActivation(
+                    activationIdentifier,
+                    binding: configuration.binding
+                ) else {
+                    throw DeviceIPCFailure.serviceUnavailable
+                }
+                activationStage = "full_trust_initial_executor_stop"
+                await stopExecutorBestEffort(configuration.binding, reason: .disconnect)
+                activationStage = "full_trust_generation_rotation"
+                let replacement = try await rotationProvider(configuration)
+                try validateRotation(replacement, after: configuration)
+                guard replacement.authorization != nil,
+                      replacement.approvals.isEmpty,
+                      replacePendingActivation(
+                          activationIdentifier,
+                          from: configuration.binding,
+                          with: replacement.binding
+                      )
+                else {
+                    throw DeviceIPCFailure.serviceUnavailable
+                }
+                activeConfiguration = replacement
+                activationStage = "full_trust_replacement_executor_update"
+                _ = try await updateExecutorSession(replacement, requestID: requestID)
+                activationStage = "full_trust_replacement_relay_establishment"
+                relay = try await relayProvider(replacement)
+            }
+            activationStage = "full_trust_relay_activation"
+            guard startRelay(
+                relay,
+                configuration: activeConfiguration,
+                activationIdentifier: activationIdentifier
+            ) else {
+                relay.cancel()
+                throw DeviceIPCFailure.serviceUnavailable
+            }
+            return activeConfiguration
+        } catch {
+            clearPendingActivation(activationIdentifier)
+            logFullTrustActivationFailure(stage: activationStage)
+            await sendAbort(binding: activeConfiguration.binding, reason: .disconnect)
+            if let failure = error as? DeviceIPCFailure {
+                throw failure
+            }
+            throw DeviceIPCFailure.serviceUnavailable
+        }
+    }
+
     private func beginActivation(_ binding: DeviceSessionBinding) -> UUID? {
         lock.withLock {
             guard pendingActivation == nil, relayBinding == nil, relay == nil else { return nil }
@@ -755,9 +851,31 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
               replacement.binding.nodeID == previous.binding.nodeID,
               replacement.binding.platform == previous.binding.platform,
               replacement.binding.generation == previous.binding.generation + 1,
-              replacement.capabilities == previous.capabilities
+              replacement.capabilities == previous.capabilities,
+              sameAuthorizationScope(replacement.authorization, previous.authorization)
         else {
             throw DeviceIPCFailure.invalidMessage
+        }
+    }
+
+    private func sameAuthorizationScope(
+        _ replacement: SessionAuthorization?,
+        _ previous: SessionAuthorization?
+    ) -> Bool {
+        switch (replacement, previous) {
+        case (nil, nil):
+            return true
+        case let (.some(replacement), .some(previous)):
+            return replacement.mode == previous.mode
+                && replacement.policyVersion == previous.policyVersion
+                && replacement.applicationScope == previous.applicationScope
+                && replacement.controlLevel == previous.controlLevel
+                && replacement.clipboardScope == previous.clipboardScope
+                && replacement.applicationLaunch == previous.applicationLaunch
+                && replacement.excludedBundleIdentifiers == previous.excludedBundleIdentifiers
+                && replacement.generation == previous.generation + 1
+        default:
+            return false
         }
     }
 
@@ -783,6 +901,27 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
             logger.error("Session approval failed during relay activation")
         default:
             logger.error("Session approval failed at an unknown stage")
+        }
+    }
+
+    private func logFullTrustActivationFailure(stage: String) {
+        switch stage {
+        case "full_trust_executor_update":
+            logger.error("Full-trust activation failed during executor update")
+        case "full_trust_initial_relay_establishment":
+            logger.error("Full-trust activation failed during initial relay establishment")
+        case "full_trust_initial_executor_stop":
+            logger.error("Full-trust activation failed while stopping the initial executor")
+        case "full_trust_generation_rotation":
+            logger.error("Full-trust activation failed during generation rotation")
+        case "full_trust_replacement_executor_update":
+            logger.error("Full-trust activation failed during replacement executor update")
+        case "full_trust_replacement_relay_establishment":
+            logger.error("Full-trust activation failed during replacement relay establishment")
+        case "full_trust_relay_activation":
+            logger.error("Full-trust activation failed during relay activation")
+        default:
+            logger.error("Full-trust activation failed at an unknown stage")
         }
     }
 
@@ -1100,6 +1239,9 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
             let request = try ActionRequestV2.decodeStrict(envelope.payload)
             if case let .observe(application) = request.action {
                 return (application ?? singleApprovedTarget, true)
+            }
+            if case let .launchApplication(application) = request.action {
+                return (application, true)
             }
         default:
             throw DeviceIPCFailure.invalidMessage

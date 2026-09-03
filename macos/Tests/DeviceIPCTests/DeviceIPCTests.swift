@@ -107,6 +107,111 @@ import DeviceSecurity
     #expect(!configuration.supportsClipboardPayloadV2)
 }
 
+@Test func fullTrustConfigurationRequiresExplicitAuthorizationAndCompleteCapabilities() throws {
+    let sessionBinding = binding(generation: 7)
+    let completeCapabilities: Set<String> = [
+        capabilityObservationModeV2,
+        capabilityAXStateV2,
+        capabilityAdaptiveSettleV2,
+        capabilityClipboardPayloadV2,
+        capabilitySessionFullTrustV1,
+        capabilityApplicationLaunchV1,
+        capabilityGlobalClipboardV1,
+    ]
+    let authorization = SessionAuthorization(generation: sessionBinding.generation)
+    let configuration = ExecutorSessionConfiguration(
+        binding: sessionBinding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: [],
+        authorization: authorization,
+        capabilities: completeCapabilities
+    )
+
+    try configuration.validate()
+    #expect(configuration.supportsSessionFullTrust)
+
+    let incomplete = ExecutorSessionConfiguration(
+        binding: sessionBinding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: [],
+        authorization: authorization,
+        capabilities: completeCapabilities.subtracting([capabilityGlobalClipboardV1])
+    )
+    #expect(throws: DeviceIPCFailure.invalidMessage) {
+        try incomplete.validate()
+    }
+
+    let widenedPolicy = ExecutorSessionConfiguration(
+        binding: sessionBinding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: [],
+        authorization: SessionAuthorization(
+            policyVersion: 2,
+            generation: sessionBinding.generation
+        ),
+        capabilities: completeCapabilities
+    )
+    #expect(throws: DeviceIPCFailure.invalidMessage) {
+        try widenedPolicy.validate()
+    }
+}
+
+@Test func fullTrustConfigurationRejectsLegacyCapabilityMixesAndMissingDeviceExclusions() throws {
+    let sessionBinding = binding(generation: 4)
+    let completeCapabilities: Set<String> = [
+        capabilityObservationModeV2,
+        capabilityAXStateV2,
+        capabilityAdaptiveSettleV2,
+        capabilityClipboardPayloadV2,
+        capabilitySessionFullTrustV1,
+        capabilityApplicationLaunchV1,
+        capabilityGlobalClipboardV1,
+    ]
+    let legacyApproval = LocalApproval(
+        application: ApplicationIdentity(
+            bundleIdentifier: "com.example.fixture",
+            signingIdentifier: "com.example.fixture"
+        ),
+        controlLevel: .fullControl,
+        clipboardAllowed: true,
+        generation: sessionBinding.generation
+    )
+    let mixed = ExecutorSessionConfiguration(
+        binding: sessionBinding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: [legacyApproval],
+        authorization: SessionAuthorization(generation: sessionBinding.generation),
+        capabilities: completeCapabilities
+    )
+    #expect(throws: DeviceIPCFailure.invalidMessage) {
+        try mixed.validate()
+    }
+
+    let legacyWithFullTrustCapabilities = ExecutorSessionConfiguration(
+        binding: sessionBinding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: [legacyApproval],
+        capabilities: completeCapabilities
+    )
+    #expect(throws: DeviceIPCFailure.invalidMessage) {
+        try legacyWithFullTrustCapabilities.validate()
+    }
+
+    let missingExclusions = ExecutorSessionConfiguration(
+        binding: sessionBinding,
+        leaseUntil: Date().addingTimeInterval(60),
+        approvals: [],
+        authorization: SessionAuthorization(
+            excludedBundleIdentifiers: [DeviceIPCServiceIdentifier.approvalUI],
+            generation: sessionBinding.generation
+        ),
+        capabilities: completeCapabilities
+    )
+    #expect(throws: DeviceIPCFailure.invalidMessage) {
+        try missingExclusions.validate()
+    }
+}
+
 @Test func ipcDecoderRejectsDuplicateAndUnknownFieldsAtEveryLevel() throws {
     let requestID = UUID()
     let encoded = try DeviceIPCEnvelope(

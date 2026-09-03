@@ -117,6 +117,8 @@ private func validV2ActionKeys(_ action: [String: Any]) -> Bool {
         return keys == ["type", "target", "direction", "pages"]
     case "secondary_action":
         return keys == ["type", "target", "action_name"]
+    case "launch_application":
+        return keys == ["type", "application"]
     case "read_clipboard":
         return keys == ["type"]
     default:

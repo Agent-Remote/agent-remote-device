@@ -10,6 +10,9 @@ pub const CAPABILITY_OBSERVATION_MODE_V2: &str = "observation_mode_v2";
 pub const CAPABILITY_AX_STATE_V2: &str = "ax_state_v2";
 pub const CAPABILITY_ADAPTIVE_SETTLE_V2: &str = "adaptive_settle_v2";
 pub const CAPABILITY_CLIPBOARD_PAYLOAD_V2: &str = "clipboard_payload_v2";
+pub const CAPABILITY_SESSION_FULL_TRUST_V1: &str = "session_full_trust_v1";
+pub const CAPABILITY_APPLICATION_LAUNCH_V1: &str = "application_launch_v1";
+pub const CAPABILITY_GLOBAL_CLIPBOARD_V1: &str = "global_clipboard_v1";
 
 pub const MAX_AX_NODES: u16 = 800;
 pub const MAX_AX_DEPTH: u8 = 20;
@@ -170,6 +173,9 @@ pub enum ActionV2 {
         target: ElementTarget,
         action_name: String,
     },
+    LaunchApplication {
+        application: String,
+    },
     ReadClipboard,
 }
 
@@ -210,6 +216,7 @@ impl ActionV2 {
                 target,
                 action_name,
             } => target.validate() && valid_bounded_text(action_name, 128),
+            Self::LaunchApplication { application } => valid_application_specifier(application),
             Self::ReadClipboard => true,
         }
     }
@@ -230,6 +237,17 @@ fn valid_bounded_text(value: &str, maximum_characters: usize) -> bool {
         && value.chars().count() <= maximum_characters
         && value.trim() == value
         && !value.chars().any(char::is_control)
+}
+
+fn valid_application_specifier(value: &str) -> bool {
+    valid_bounded_text(value, 255)
+        && value.len() <= 255
+        && !value.chars().any(|character| {
+            matches!(
+                character,
+                '/' | ':' | '~' | ';' | '|' | '&' | '$' | '<' | '>' | '`' | '\\'
+            )
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -557,6 +575,46 @@ mod tests {
         assert_eq!(request.context.monotonic_sequence, 8);
         assert!(request.observation.validate());
         assert!(request.action.validate_parameters());
+    }
+
+    #[test]
+    fn swift_launch_vector_decodes_strictly() {
+        let raw = include_str!("../../protocol/test-vectors/action-request-v2-launch-valid.json");
+        let request: ActionRequestV2 = serde_json::from_str(raw).expect("valid launch fixture");
+        assert_eq!(
+            request.action,
+            ActionV2::LaunchApplication {
+                application: "com.apple.TextEdit".to_owned(),
+            }
+        );
+        assert!(request.action.validate_parameters());
+    }
+
+    #[test]
+    fn launch_rejects_paths_urls_shell_fragments_and_byte_overflow() {
+        let invalid_raw =
+            include_str!("../../protocol/test-vectors/action-request-v2-launch-invalid.json");
+        let invalid_request: ActionRequestV2 = serde_json::from_str(invalid_raw)
+            .expect("structurally decodable invalid launch fixture");
+        assert!(!invalid_request.action.validate_parameters());
+
+        for application in [
+            "/Applications/TextEdit.app",
+            "file:///Applications/TextEdit.app",
+            "https://example.test/app",
+            "TextEdit;whoami",
+            "TextEdit$(whoami)",
+            "TextEdit --args/value",
+        ] {
+            assert!(!ActionV2::LaunchApplication {
+                application: application.to_owned(),
+            }
+            .validate_parameters());
+        }
+        assert!(!ActionV2::LaunchApplication {
+            application: "界".repeat(86),
+        }
+        .validate_parameters());
     }
 
     #[test]

@@ -81,6 +81,7 @@ public actor SessionGuard {
 
     private var leaseUntil: Date?
     private var approvals: [String: LocalApproval] = [:]
+    private var fullTrustGeneration: UInt64?
     private var statesByApplication: [String: AccessibilityStateContext] = [:]
 
     public init(generation: UInt64 = 1, nextSequence: UInt64 = 1) {
@@ -118,6 +119,19 @@ public actor SessionGuard {
         state = .active
     }
 
+    public func activateFullTrust(authorizationGeneration: UInt64, leaseUntil: Date) throws {
+        guard state == .pendingUserApproval,
+              leaseUntil > Date(),
+              authorizationGeneration == generation
+        else {
+            throw GuardFailure.invalidState
+        }
+        approvals.removeAll(keepingCapacity: false)
+        fullTrustGeneration = authorizationGeneration
+        self.leaseUntil = leaseUntil
+        state = .active
+    }
+
     public func renewLease(until value: Date, now: Date = Date()) throws {
         try requireActive(now: now)
         guard let leaseUntil, value >= leaseUntil, value > now else {
@@ -131,7 +145,7 @@ public actor SessionGuard {
         guard context.generation > (currentScreenshot?.generation ?? 0) else {
             throw GuardFailure.staleScreenshot
         }
-        guard let approval = approvals[context.applicationDigest], approval.generation == generation else {
+        guard isApplicationAuthorized(context.applicationDigest) else {
             throw GuardFailure.approvalMissing
         }
         currentScreenshot = context
@@ -142,7 +156,7 @@ public actor SessionGuard {
         guard context.stateGeneration > (currentState?.stateGeneration ?? 0) else {
             throw GuardFailure.staleState
         }
-        guard let approval = approvals[context.applicationDigest], approval.generation == generation else {
+        guard isApplicationAuthorized(context.applicationDigest) else {
             throw GuardFailure.approvalMissing
         }
         currentState = context
@@ -185,13 +199,17 @@ public actor SessionGuard {
         }
         let digest = application.stableDigest
         guard screenshot.applicationDigest == digest else { throw GuardFailure.applicationChanged }
-        guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
-        guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
-        if action == .readClipboard, !approval.clipboardAllowed {
-            throw GuardFailure.clipboardAccessDenied
-        }
-        guard approval.controlLevel >= requiredLevel(for: action) else {
-            throw GuardFailure.controlLevelDenied
+        if !hasFullTrust {
+            guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
+            guard approval.generation == generation else {
+                throw GuardFailure.approvalFromPriorGeneration
+            }
+            if action == .readClipboard, !approval.clipboardAllowed {
+                throw GuardFailure.clipboardAccessDenied
+            }
+            guard approval.controlLevel >= requiredLevel(for: action) else {
+                throw GuardFailure.controlLevelDenied
+            }
         }
         guard coordinatesFit(action, width: screenshot.pixelWidth, height: screenshot.pixelHeight) else {
             throw GuardFailure.coordinateOutOfBounds
@@ -225,10 +243,14 @@ public actor SessionGuard {
         guard state.windowID == windowID else { throw GuardFailure.windowChanged }
         let digest = application.stableDigest
         guard state.applicationDigest == digest else { throw GuardFailure.applicationChanged }
-        guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
-        guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
-        guard approval.controlLevel >= requiredLevel(for: action) else {
-            throw GuardFailure.controlLevelDenied
+        if !hasFullTrust {
+            guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
+            guard approval.generation == generation else {
+                throw GuardFailure.approvalFromPriorGeneration
+            }
+            guard approval.controlLevel >= requiredLevel(for: action) else {
+                throw GuardFailure.controlLevelDenied
+            }
         }
     }
 
@@ -259,10 +281,14 @@ public actor SessionGuard {
         guard state.windowID == windowID else { throw GuardFailure.windowChanged }
         let digest = application.stableDigest
         guard state.applicationDigest == digest else { throw GuardFailure.applicationChanged }
-        guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
-        guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
-        guard approval.controlLevel >= requiredLevel(for: action) else {
-            throw GuardFailure.controlLevelDenied
+        if !hasFullTrust {
+            guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
+            guard approval.generation == generation else {
+                throw GuardFailure.approvalFromPriorGeneration
+            }
+            guard approval.controlLevel >= requiredLevel(for: action) else {
+                throw GuardFailure.controlLevelDenied
+            }
         }
     }
 
@@ -289,9 +315,42 @@ public actor SessionGuard {
         guard state.windowID == windowID else { throw GuardFailure.windowChanged }
         let digest = application.stableDigest
         guard state.applicationDigest == digest else { throw GuardFailure.applicationChanged }
-        guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
-        guard approval.generation == generation else { throw GuardFailure.approvalFromPriorGeneration }
-        guard approval.clipboardAllowed else { throw GuardFailure.clipboardAccessDenied }
+        if !hasFullTrust {
+            guard let approval = approvals[digest] else { throw GuardFailure.approvalMissing }
+            guard approval.generation == generation else {
+                throw GuardFailure.approvalFromPriorGeneration
+            }
+            guard approval.clipboardAllowed else { throw GuardFailure.clipboardAccessDenied }
+        }
+    }
+
+    public func authorizeGlobalClipboard(sequence: UInt64, now: Date = Date()) throws {
+        try requireActive(now: now)
+        guard sequence == nextSequence else { throw GuardFailure.sequenceMismatch }
+        guard nextSequence < UInt64.max else {
+            failClosed()
+            throw GuardFailure.counterExhausted
+        }
+        guard hasFullTrust else { throw GuardFailure.clipboardAccessDenied }
+    }
+
+    public func authorizeFullTrustAction(
+        _ action: ActionV2,
+        sequence: UInt64,
+        now: Date = Date()
+    ) throws {
+        try requireActive(now: now)
+        guard sequence == nextSequence else { throw GuardFailure.sequenceMismatch }
+        guard nextSequence < UInt64.max else {
+            failClosed()
+            throw GuardFailure.counterExhausted
+        }
+        guard hasFullTrust, action.hasValidParameters else {
+            throw GuardFailure.controlLevelDenied
+        }
+        guard case .launchApplication = action else {
+            throw GuardFailure.invalidParameters
+        }
     }
 
     public func accept(sequence: UInt64) throws {
@@ -317,6 +376,7 @@ public actor SessionGuard {
         guard value == next else { throw GuardFailure.generationMismatch }
         generation = value
         approvals.removeAll(keepingCapacity: false)
+        fullTrustGeneration = nil
         currentScreenshot = nil
         currentState = nil
         statesByApplication.removeAll(keepingCapacity: false)
@@ -326,6 +386,7 @@ public actor SessionGuard {
 
     public func failClosed() {
         approvals.removeAll(keepingCapacity: false)
+        fullTrustGeneration = nil
         currentScreenshot = nil
         currentState = nil
         statesByApplication.removeAll(keepingCapacity: false)
@@ -338,11 +399,20 @@ public actor SessionGuard {
         guard let leaseUntil, leaseUntil > now else {
             state = .expired
             self.leaseUntil = nil
+            fullTrustGeneration = nil
             currentScreenshot = nil
             currentState = nil
             statesByApplication.removeAll(keepingCapacity: false)
             throw GuardFailure.leaseExpired
         }
+    }
+
+    private var hasFullTrust: Bool {
+        fullTrustGeneration == generation
+    }
+
+    private func isApplicationAuthorized(_ digest: String) -> Bool {
+        hasFullTrust || approvals[digest]?.generation == generation
     }
 
     private func requiredLevel(for action: Action) -> ControlLevel {
@@ -364,7 +434,7 @@ public actor SessionGuard {
             requiredLevel(for: action)
         case .press, .scrollElement, .secondaryAction:
             .clickOnly
-        case .setValue, .selectText:
+        case .setValue, .selectText, .launchApplication:
             .fullControl
         }
     }

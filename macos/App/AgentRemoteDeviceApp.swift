@@ -36,7 +36,6 @@ struct AgentRemoteDeviceApp: App {
         configureModelHandlers()
         var connectedPreviously = false
         var connectedGeneration: UInt64?
-        var presentedBinding: DeviceSessionBinding?
         while !Task.isCancelled {
             if model.state == .reconnecting {
                 try? await Task.sleep(for: .milliseconds(500))
@@ -61,7 +60,6 @@ struct AgentRemoteDeviceApp: App {
                 continue
             }
             if let connectedGeneration, connectedGeneration != currentGeneration {
-                presentedBinding = nil
                 model.failIfInfrastructureUnavailable(false)
             }
             connectedGeneration = currentGeneration
@@ -72,7 +70,7 @@ struct AgentRemoteDeviceApp: App {
             model.recoverAfterInfrastructureReconnect()
 
             do {
-                try await synchronizeBrokerState(presentedBinding: &presentedBinding)
+                try await synchronizeBrokerState()
             } catch {
                 brokerLogger.error("Broker synchronization failed")
                 model.reportSessionDiscoveryFailure(error)
@@ -83,17 +81,11 @@ struct AgentRemoteDeviceApp: App {
 
     @MainActor
     private func configureModelHandlers() {
-        model.onApprove = { approvals in
-            try await broker.approve(approvals)
-        }
         model.onRefreshSessionCandidates = {
             try await broker.sessionCandidates()
         }
         model.onClaimSession = { toolSessionID in
             try await broker.claimSession(toolSessionID: toolSessionID)
-        }
-        model.onDeny = { approvals in
-            try await broker.deny(approvals)
         }
         model.onAbort = { reason in
             let brokerReason: BrokerAbortReason = switch reason {
@@ -115,35 +107,22 @@ struct AgentRemoteDeviceApp: App {
     }
 
     @MainActor
-    private func synchronizeBrokerState(
-        presentedBinding: inout DeviceSessionBinding?
-    ) async throws {
+    private func synchronizeBrokerState() async throws {
         model.enforceCurrentPermissions()
         switch model.state {
         case .selectingSession:
             guard !model.isRefreshingSessionCandidates else { return }
             let candidates = try await broker.sessionCandidates()
             model.presentSessionCandidates(candidates)
-        case .ready, .paused, .stopped, .denied:
-            if let pending = try await broker.pollPendingSession() {
-                if pending.binding != presentedBinding {
-                    let presentation = try LocalApplicationDiscovery.approvalPresentation(
-                        generation: pending.binding.generation
-                    )
-                    model.presentApproval(presentation)
-                    presentedBinding = pending.binding
-                }
-            } else {
-                presentedBinding = nil
-                let candidates = try await broker.sessionCandidates()
-                model.presentSessionCandidates(candidates)
-            }
+        case .ready, .stopped:
+            let candidates = try await broker.sessionCandidates()
+            model.presentSessionCandidates(candidates)
         case .permissionRequired:
-            if model.approvalPresentation == nil, model.sessionCandidates.isEmpty {
+            if model.sessionCandidates.isEmpty {
                 let candidates = try await broker.sessionCandidates()
                 model.presentSessionCandidates(candidates)
             }
-        case .claimingSession, .awaitingApproval, .activating, .active, .pausing,
+        case .claimingSession, .activating, .active, .pausing, .paused,
              .endingSession, .reconnecting, .failed:
             break
         }

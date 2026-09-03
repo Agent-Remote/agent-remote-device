@@ -63,6 +63,44 @@ import Testing
     }
 }
 
+@Test func decodesCrossLanguageLaunchVectorAndRejectsUnsafeSpecifiers() throws {
+    let url = try #require(Bundle.module.url(
+        forResource: "action-request-v2-launch-valid",
+        withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let data = try Data(contentsOf: url)
+    let request = try ActionRequestV2.decodeStrict(data)
+    #expect(request.action == .launchApplication("com.apple.TextEdit"))
+
+    var object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    for application in [
+        "/Applications/TextEdit.app",
+        "file:///Applications/TextEdit.app",
+        "https://example.test/app",
+        "TextEdit;whoami",
+        "TextEdit$(whoami)",
+        String(repeating: "界", count: 86),
+    ] {
+        object["action"] = [
+            "type": "launch_application",
+            "application": application,
+        ]
+        #expect(throws: (any Error).self) {
+            try ActionRequestV2.decodeStrict(JSONSerialization.data(withJSONObject: object))
+        }
+    }
+
+    object["action"] = [
+        "type": "launch_application",
+        "application": "TextEdit",
+        "arguments": ["--unsafe"],
+    ]
+    #expect(throws: ActionRequestDecodingFailure.invalidStructure) {
+        try ActionRequestV2.decodeStrict(JSONSerialization.data(withJSONObject: object))
+    }
+}
+
 @Test func decodesCrossLanguageV2ResponseVector() throws {
     let url = try #require(Bundle.module.url(
         forResource: "action-response-v2-valid",

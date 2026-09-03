@@ -5,6 +5,9 @@ public let capabilityObservationModeV2 = "observation_mode_v2"
 public let capabilityAXStateV2 = "ax_state_v2"
 public let capabilityAdaptiveSettleV2 = "adaptive_settle_v2"
 public let capabilityClipboardPayloadV2 = "clipboard_payload_v2"
+public let capabilitySessionFullTrustV1 = "session_full_trust_v1"
+public let capabilityApplicationLaunchV1 = "application_launch_v1"
+public let capabilityGlobalClipboardV1 = "global_clipboard_v1"
 
 public let maximumAXNodes: UInt16 = 800
 public let maximumAXDepth: UInt8 = 20
@@ -16,6 +19,7 @@ public let defaultAXNodes: UInt16 = 600
 public let defaultAXTotalTextBytes: UInt32 = 12 * 1_024
 public let defaultAXVisibleRowsPerContainer: UInt8 = 12
 public let maximumClipboardTextBytesV2 = 64 * 1_024
+public let maximumApplicationSpecifierBytes = 255
 
 public struct ActionRequestV2: Codable, Sendable, Equatable {
     public let version: UInt8
@@ -288,6 +292,7 @@ public enum ActionV2: Sendable, Equatable {
     )
     case scrollElement(target: ElementTarget, direction: ScrollDirection, pages: UInt8)
     case secondaryAction(target: ElementTarget, actionName: String)
+    case launchApplication(String)
     case readClipboard
 
     public var hasValidParameters: Bool {
@@ -309,13 +314,15 @@ public enum ActionV2: Sendable, Equatable {
         case let .secondaryAction(target, actionName):
             target.hasValidParameters
                 && Self.validBoundedText(actionName, maximumCharacters: 128)
+        case let .launchApplication(application):
+            Self.validApplicationSpecifier(application)
         case .readClipboard: true
         }
     }
 
     public var requiresForegroundApplication: Bool {
         switch self {
-        case .observe, .readClipboard:
+        case .observe, .launchApplication, .readClipboard:
             false
         case let .coordinate(action):
             action.requiresForegroundApplication
@@ -326,14 +333,24 @@ public enum ActionV2: Sendable, Equatable {
 
     /// Whether the coordinate key can create or select a different window.
     public var mayChangeFrontmostWindow: Bool {
-        guard case let .coordinate(action) = self else { return false }
-        return action.mayChangeFrontmostWindow
+        switch self {
+        case .launchApplication: true
+        case let .coordinate(action): action.mayChangeFrontmostWindow
+        default: false
+        }
     }
 
     private static func validBoundedText(_ value: String, maximumCharacters: Int) -> Bool {
         !value.isEmpty && value.count <= maximumCharacters
             && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
             && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+    }
+
+    private static func validApplicationSpecifier(_ value: String) -> Bool {
+        let forbidden = CharacterSet(charactersIn: "/:~;|&$<>`\\")
+        return validBoundedText(value, maximumCharacters: 255)
+            && value.utf8.count <= maximumApplicationSpecifierBytes
+            && !value.unicodeScalars.contains(where: forbidden.contains)
     }
 
     private static func isCoordinateAction(_ action: Action) -> Bool {
@@ -357,6 +374,7 @@ extension ActionV2: Codable {
         case selectText = "select_text"
         case scrollElement = "scroll_element"
         case secondaryAction = "secondary_action"
+        case launchApplication = "launch_application"
         case readClipboard = "read_clipboard"
     }
 
@@ -393,6 +411,8 @@ extension ActionV2: Codable {
                 target: try container.decode(ElementTarget.self, forKey: .target),
                 actionName: try container.decode(String.self, forKey: .actionName)
             )
+        case .launchApplication:
+            self = .launchApplication(try container.decode(String.self, forKey: .application))
         case .readClipboard: self = .readClipboard
         }
         guard hasValidParameters else {
@@ -436,6 +456,9 @@ extension ActionV2: Codable {
             try container.encode(Kind.secondaryAction, forKey: .type)
             try container.encode(target, forKey: .target)
             try container.encode(actionName, forKey: .actionName)
+        case let .launchApplication(application):
+            try container.encode(Kind.launchApplication, forKey: .type)
+            try container.encode(application, forKey: .application)
         case .readClipboard:
             try container.encode(Kind.readClipboard, forKey: .type)
         }

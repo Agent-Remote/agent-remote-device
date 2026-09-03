@@ -28,7 +28,7 @@ that policy remains a separate MDM/Network Extension release gate.
 
 ## Runtime activation proof
 
-The Network Broker also requires a live proof before sending an allowed approval to the control
+The Network Broker also requires a live proof before installing a session authorization with the control
 plane and again before establishing its relay. The proof comes from the privileged mach service
 configured in the signed Broker `Info.plist`; development builds leave that configuration empty and
 therefore cannot activate device control. The service is owned and deployed by the MDM/Network

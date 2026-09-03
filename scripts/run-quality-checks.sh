@@ -9,6 +9,7 @@ bash tests/swift_dependency_audit_test.sh
 ruby tests/release_workflow_contract_test.rb
 ruby tests/localization_catalog_test.rb
 ruby tests/logging_privacy_contract_test.rb
+ruby tests/managed_skill_safety_contract_test.rb
 ruby tests/swift_concurrency_contract_test.rb
 ruby tests/isolation_evidence_verifier_test.rb
 cargo fmt --all -- --check

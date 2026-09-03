@@ -1,12 +1,13 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import DeviceProtocol
 import DeviceSecurity
 import Foundation
 @preconcurrency import ScreenCaptureKit
 
-public enum ExecutionFailure: Error, Equatable {
+public enum ExecutionFailure: Error, Equatable, Sendable {
     case accessibilityPermissionMissing
     case applicationChanged
     case windowChanged
@@ -14,8 +15,11 @@ public enum ExecutionFailure: Error, Equatable {
     case eventCreationFailed
     case unsupportedKey
     case actionRequiresCapture
-    case clipboardContentUnavailable
-    case clipboardContentTooLarge
+    case protectedSystemSurface
+    case clipboardEmpty
+    case clipboardNonText
+    case clipboardUnavailable
+    case clipboardTooLarge
 
     public var diagnosticCode: String {
         switch self {
@@ -26,8 +30,11 @@ public enum ExecutionFailure: Error, Equatable {
         case .eventCreationFailed: "input_event_creation_failed"
         case .unsupportedKey: "unsupported_key"
         case .actionRequiresCapture: "invalid_capture_action_dispatch"
-        case .clipboardContentUnavailable: "clipboard_content_unavailable"
-        case .clipboardContentTooLarge: "clipboard_content_too_large"
+        case .protectedSystemSurface: "protected_system_surface"
+        case .clipboardEmpty: "clipboard_empty"
+        case .clipboardNonText: "clipboard_non_text"
+        case .clipboardUnavailable: "clipboard_unavailable"
+        case .clipboardTooLarge: "clipboard_too_large"
         }
     }
 
@@ -36,7 +43,7 @@ public enum ExecutionFailure: Error, Equatable {
         case .accessibilityPermissionMissing:
             "Mac Accessibility permission is missing for Agent Remote Device."
         case .applicationChanged:
-            "The approved application changed after the latest screenshot. Take a fresh screenshot."
+            "The target application changed after the latest screenshot. Take a fresh screenshot."
         case .windowChanged:
             "The approved window moved, resized, or closed after the latest screenshot. Take a fresh screenshot."
         case .displayChanged:
@@ -47,9 +54,15 @@ public enum ExecutionFailure: Error, Equatable {
             "The requested key or key combination is not supported."
         case .actionRequiresCapture:
             "The capture action was sent to the input-event executor."
-        case .clipboardContentUnavailable:
-            "The Mac clipboard does not currently contain text."
-        case .clipboardContentTooLarge:
+        case .protectedSystemSurface:
+            "macOS Secure Input is active. The requested action was rejected."
+        case .clipboardEmpty:
+            "The Mac clipboard is empty."
+        case .clipboardNonText:
+            "The Mac clipboard does not contain plain text."
+        case .clipboardUnavailable:
+            "The Mac clipboard text is temporarily unavailable."
+        case .clipboardTooLarge:
             "The Mac clipboard text exceeds the 64 KiB limit."
         }
     }
@@ -84,12 +97,17 @@ enum WindowFrameValidation: Sendable {
 @MainActor
 public final class ActionExecutor {
     private let guardState: SessionGuard
+    private let secureInputEnabled: () -> Bool
     private var leftMouseIsDown = false
     private var heldKeyCode: CGKeyCode?
     private var heldKeyUpFlags: CGEventFlags = []
 
-    public init(guardState: SessionGuard) {
+    public init(
+        guardState: SessionGuard,
+        secureInputEnabled: @escaping () -> Bool = { IsSecureEventInputEnabled() }
+    ) {
         self.guardState = guardState
+        self.secureInputEnabled = secureInputEnabled
     }
 
     public var hasPressedState: Bool {
@@ -103,6 +121,7 @@ public final class ActionExecutor {
         capture: CapturedWindow
     ) async throws {
         do {
+            try rejectSecureInput(for: action)
             guard AXIsProcessTrusted() else {
                 throw ExecutionFailure.accessibilityPermissionMissing
             }
@@ -118,6 +137,7 @@ public final class ActionExecutor {
                 displayFingerprint: displayFingerprint,
                 application: capture.application
             )
+            try rejectSecureInput(for: action)
             try await dispatch(action, capture: capture)
             try await guardState.accept(sequence: sequence)
         } catch {
@@ -134,6 +154,7 @@ public final class ActionExecutor {
         accessibility: AccessibilityRuntime
     ) async throws {
         do {
+            try rejectSecureInput(for: action)
             guard AXIsProcessTrusted() else {
                 throw ExecutionFailure.accessibilityPermissionMissing
             }
@@ -157,6 +178,7 @@ public final class ActionExecutor {
             var actionError: Error?
             for attempt in 0 ..< (requiresEditableFocus ? 12 : 1) {
                 do {
+                    try rejectSecureInput(for: action)
                     try accessibility.perform(action, target: target)
                     actionError = nil
                     break
@@ -195,6 +217,7 @@ public final class ActionExecutor {
         context: WindowContext
     ) async throws {
         do {
+            try rejectSecureInput(for: action)
             guard AXIsProcessTrusted() else {
                 throw ExecutionFailure.accessibilityPermissionMissing
             }
@@ -211,6 +234,7 @@ public final class ActionExecutor {
                 windowID: context.windowID,
                 application: context.application
             )
+            try rejectSecureInput(for: action)
             try await dispatchContextAction(action, processID: context.processID)
             try await guardState.accept(sequence: sequence)
         } catch {
@@ -260,12 +284,10 @@ public final class ActionExecutor {
                 displayFingerprint: displayFingerprint,
                 application: capture.application
             )
-            guard let text = NSPasteboard.general.string(forType: .string) else {
-                throw ExecutionFailure.clipboardContentUnavailable
-            }
-            guard text.utf8.count <= 64 * 1_024 else {
-                throw ExecutionFailure.clipboardContentTooLarge
-            }
+            let text = try Self.clipboardText(
+                from: .general,
+                maximumBytes: maximumClipboardTextBytesV2
+            )
             try await guardState.accept(sequence: sequence)
             return text
         } catch {
@@ -292,12 +314,22 @@ public final class ActionExecutor {
                 windowID: context.windowID,
                 application: context.application
             )
-            guard let text = NSPasteboard.general.string(forType: .string) else {
-                throw ExecutionFailure.clipboardContentUnavailable
-            }
-            guard maximumBytes > 0, text.utf8.count <= maximumBytes else {
-                throw ExecutionFailure.clipboardContentTooLarge
-            }
+            let text = try Self.clipboardText(from: .general, maximumBytes: maximumBytes)
+            try await guardState.accept(sequence: sequence)
+            return text
+        } catch {
+            releasePressedState()
+            throw error
+        }
+    }
+
+    public func readGlobalClipboard(
+        sequence: UInt64,
+        maximumBytes: Int = maximumClipboardTextBytesV2
+    ) async throws -> String {
+        do {
+            try await guardState.authorizeGlobalClipboard(sequence: sequence)
+            let text = try Self.clipboardText(from: .general, maximumBytes: maximumBytes)
             try await guardState.accept(sequence: sequence)
             return text
         } catch {
@@ -395,6 +427,58 @@ public final class ActionExecutor {
 
     static func usesFrontmostHIDRouting(for key: String) -> Bool {
         Action.key(key).mayChangeFrontmostWindow
+    }
+
+    static func clipboardText(
+        from pasteboard: NSPasteboard,
+        maximumBytes: Int
+    ) throws -> String {
+        guard let items = pasteboard.pasteboardItems, !items.isEmpty else {
+            throw ExecutionFailure.clipboardEmpty
+        }
+        guard items.contains(where: { $0.types.contains(.string) }) else {
+            throw ExecutionFailure.clipboardNonText
+        }
+        guard let text = pasteboard.string(forType: .string) else {
+            throw ExecutionFailure.clipboardUnavailable
+        }
+        guard !text.isEmpty else {
+            throw ExecutionFailure.clipboardEmpty
+        }
+        guard maximumBytes > 0, text.utf8.count <= maximumBytes else {
+            throw ExecutionFailure.clipboardTooLarge
+        }
+        return text
+    }
+
+    static func requiresSecureInputClear(_ action: Action) -> Bool {
+        switch action {
+        case .screenshot, .screenshotApplication, .readClipboard, .zoom, .wait:
+            false
+        default:
+            true
+        }
+    }
+
+    static func requiresSecureInputClear(_ action: ActionV2) -> Bool {
+        switch action {
+        case .observe, .launchApplication, .readClipboard:
+            false
+        default:
+            true
+        }
+    }
+
+    private func rejectSecureInput(for action: Action) throws {
+        if Self.requiresSecureInputClear(action), secureInputEnabled() {
+            throw ExecutionFailure.protectedSystemSurface
+        }
+    }
+
+    private func rejectSecureInput(for action: ActionV2) throws {
+        if Self.requiresSecureInputClear(action), secureInputEnabled() {
+            throw ExecutionFailure.protectedSystemSurface
+        }
     }
 
     private func dispatchContextAction(_ action: Action, processID: pid_t) async throws {
@@ -723,7 +807,7 @@ public final class ActionExecutor {
         up.flags = parsed.keyUpFlags
         if Self.usesFrontmostHIDRouting(for: value) {
             // Window-management shortcuts must enter normal HID routing so the
-            // frontmost approved application can select or create its window.
+            // frontmost eligible application can select or create its window.
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
         } else {

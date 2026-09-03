@@ -1,7 +1,6 @@
 import AppKit
 import DeviceAppCore
 import DeviceIPC
-import DeviceSecurity
 import SwiftUI
 
 struct DeviceStatusView: View {
@@ -32,20 +31,11 @@ struct DeviceStatusView: View {
             switch model.state {
             case .permissionRequired:
                 PermissionView(model: model)
-            case .selectingSession, .claimingSession:
+            case .selectingSession:
                 SessionSelectionView(model: model)
-            case .awaitingApproval:
-                if let presentation = model.approvalPresentation {
-                    ApprovalView(model: model, presentation: presentation)
-                } else {
-                    RecoveryActionView(
-                        title: localizedAppString("failure.invalid_state"),
-                        message: localizedAppString("failure.invalid_state_message"),
-                        actionTitle: localizedAppString("session.return_to_list"),
-                        action: model.returnToSessionSelection
-                    )
-                }
-            case .active, .activating, .paused:
+            case .claimingSession, .activating:
+                SessionPreparationView(model: model)
+            case .active, .paused:
                 SessionControlsView(model: model)
             case .pausing:
                 OperationProgressView(
@@ -64,7 +54,7 @@ struct DeviceStatusView: View {
                 )
             case .failed:
                 FailureRecoveryView(model: model)
-            case .denied, .stopped:
+            case .stopped:
                 RecoveryActionView(
                     title: statusTitle,
                     message: model.completionMessage ?? localizedAppString("session.return_hint"),
@@ -87,14 +77,12 @@ struct DeviceStatusView: View {
         case .selectingSession: localizedAppString("status.selecting_session")
         case .claimingSession: localizedAppString("status.claiming_session")
         case .permissionRequired: localizedAppString("status.permission_required")
-        case .awaitingApproval: localizedAppString("status.approval_required")
         case .activating: localizedAppString("status.activating")
         case .active: localizedAppString("status.active")
         case .pausing: localizedAppString("status.pausing")
         case .paused: localizedAppString("status.paused")
         case .endingSession: localizedAppString("status.ending_session")
         case .reconnecting: localizedAppString("status.reconnecting")
-        case .denied: localizedAppString("status.denied")
         case .stopped: localizedAppString("status.stopped")
         case .failed: localizedAppString("status.failed")
         }
@@ -107,9 +95,9 @@ struct DeviceStatusView: View {
         case .selectingSession, .claimingSession: "list.bullet.rectangle"
         case .endingSession: "xmark.circle"
         case .reconnecting: "network"
-        case .permissionRequired, .awaitingApproval: "hand.raised"
+        case .permissionRequired: "hand.raised"
         case .failed: "exclamationmark.shield"
-        case .paused, .denied, .stopped: "stop.circle"
+        case .paused, .stopped: "stop.circle"
         case .ready: "checkmark.shield"
         }
     }
@@ -118,7 +106,7 @@ struct DeviceStatusView: View {
         switch model.state {
         case .active, .activating: .green
         case .selectingSession, .claimingSession: .blue
-        case .permissionRequired, .awaitingApproval: .orange
+        case .permissionRequired: .orange
         case .failed: .red
         case .pausing, .endingSession, .reconnecting: .blue
         default: .secondary
@@ -213,14 +201,6 @@ private struct SessionSelectionView: View {
                 .listStyle(.inset)
             }
         }
-        .overlay {
-            if model.state == .claimingSession {
-                ProgressView(localizedAppString("session.claiming_session"))
-                    .padding(20)
-                    .background(.regularMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
-        }
         .alert(
             localizedAppString("session.rebind_title"),
             isPresented: Binding(
@@ -236,11 +216,34 @@ private struct SessionSelectionView: View {
                 }
                 candidateToClaim = nil
             }
-            Button(localizedAppString("approval.deny"), role: .cancel) {
+            Button(localizedAppString("common.cancel"), role: .cancel) {
                 candidateToClaim = nil
             }
         } message: {
             Text(localizedAppString("session.rebind_message"))
+        }
+    }
+}
+
+private struct SessionPreparationView: View {
+    @ObservedObject var model: DeviceAppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let selectedSession = model.selectedSession {
+                SessionIdentityView(session: selectedSession)
+            }
+            Spacer()
+            ContentUnavailableView {
+                Label(
+                    localizedAppString("session.preparing_secure_connection"),
+                    systemImage: "lock.shield"
+                )
+            } description: {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            Spacer()
         }
     }
 }
@@ -268,7 +271,7 @@ private struct PermissionView: View {
             }
             Spacer()
             HStack {
-                if model.approvalPresentation != nil {
+                if model.selectedSession != nil {
                     Button {
                         model.switchSession()
                     } label: {
@@ -312,137 +315,15 @@ private struct PermissionRow: View {
     }
 }
 
-private struct ApprovalView: View {
-    @ObservedObject var model: DeviceAppModel
-    let presentation: ApprovalPresentation
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            List(presentation.applications) { candidate in
-                ApprovalApplicationRow(model: model, candidate: candidate)
-            }
-            .listStyle(.inset)
-
-            HStack {
-                Button(role: .cancel) {
-                    model.deny()
-                } label: {
-                    Label(localizedAppString("approval.deny"), systemImage: "xmark")
-                }
-                Button {
-                    model.switchSession()
-                } label: {
-                    Label(
-                        localizedAppString("session.switch"),
-                        systemImage: "arrow.left.arrow.right"
-                    )
-                }
-                Spacer()
-                Button {
-                    model.allowForSession()
-                } label: {
-                    Label(localizedAppString("approval.allow_session"), systemImage: "checkmark")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(model.applicationSelections.isEmpty)
-            }
-        }
-    }
-}
-
-private struct ApprovalApplicationRow: View {
-    @ObservedObject var model: DeviceAppModel
-    let candidate: ApprovalCandidate
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Toggle(
-                    candidate.displayName,
-                    isOn: Binding(
-                        get: { model.applicationSelections.contains(candidate.id) },
-                        set: { enabled in
-                            if enabled {
-                                model.applicationSelections.insert(candidate.id)
-                            } else {
-                                model.applicationSelections.remove(candidate.id)
-                                model.clipboardSelections.remove(candidate.id)
-                            }
-                        }
-                    )
-                )
-                .font(.headline)
-                Spacer()
-                if candidate.classification.source == .pendingConfirmation {
-                    Picker(
-                        localizedAppString("approval.control_level"),
-                        selection: Binding(
-                            get: { model.controlLevelSelections[candidate.id] ?? .viewOnly },
-                            set: { model.controlLevelSelections[candidate.id] = $0 }
-                        )
-                    ) {
-                        Text(localizedAppString("control.view")).tag(ControlLevel.viewOnly)
-                        Text(localizedAppString("control.click")).tag(ControlLevel.clickOnly)
-                        Text(localizedAppString("control.full")).tag(ControlLevel.fullControl)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 190)
-                } else {
-                    Text(controlLevelTitle)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            if candidate.classification.source == .pendingConfirmation {
-                Label(localizedAppString("approval.category_pending"), systemImage: "questionmark.circle")
-                    .foregroundStyle(.orange)
-            }
-            ForEach(candidate.classification.warnings.sorted(by: { $0.rawValue < $1.rawValue }), id: \.self) { warning in
-                Label(warningTitle(warning), systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
-            if candidate.clipboardRequested {
-                Toggle(
-                    localizedAppString("approval.clipboard"),
-                    isOn: Binding(
-                        get: { model.clipboardSelections.contains(candidate.id) },
-                        set: { enabled in
-                            if enabled {
-                                model.clipboardSelections.insert(candidate.id)
-                            } else {
-                                model.clipboardSelections.remove(candidate.id)
-                            }
-                        }
-                    )
-                )
-                .disabled(!model.applicationSelections.contains(candidate.id))
-            }
-        }
-        .padding(.vertical, 6)
-    }
-
-    private var controlLevelTitle: String {
-        switch candidate.effectiveControlLevel {
-        case .viewOnly: localizedAppString("control.view_only")
-        case .clickOnly: localizedAppString("control.click_only")
-        case .fullControl: localizedAppString("control.full_control")
-        }
-    }
-
-    private func warningTitle(_ warning: ApplicationWarning) -> String {
-        switch warning {
-        case .shellAccess: localizedAppString("warning.shell_access")
-        case .fileAccess: localizedAppString("warning.file_access")
-        case .systemSettings: localizedAppString("warning.system_settings")
-        }
-    }
-}
-
 private struct SessionControlsView: View {
     @ObservedObject var model: DeviceAppModel
     @State private var pendingConfirmation: SessionControlConfirmation?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            if let selectedSession = model.selectedSession {
+                SessionIdentityView(session: selectedSession)
+            }
             if model.state == .paused, let reason = model.lastUnsafeTransition {
                 Label(reasonTitle(reason), systemImage: "hand.raised.fill")
                     .foregroundStyle(.orange)
@@ -526,6 +407,26 @@ private struct SessionControlsView: View {
         case .screenLocked: localizedAppString("stop.screen_locked")
         case .userSwitched: localizedAppString("stop.user_switched")
         case .networkDisconnected: localizedAppString("stop.network_disconnected")
+        }
+    }
+}
+
+private struct SessionIdentityView: View {
+    let session: BrokerSessionCandidate
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(session.displayName)
+                    .font(.headline)
+                Text(session.projectKey)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        } icon: {
+            Image(systemName: "terminal")
+                .foregroundStyle(.secondary)
         }
     }
 }

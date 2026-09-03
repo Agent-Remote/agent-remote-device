@@ -37,6 +37,15 @@ public struct ActionSettlePreparation: Sendable {
 }
 
 public protocol GUIActionRuntime: Sendable {
+    func resolveApplication(
+        targetApplication: String?,
+        excludedBundleIdentifiers: Set<String>
+    ) async throws -> ApplicationIdentity
+    func launchApplication(
+        _ application: String,
+        excludedBundleIdentifiers: Set<String>,
+        deadline: Date
+    ) async throws -> WindowContext
     func capture(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?
@@ -115,12 +124,28 @@ public protocol GUIActionRuntime: Sendable {
         context: WindowContext,
         maximumBytes: Int
     ) async throws -> String
+    func readGlobalClipboard(sequence: UInt64, maximumBytes: Int) async throws -> String
     func releasePressedState() async
     func restoreUserFocus() async
     func clearAccessibilityState(applicationDigest: String?) async
 }
 
 public extension GUIActionRuntime {
+    func resolveApplication(
+        targetApplication _: String?,
+        excludedBundleIdentifiers _: Set<String>
+    ) async throws -> ApplicationIdentity {
+        throw CaptureFailure.applicationNotFound
+    }
+
+    func launchApplication(
+        _: String,
+        excludedBundleIdentifiers _: Set<String>,
+        deadline _: Date
+    ) async throws -> WindowContext {
+        throw CaptureFailure.applicationNotFound
+    }
+
     func captureV2(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?,
@@ -221,6 +246,10 @@ public extension GUIActionRuntime {
     ) async throws -> String {
         throw AccessibilityFailure.operationFailed
     }
+
+    func readGlobalClipboard(sequence _: UInt64, maximumBytes _: Int) async throws -> String {
+        throw AccessibilityFailure.operationFailed
+    }
 }
 
 public actor LiveGUIActionRuntime: GUIActionRuntime {
@@ -242,6 +271,86 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             (ActionExecutor(guardState: guardState), AccessibilityRuntime())
         }
         return LiveGUIActionRuntime(executor: values.0, accessibility: values.1)
+    }
+
+    public func resolveApplication(
+        targetApplication: String?,
+        excludedBundleIdentifiers: Set<String>
+    ) async throws -> ApplicationIdentity {
+        try await MainActor.run {
+            try ApplicationResolver.runningApplication(
+                matching: targetApplication,
+                excludedBundleIdentifiers: excludedBundleIdentifiers
+            )
+        }
+    }
+
+    public func launchApplication(
+        _ application: String,
+        excludedBundleIdentifiers: Set<String>,
+        deadline: Date
+    ) async throws -> WindowContext {
+        let priorProcessID = await MainActor.run {
+            NSWorkspace.shared.frontmostApplication?.processIdentifier
+        }
+        let target = try await MainActor.run {
+            try ApplicationResolver.installedApplication(
+                matching: application,
+                excludedBundleIdentifiers: excludedBundleIdentifiers
+            )
+        }
+        if let priorProcessID {
+            userFocusProcessID = priorProcessID
+        }
+        let processID: pid_t
+        do {
+            processID = try await ApplicationResolver.launch(target)
+        } catch {
+            await restoreUserFocus()
+            throw CaptureFailure.applicationLaunchResultUnknown
+        }
+        activatedProcessIDs.insert(processID)
+        do {
+            return try await Self.waitForLaunchedWindow(
+                deadline: deadline,
+                context: { [captureEngine] in
+                    try await captureEngine.context(
+                        application: target.identity,
+                        requiredProcessID: processID
+                    )
+                },
+                restore: { await self.restoreUserFocus() }
+            )
+        } catch let failure as CaptureFailure where failure == .applicationLaunchTimeout {
+            throw failure
+        } catch {
+            throw CaptureFailure.applicationLaunchResultUnknown
+        }
+    }
+
+    static func waitForLaunchedWindow(
+        deadline: Date,
+        context: @escaping @Sendable () async throws -> WindowContext,
+        restore: @escaping @Sendable () async -> Void
+    ) async throws -> WindowContext {
+        do {
+            repeat {
+                do {
+                    return try await context()
+                } catch let failure as CaptureFailure
+                    where failure == .approvedApplicationNotRunning
+                        || failure == .approvedWindowMissing
+                {
+                    let remainingMilliseconds = Int64(deadline.timeIntervalSinceNow * 1_000)
+                    guard remainingMilliseconds > 0 else { break }
+                    try await Task.sleep(for: .milliseconds(min(100, remainingMilliseconds)))
+                }
+            } while Date() < deadline
+            throw CaptureFailure.applicationLaunchTimeout
+        } catch {
+            await restore()
+            throw error
+        }
     }
 
     public func capture(
@@ -441,6 +550,13 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             sequence: sequence,
             stateGeneration: stateGeneration,
             context: context,
+            maximumBytes: maximumBytes
+        )
+    }
+
+    public func readGlobalClipboard(sequence: UInt64, maximumBytes: Int) async throws -> String {
+        try await executor.readGlobalClipboard(
+            sequence: sequence,
             maximumBytes: maximumBytes
         )
     }

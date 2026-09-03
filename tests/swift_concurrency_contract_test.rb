@@ -16,9 +16,22 @@ activation_sources.each do |relative|
   end
 end
 
-discovery_source = File.read(File.join(root, "macos/App/LocalApplicationDiscovery.swift"))
-if discovery_source.match?(/\b(?:activate|openApplication|AXUIElement)\b/)
-  abort("LocalApplicationDiscovery.swift must not activate applications")
+legacy_discovery = File.join(root, "macos/App/LocalApplicationDiscovery.swift")
+if File.exist?(legacy_discovery)
+  abort("LocalApplicationDiscovery.swift must remain removed; targets are resolved per action")
+end
+
+legacy_approval_model = File.join(root, "macos/AppCore/ApprovalModels.swift")
+if File.exist?(legacy_approval_model)
+  abort("ApprovalModels.swift must remain removed; session selection grants full trust")
+end
+
+app_sources = Dir.glob(File.join(root, "macos/{App,AppCore}/**/*.swift"))
+app_sources.each do |path|
+  source = File.read(path)
+  if source.match?(/awaiting_approval|awaitingApproval|applicationSelections|clipboardSelections|controlLevelSelections/)
+    abort("#{path.delete_prefix("#{root}/")} must not restore the legacy application approval path")
+  end
 end
 
 Dir.glob(File.join(root, "macos/**/*.swift")).each do |path|
