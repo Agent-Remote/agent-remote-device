@@ -272,7 +272,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             CaptureProfile(
                 maximumWidth: 960,
                 maximumHeight: 600,
-                encoding: .jpeg(quality: 0.65)
+                encoding: .jpeg(quality: 0.72)
             )
         case .standard:
             CaptureProfile(

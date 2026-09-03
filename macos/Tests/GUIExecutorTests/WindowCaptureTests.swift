@@ -393,7 +393,7 @@ private func synchronouslyBlock(for seconds: Double) {
     let png = try testPNG(width: 64, height: 40)
     let source = try #require(CGImageSourceCreateWithData(png as CFData, nil))
     let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
-    let encoding = CaptureImageEncoding.jpeg(quality: 0.65)
+    let encoding = CaptureImageEncoding.jpeg(quality: 0.72)
     let jpeg = try #require(WindowCapture.encodedData(image, encoding: encoding))
     let encodedSource = try #require(CGImageSourceCreateWithData(jpeg as CFData, nil))
     let encodedImage = try #require(CGImageSourceCreateImageAtIndex(encodedSource, 0, nil))
