@@ -9,19 +9,38 @@ import ImageIO
 import Security
 import UniformTypeIdentifiers
 
+public enum CaptureImageEncoding: Equatable, Sendable {
+    case png
+    case jpeg(quality: Double)
+
+    public var mimeType: String {
+        switch self {
+        case .png: "image/png"
+        case .jpeg: "image/jpeg"
+        }
+    }
+}
+
 public struct CaptureProfile: Equatable, Sendable {
     public let maximumWidth: Int
     public let maximumHeight: Int
+    public let encoding: CaptureImageEncoding
 
-    public init(maximumWidth: Int, maximumHeight: Int) {
+    public init(
+        maximumWidth: Int,
+        maximumHeight: Int,
+        encoding: CaptureImageEncoding = .png
+    ) {
         precondition(maximumWidth > 0 && maximumHeight > 0)
         self.maximumWidth = maximumWidth
         self.maximumHeight = maximumHeight
+        self.encoding = encoding
     }
 }
 
 public struct CapturedWindow: @unchecked Sendable {
     public let pngData: Data
+    public let encoding: CaptureImageEncoding
     public let pixelWidth: UInt16
     public let pixelHeight: UInt16
     public let windowID: CGWindowID
@@ -34,6 +53,7 @@ public struct CapturedWindow: @unchecked Sendable {
 
     public init(
         pngData: Data,
+        encoding: CaptureImageEncoding = .png,
         pixelWidth: UInt16,
         pixelHeight: UInt16,
         windowID: CGWindowID,
@@ -45,6 +65,7 @@ public struct CapturedWindow: @unchecked Sendable {
         windowTitle: String? = nil
     ) {
         self.pngData = pngData
+        self.encoding = encoding
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
         self.windowID = windowID
@@ -261,9 +282,12 @@ public struct WindowCapture: Sendable {
                 configuration: configuration
             )
         }
-        guard let pngData = Self.pngData(image) else { throw CaptureFailure.encodingFailed }
+        guard let imageData = Self.encodedData(image, encoding: profile.encoding) else {
+            throw CaptureFailure.encodingFailed
+        }
         return CapturedWindow(
-            pngData: pngData,
+            pngData: imageData,
+            encoding: profile.encoding,
             pixelWidth: UInt16(size.width),
             pixelHeight: UInt16(size.height),
             windowID: resolved.windowID,
@@ -579,7 +603,7 @@ public struct WindowCapture: Sendable {
                   width: Int(region.width),
                   height: Int(region.height)
               )),
-              let pngData = pngData(croppedImage)
+              let imageData = encodedData(croppedImage, encoding: capture.encoding)
         else {
             throw CaptureFailure.cropOutOfBounds
         }
@@ -593,7 +617,8 @@ public struct WindowCapture: Sendable {
             height: CGFloat(region.height) * yScale
         )
         return CapturedWindow(
-            pngData: pngData,
+            pngData: imageData,
+            encoding: capture.encoding,
             pixelWidth: region.width,
             pixelHeight: region.height,
             windowID: capture.windowID,
@@ -626,17 +651,31 @@ public struct WindowCapture: Sendable {
         )
     }
 
-    private static func pngData(_ image: CGImage) -> Data? {
+    static func encodedData(
+        _ image: CGImage,
+        encoding: CaptureImageEncoding
+    ) -> Data? {
         let data = NSMutableData()
+        let type: UTType
+        let properties: CFDictionary?
+        switch encoding {
+        case .png:
+            type = .png
+            properties = nil
+        case let .jpeg(quality):
+            guard (0 ... 1).contains(quality) else { return nil }
+            type = .jpeg
+            properties = [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
+        }
         guard let destination = CGImageDestinationCreateWithData(
             data,
-            UTType.png.identifier as CFString,
+            type.identifier as CFString,
             1,
             nil
         ) else {
             return nil
         }
-        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationAddImage(destination, image, properties)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return data as Data
     }

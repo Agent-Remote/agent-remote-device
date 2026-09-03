@@ -649,6 +649,16 @@ public actor GUIExecutorSessionController {
             throw failure
         }
 
+        // A completed interaction can change pixels without changing the
+        // window frame. Drop the local capture so another coordinate action
+        // must first return a new model-visible screenshot.
+        switch request.action {
+        case .observe, .readClipboard:
+            break
+        default:
+            latestCapture = nil
+        }
+
         if case .readClipboard = request.action {
             guard let currentState else {
                 return try failureResponseV2(
@@ -1041,7 +1051,7 @@ public actor GUIExecutorSessionController {
                 latestWindowContext = capture.windowContext
                 image = ImagePayloadV2(
                     base64Data: capture.pngData.base64EncodedString(),
-                    mimeType: "image/png",
+                    mimeType: capture.encoding.mimeType,
                     pixelWidth: capture.pixelWidth,
                     pixelHeight: capture.pixelHeight,
                     profile: profile

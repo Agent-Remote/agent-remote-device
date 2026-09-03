@@ -162,8 +162,8 @@ browser profiles, cookies, DOM debugging endpoints, local files, or another
 application. Two stable samples after a debounce interval are required for
 `settled`; timeout returns the newest safe state with an explicit timeout status.
 
-Compact, standard, and region image profiles preserve the exact returned pixel
-dimensions and coordinate frame in the screenshot context. Compression never
+Compact, standard, and region image profiles use bounded JPEG quality and preserve
+the exact returned pixel dimensions and coordinate frame in the screenshot context. Compression never
 weakens image signature, dimension, pixel-count, decode-allocation, or application
 identity checks.
 

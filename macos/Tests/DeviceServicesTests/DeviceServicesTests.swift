@@ -377,6 +377,120 @@ import Testing
     #expect(await recorder.actions == [.key("CMD+A")])
 }
 
+@Test func executorRejectsCoordinatesFromAScreenshotInvalidatedByScrolling() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let screenshotData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .screenshot, imageProfile: .standard),
+        action: .observe(application: nil)
+    ))
+    let screenshot = try JSONDecoder().decode(ActionResponseV2.self, from: screenshotData)
+    #expect(screenshot.status == .success)
+    #expect(screenshot.screenshotGeneration == 1)
+
+    let scrollData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 1,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.scroll(deltaX: 0, deltaY: -100, coordinate: nil))
+    ))
+    let scroll = try JSONDecoder().decode(ActionResponseV2.self, from: scrollData)
+    #expect(scroll.status == .success)
+    #expect(scroll.screenshotGeneration == 1)
+
+    let staleCoordinateData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        stateGeneration: 2,
+        screenshotGeneration: 1,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.mouseMove(Point(x: 10, y: 10)))
+    ))
+    let staleCoordinate = try JSONDecoder().decode(
+        ActionResponseV2.self,
+        from: staleCoordinateData
+    )
+    #expect(staleCoordinate.status == .failed)
+    #expect(staleCoordinate.message.hasPrefix("fresh_screenshot_required:"))
+    #expect(await recorder.actions == [.scroll(deltaX: 0, deltaY: -100, coordinate: nil)])
+
+    let refreshedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        stateGeneration: 2,
+        screenshotGeneration: 1,
+        observation: ObservationPolicy(mode: .screenshot, imageProfile: .standard),
+        action: .observe(application: nil)
+    ))
+    let refreshed = try JSONDecoder().decode(ActionResponseV2.self, from: refreshedData)
+    #expect(refreshed.status == .success)
+    #expect(refreshed.stateGeneration == 3)
+    #expect(refreshed.screenshotGeneration == 2)
+
+    let freshCoordinateData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 4,
+        stateGeneration: 3,
+        screenshotGeneration: 2,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.mouseMove(Point(x: 10, y: 10)))
+    ))
+    let freshCoordinate = try JSONDecoder().decode(
+        ActionResponseV2.self,
+        from: freshCoordinateData
+    )
+    #expect(freshCoordinate.status == .success)
+    #expect(await recorder.actions == [
+        .scroll(deltaX: 0, deltaY: -100, coordinate: nil),
+        .mouseMove(Point(x: 10, y: 10)),
+    ])
+}
+
 @Test func passiveWaitRetainsTheCurrentWindowBinding() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -1013,7 +1127,6 @@ import Testing
         displayFingerprint: try #require(observed.displayFingerprint),
         elementIndex: 0
     )
-    let started = Date()
     let actionData = try await controller.performAction(actionEnvelopeV2(
         configuration: session,
         requestID: UUID(),
@@ -1035,10 +1148,11 @@ import Testing
     #expect(action.status == .success)
     #expect(action.observation?.nodes.contains { $0.value == expectedValue } == true)
     #expect(calls.count == 1)
-    #expect(calls.first?.0 == target)
-    #expect(calls.first?.1 == expectedValue)
-    #expect(try #require(calls.first?.2) <= session.leaseUntil)
-    #expect(try #require(calls.first?.2) <= started.addingTimeInterval(2.1))
+    let freshnessCall = try #require(calls.first)
+    #expect(freshnessCall.target == target)
+    #expect(freshnessCall.expectedValue == expectedValue)
+    #expect(freshnessCall.deadline <= session.leaseUntil)
+    #expect(freshnessCall.deadline.timeIntervalSince(freshnessCall.recordedAt) <= 2)
 
     let latestTarget = ElementTarget(
         stateID: try #require(action.stateID),
@@ -4250,7 +4364,12 @@ private actor RuntimeRecorder {
     private(set) var preferredWindowIDs: [[UInt32]] = []
     private(set) var windowContextPreferredWindowIDs: [[UInt32]] = []
     private(set) var clipboardMaximumBytes: [Int] = []
-    private(set) var valueFreshnessCalls: [(ElementTarget, String, Date)] = []
+    private(set) var valueFreshnessCalls: [(
+        target: ElementTarget,
+        expectedValue: String,
+        deadline: Date,
+        recordedAt: Date
+    )] = []
     private(set) var observationBaseStateIDs: [UUID?] = []
     private(set) var settlePhases: [String] = []
     private(set) var windowRefreshPhases: [String] = []
@@ -4299,7 +4418,7 @@ private actor RuntimeRecorder {
     }
 
     func checkedValueFreshness(target: ElementTarget, expectedValue: String, deadline: Date) {
-        valueFreshnessCalls.append((target, expectedValue, deadline))
+        valueFreshnessCalls.append((target, expectedValue, deadline, Date()))
     }
 
     func observed(baseStateID: UUID?) {

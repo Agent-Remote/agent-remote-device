@@ -389,6 +389,21 @@ private func synchronouslyBlock(for seconds: Double) {
     #expect(image.height == 2)
 }
 
+@Test func jpegEncodingPreservesDimensionsAndAdvertisesItsExactMimeType() throws {
+    let png = try testPNG(width: 64, height: 40)
+    let source = try #require(CGImageSourceCreateWithData(png as CFData, nil))
+    let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+    let encoding = CaptureImageEncoding.jpeg(quality: 0.65)
+    let jpeg = try #require(WindowCapture.encodedData(image, encoding: encoding))
+    let encodedSource = try #require(CGImageSourceCreateWithData(jpeg as CFData, nil))
+    let encodedImage = try #require(CGImageSourceCreateImageAtIndex(encodedSource, 0, nil))
+
+    #expect(encoding.mimeType == "image/jpeg")
+    #expect(CGImageSourceGetType(encodedSource) as String? == UTType.jpeg.identifier)
+    #expect(encodedImage.width == 64)
+    #expect(encodedImage.height == 40)
+}
+
 @Test func escapeMonitorRecognizesOnlyTheGlobalEscapeKeyCode() {
     #expect(GlobalStopMonitor.isEscape(keyCode: 53))
     #expect(!GlobalStopMonitor.isEscape(keyCode: 36))

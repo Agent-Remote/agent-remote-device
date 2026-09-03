@@ -300,6 +300,11 @@ actions remain available as a fallback and continue to require the latest
 model-visible `screenshot_generation` and exact returned image dimensions.
 They also require the live window frame to match that screenshot exactly; the
 frame relaxation used for non-coordinate and AX actions never applies to pixels.
+After any successful interaction that does not return a new image, the Executor
+invalidates its local pixel capture even though the protocol generation remains
+unchanged. A later coordinate action then fails with `fresh_screenshot_required`
+until an observation returns a new model-visible screenshot. This covers content-only
+changes such as scrolling where the application, window, display, and frame stay fixed.
 `clear_value` is a compact MCP alias for a state-bound SetValue carrying an empty
 string; it avoids empty-string JSON serialization failures in model clients.
 
@@ -366,8 +371,9 @@ region    bounded detail inspection
 ```
 
 Returned dimensions, selected window, coordinate frame, and display fingerprint
-are recorded in the screenshot context. JPEG may reduce bridge bytes, but image
-count and dimensions are the primary model-token controls.
+are recorded in the screenshot context. Protocol v2 compact, standard, and region
+profiles use bounded JPEG quality to keep remote bridge latency below the action
+deadline; the legacy protocol v1 capture remains PNG.
 
 ### MCP mapping and sequence helpers
 

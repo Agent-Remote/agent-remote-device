@@ -35,7 +35,11 @@ func nestedTLSRelayCarriesActionsOnlyThroughOpaqueWebSocketBytes() async throws 
     )
     let deviceInbox = MemoryWebSocketInbox()
     let proxyInbox = MemoryWebSocketInbox()
-    let deviceWebSocket = MemoryWebSocket(inbox: deviceInbox, peerInbox: proxyInbox)
+    let deviceWebSocket = MemoryWebSocket(
+        inbox: deviceInbox,
+        peerInbox: proxyInbox,
+        sendDelay: .milliseconds(100)
+    )
     let proxyWebSocket = MemoryWebSocket(inbox: proxyInbox, peerInbox: deviceInbox)
 
     async let establishedRelay = NetworkBrokerNestedTLSRelay.establish(
@@ -56,12 +60,13 @@ func nestedTLSRelayCarriesActionsOnlyThroughOpaqueWebSocketBytes() async throws 
     )
     let relay = try await establishedRelay
     let handled = TestRelayRecorder()
+    let expectedResponse = Data(repeating: 0xA5, count: 6 * 1_024 * 1_024)
     let relayTask = Task {
         try await relay.run(
             actionHandler: { envelopeData in
                 let envelope = try DeviceIPCEnvelope.decode(envelopeData)
                 await handled.record(envelope)
-                return Data("bounded-response".utf8)
+                return expectedResponse
             },
             lifecycleHandler: { event in await handled.record(event) }
         )
@@ -83,7 +88,9 @@ func nestedTLSRelayCarriesActionsOnlyThroughOpaqueWebSocketBytes() async throws 
     try await sendTestFrame(request, over: proxyConnection)
     let response = try await receiveTestFrame(from: proxyConnection)
 
-    #expect(response == Data("bounded-response".utf8))
+    #expect(response == expectedResponse)
+    let pushedFrameCount = await proxyInbox.pushedFrameCount
+    #expect(pushedFrameCount <= 5, "sent \(pushedFrameCount) WebSocket frames")
     let envelope = try #require(await handled.envelope)
     #expect(envelope.requestID.uuidString.lowercased() == requestID)
 
@@ -378,13 +385,22 @@ private func receiveTestChunk(
 private final class MemoryWebSocket: NetworkBrokerRelayWebSocket, @unchecked Sendable {
     private let inbox: MemoryWebSocketInbox
     private let peerInbox: MemoryWebSocketInbox
+    private let sendDelay: Duration?
 
-    init(inbox: MemoryWebSocketInbox, peerInbox: MemoryWebSocketInbox) {
+    init(
+        inbox: MemoryWebSocketInbox,
+        peerInbox: MemoryWebSocketInbox,
+        sendDelay: Duration? = nil
+    ) {
         self.inbox = inbox
         self.peerInbox = peerInbox
+        self.sendDelay = sendDelay
     }
 
     func send(_ data: Data) async throws {
+        if let sendDelay {
+            try await Task.sleep(for: sendDelay)
+        }
         await peerInbox.push(data)
     }
 
@@ -404,9 +420,11 @@ private actor MemoryWebSocketInbox {
     private var values: [Data] = []
     private var waiters: [CheckedContinuation<Data, Error>] = []
     private var closed = false
+    private(set) var pushedFrameCount = 0
 
     func push(_ data: Data) {
         guard !closed else { return }
+        pushedFrameCount += 1
         if let waiter = waiters.first {
             waiters.removeFirst()
             waiter.resume(returning: data)

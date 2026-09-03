@@ -267,14 +267,29 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
-        let dimensions = switch profile {
-        case .compact: (960, 600)
-        case .standard, .region: (1_280, 800)
-        case .none: (1, 1)
+        let captureProfile = switch profile {
+        case .compact:
+            CaptureProfile(
+                maximumWidth: 960,
+                maximumHeight: 600,
+                encoding: .jpeg(quality: 0.65)
+            )
+        case .standard:
+            CaptureProfile(
+                maximumWidth: 1_280,
+                maximumHeight: 800,
+                encoding: .jpeg(quality: 0.75)
+            )
+        case .region:
+            CaptureProfile(
+                maximumWidth: 1_280,
+                maximumHeight: 800,
+                encoding: .jpeg(quality: 0.82)
+            )
+        case .none:
+            CaptureProfile(maximumWidth: 1, maximumHeight: 1)
         }
-        let engine = WindowCapture(
-            profile: CaptureProfile(maximumWidth: dimensions.0, maximumHeight: dimensions.1)
-        )
+        let engine = WindowCapture(profile: captureProfile)
         let preferredWindowID = preferredWindowContexts.first {
             $0.application.stableDigest == application.stableDigest
         }?.windowID

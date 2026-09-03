@@ -27,7 +27,8 @@ public enum RemoteLifecycleEvent: String, Codable, Equatable, Sendable {
 public final class NetworkBrokerNestedTLSRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
     public typealias ActionHandler = @Sendable (Data) async throws -> Data
 
-    fileprivate static let transportChunkBytes = 64 * 1_024
+    static let transportChunkBytes = 512 * 1_024
+    static let websocketBatchBytes = URLSessionNetworkBrokerRelayWebSocket.maximumFrameBytes
 
     private let listener: NWListener
     private let rawConnection: NWConnection
@@ -339,6 +340,9 @@ private func bridge(
     _ rawConnection: NWConnection,
     websocket: any NetworkBrokerRelayWebSocket
 ) async throws {
+    let outbound = RelayByteBatcher(
+        maximumBatchBytes: NetworkBrokerNestedTLSRelay.websocketBatchBytes
+    )
     try await withThrowingTaskGroup(of: Void.self) { group in
         group.addTask {
             do {
@@ -347,9 +351,22 @@ private func bridge(
                         from: rawConnection,
                         maximumLength: NetworkBrokerNestedTLSRelay.transportChunkBytes
                     )
-                    try await websocket.send(data)
+                    await outbound.append(data)
                 }
             } catch {
+                await outbound.fail(error)
+                rawConnection.cancel()
+                websocket.cancel()
+                throw error
+            }
+        }
+        group.addTask {
+            do {
+                while true {
+                    try await websocket.send(outbound.next())
+                }
+            } catch {
+                await outbound.fail(error)
                 rawConnection.cancel()
                 websocket.cancel()
                 throw error
@@ -362,6 +379,7 @@ private func bridge(
                     try await send(data, over: rawConnection)
                 }
             } catch {
+                await outbound.fail(error)
                 rawConnection.cancel()
                 websocket.cancel()
                 throw error
@@ -369,6 +387,45 @@ private func bridge(
         }
         _ = try await group.next()
         group.cancelAll()
+    }
+}
+
+private actor RelayByteBatcher {
+    private let maximumBatchBytes: Int
+    private var buffered = Data()
+    private var waiter: CheckedContinuation<Data, Error>?
+    private var failure: Error?
+
+    init(maximumBatchBytes: Int) {
+        self.maximumBatchBytes = maximumBatchBytes
+    }
+
+    func append(_ data: Data) {
+        guard failure == nil else { return }
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+            return
+        }
+        buffered.append(data)
+    }
+
+    func next() async throws -> Data {
+        if !buffered.isEmpty {
+            let count = min(buffered.count, maximumBatchBytes)
+            let batch = Data(buffered.prefix(count))
+            buffered.removeFirst(count)
+            return batch
+        }
+        if let failure { throw failure }
+        return try await withCheckedThrowingContinuation { waiter = $0 }
+    }
+
+    func fail(_ error: Error) {
+        guard failure == nil else { return }
+        failure = error
+        waiter?.resume(throwing: error)
+        waiter = nil
     }
 }
 
