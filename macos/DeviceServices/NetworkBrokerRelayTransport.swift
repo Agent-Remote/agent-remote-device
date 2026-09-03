@@ -13,14 +13,21 @@ public protocol NetworkBrokerRelayWebSocket: Sendable {
     func cancel()
 }
 
+protocol RelayWebSocketKeepaliveTarget: Sendable {
+    func ping() async throws
+    func cancel()
+}
+
 public final class URLSessionNetworkBrokerRelayWebSocket: NetworkBrokerRelayWebSocket,
     @unchecked Sendable
 {
     public static let maximumFrameBytes = 4 * 1_024 * 1_024
+    static let keepaliveInterval: Duration = .seconds(20)
 
     private let task: URLSessionWebSocketTask
     private let session: URLSession
     private let delegate: RelaySessionDelegate
+    private let keepalive: RelayWebSocketKeepalive
 
     public init(request: URLRequest) throws {
         guard request.url?.scheme == "wss",
@@ -47,8 +54,17 @@ public final class URLSessionNetworkBrokerRelayWebSocket: NetworkBrokerRelayWebS
         )
         self.delegate = delegate
         self.session = session
-        task = session.webSocketTask(with: request)
-        task.resume()
+        let webSocketTask = session.webSocketTask(with: request)
+        task = webSocketTask
+        webSocketTask.resume()
+        keepalive = RelayWebSocketKeepalive(
+            interval: Self.keepaliveInterval,
+            target: URLSessionRelayWebSocketKeepaliveTarget(task: webSocketTask)
+        )
+    }
+
+    deinit {
+        keepalive.cancel()
     }
 
     public func send(_ data: Data) async throws {
@@ -70,8 +86,91 @@ public final class URLSessionNetworkBrokerRelayWebSocket: NetworkBrokerRelayWebS
     }
 
     public func cancel() {
+        keepalive.cancel()
         task.cancel(with: .goingAway, reason: nil)
         session.invalidateAndCancel()
+    }
+}
+
+final class RelayWebSocketKeepalive: @unchecked Sendable {
+    private let task: Task<Void, Never>
+
+    convenience init(
+        interval: Duration,
+        target: any RelayWebSocketKeepaliveTarget
+    ) {
+        self.init(
+            interval: interval,
+            ping: { try await target.ping() },
+            onFailure: { target.cancel() }
+        )
+    }
+
+    init(
+        interval: Duration,
+        ping: @escaping @Sendable () async throws -> Void,
+        onFailure: @escaping @Sendable () async -> Void
+    ) {
+        task = Task {
+            do {
+                try await Self.run(interval: interval, ping: ping)
+            } catch {
+                if !Task.isCancelled {
+                    await onFailure()
+                }
+            }
+        }
+    }
+
+    deinit {
+        task.cancel()
+    }
+
+    func cancel() {
+        task.cancel()
+    }
+
+    func waitForCompletion() async {
+        await task.value
+    }
+
+    private static func run(
+        interval: Duration,
+        ping: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        while true {
+            try await Task.sleep(for: interval)
+            try Task.checkCancellation()
+            try await ping()
+        }
+    }
+}
+
+private final class URLSessionRelayWebSocketKeepaliveTarget:
+    RelayWebSocketKeepaliveTarget,
+    @unchecked Sendable
+{
+    private let task: URLSessionWebSocketTask
+
+    init(task: URLSessionWebSocketTask) {
+        self.task = task
+    }
+
+    func ping() async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            task.sendPing { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        task.cancel(with: .goingAway, reason: nil)
     }
 }
 

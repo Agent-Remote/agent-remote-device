@@ -627,7 +627,11 @@ impl UnixDeviceTransport {
             },
         };
         match result {
-            Ok(()) | Err(TransportError::DeviceRejected(_)) => {
+            Ok(()) => {
+                state.pending_request = None;
+                Ok(retries.saturating_add(1))
+            }
+            Err(TransportError::DeviceRejected(_)) if !state.poisoned => {
                 state.pending_request = None;
                 Ok(retries.saturating_add(1))
             }
@@ -1286,6 +1290,9 @@ fn apply_response_v2(
                 "failed response contains state",
             ));
         }
+        if is_terminal_device_rejection(&response.message) {
+            poison(state);
+        }
         return Err(TransportError::DeviceRejected(response.message));
     }
     let message = match model_message_v2(
@@ -1444,6 +1451,10 @@ fn supports_v2(capabilities: &BTreeSet<String>) -> bool {
     ]
     .iter()
     .all(|capability| capabilities.contains(*capability))
+}
+
+fn is_terminal_device_rejection(message: &str) -> bool {
+    message.starts_with("window_refresh_failed:")
 }
 
 fn poison(state: &mut TransportState) {
@@ -2081,6 +2092,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_window_refresh_rejection_poisons_the_generation() {
+        let context = test_context(1, Utc::now() + chrono::Duration::seconds(30));
+        let request_id = Uuid::new_v4();
+        let request = ActionRequestV2 {
+            version: PROTOCOL_VERSION_V2,
+            request_id,
+            context: RequestContextV2 {
+                user_id: context.user_id,
+                device_id: context.device_id,
+                tool_session_id: context.tool_session_id,
+                device_session_id: context.device_session_id,
+                node_id: context.node_id,
+                platform: context.platform,
+                generation: context.generation,
+                monotonic_sequence: 1,
+                current_state_generation: 0,
+                current_screenshot_generation: 0,
+                base_state_id: None,
+            },
+            lease_until: context.lease_until,
+            observation: ObservationPolicy::default(),
+            action: ActionV2::Observe { application: None },
+        };
+        let mut state = TransportState {
+            context,
+            state_id: None,
+            state_context: None,
+            model_ax_bases: BTreeMap::new(),
+            poisoned: false,
+            pending_request: None,
+            last_completed_response_binding: None,
+            connection: None,
+        };
+        let response = ActionResponseV2 {
+            request_id,
+            monotonic_sequence: 1,
+            state_generation: 0,
+            screenshot_generation: 0,
+            state_id: None,
+            application_digest: None,
+            window_id: None,
+            display_fingerprint: None,
+            base_state_id: None,
+            status: ResponseStatusV2::Failed,
+            message: "window_refresh_failed: the new window was not confirmed".to_owned(),
+            clipboard: None,
+            observation: None,
+            settle: SettleResult {
+                status: crate::protocol_v2::SettleStatus::NotRequested,
+                elapsed_ms: 0,
+            },
+            image: None,
+        };
+
+        let error = apply_response_v2(&mut state, &request, response)
+            .expect_err("terminal device rejection");
+        assert!(matches!(error, TransportError::DeviceRejected(message)
+            if message.starts_with("window_refresh_failed:")));
+        assert!(state.poisoned);
+        assert!(state.connection.is_none());
+    }
+
     #[tokio::test]
     async fn bridge_connection_error_is_not_reported_as_context_io() {
         let directory = tempdir().expect("temp directory");
@@ -2350,6 +2424,86 @@ mod tests {
         assert_eq!(state.context.next_sequence, 3);
         drop(state);
         server.await.expect("bridge server");
+    }
+
+    #[tokio::test]
+    async fn terminal_pending_rejection_does_not_start_a_new_action() {
+        let directory = tempdir().expect("temp directory");
+        let socket_path = directory.path().join("bridge.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind bridge socket");
+        let mut context = test_context(12, Utc::now() + chrono::Duration::seconds(60));
+        context.capabilities = [
+            CAPABILITY_ADAPTIVE_SETTLE_V2.to_owned(),
+            CAPABILITY_AX_STATE_V2.to_owned(),
+            CAPABILITY_OBSERVATION_MODE_V2.to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let server_context = context.clone();
+        let server_socket_path = socket_path.clone();
+        let first_server = tokio::spawn(async move {
+            let mut tls = accept_test_tls(&listener, &server_context, 0x41).await;
+            let request = read_framed_json(&mut tls).await;
+            let request = &request["request"];
+            assert_eq!(request["context"]["monotonic_sequence"], 1);
+            drop(tls);
+            drop(listener);
+            std::fs::remove_file(server_socket_path).expect("remove bridge socket");
+        });
+
+        let transport = Arc::new(UnixDeviceTransport::new(&socket_path, context.clone()));
+        let first_action = transport.execute_v2(
+            ActionV2::Observe { application: None },
+            ObservationPolicy::default(),
+        );
+        let (server_result, first_result) = tokio::join!(first_server, first_action);
+        server_result.expect("first bridge server");
+        first_result.expect_err("the disconnected action must be retained as pending");
+        {
+            let state = transport.state.lock().await;
+            assert!(!state.poisoned);
+            assert!(state.pending_request.is_some());
+        }
+
+        let listener = UnixListener::bind(&socket_path).expect("rebind bridge socket");
+        let server_context = context;
+        let second_server = tokio::spawn(async move {
+            let mut tls = accept_test_tls(&listener, &server_context, 0x42).await;
+            let request = read_framed_json(&mut tls).await;
+            let request = &request["request"];
+            assert_eq!(request["context"]["monotonic_sequence"], 1);
+            write_framed_json(
+                &mut tls,
+                &serde_json::json!({
+                    "request_id": request["request_id"],
+                    "monotonic_sequence": 1,
+                    "state_generation": 0,
+                    "screenshot_generation": 0,
+                    "status": "failed",
+                    "message": "window_refresh_failed: the new window was not confirmed",
+                    "settle": {"status": "not_requested", "elapsed_ms": 0}
+                }),
+            )
+            .await;
+            if let Ok(Ok(_)) = timeout(Duration::from_millis(250), tls.read_u32()).await {
+                panic!("a poisoned generation must not receive a new action")
+            }
+        });
+
+        let error = transport
+            .execute_v2(
+                ActionV2::Observe { application: None },
+                ObservationPolicy::default(),
+            )
+            .await
+            .expect_err("terminal pending rejection");
+        assert!(matches!(error, TransportError::DeviceRejected(message)
+            if message.starts_with("window_refresh_failed:")));
+        let state = transport.state.lock().await;
+        assert!(state.poisoned);
+        assert!(state.pending_request.is_none());
+        drop(state);
+        second_server.await.expect("second bridge server");
     }
 
     #[tokio::test]

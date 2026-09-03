@@ -72,7 +72,7 @@
     },
     "keyAction": {
       "type": "object", "additionalProperties": false, "required": ["type", "key"],
-      "properties": { "type": { "const": "key" }, "key": { "type": "string", "pattern": "^[A-Za-z0-9_+ -]{1,64}$" } }
+      "properties": { "type": { "const": "key" }, "key": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^(?:[A-Za-z]+\\+)*(?:[A-Za-z0-9_ -]+|['\\\\,./;=\\[\\]`])$" } }
     },
     "scrollAction": {
       "type": "object", "additionalProperties": false, "required": ["type", "delta_x", "delta_y"],
@@ -84,7 +84,7 @@
     },
     "holdAction": {
       "type": "object", "additionalProperties": false, "required": ["type", "key", "duration_ms"],
-      "properties": { "type": { "const": "hold_key" }, "key": { "type": "string", "pattern": "^[A-Za-z0-9_+ -]{1,64}$" }, "duration_ms": { "type": "integer", "minimum": 50, "maximum": 5000 } }
+      "properties": { "type": { "const": "hold_key" }, "key": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^(?:[A-Za-z]+\\+)*(?:[A-Za-z0-9_ -]+|['\\\\,./;=\\[\\]`])$" }, "duration_ms": { "type": "integer", "minimum": 50, "maximum": 5000 } }
     },
     "waitAction": {
       "type": "object", "additionalProperties": false, "required": ["type", "duration_ms"],

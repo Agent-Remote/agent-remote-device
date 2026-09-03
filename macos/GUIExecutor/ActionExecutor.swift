@@ -86,6 +86,7 @@ public final class ActionExecutor {
     private let guardState: SessionGuard
     private var leftMouseIsDown = false
     private var heldKeyCode: CGKeyCode?
+    private var heldKeyUpFlags: CGEventFlags = []
 
     public init(guardState: SessionGuard) {
         self.guardState = guardState
@@ -311,8 +312,11 @@ public final class ActionExecutor {
             leftMouseIsDown = false
         }
         if let heldKeyCode {
-            CGEvent(keyboardEventSource: nil, virtualKey: heldKeyCode, keyDown: false)?.post(tap: .cghidEventTap)
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: heldKeyCode, keyDown: false)
+            event?.flags = heldKeyUpFlags
+            event?.post(tap: .cghidEventTap)
             self.heldKeyCode = nil
+            heldKeyUpFlags = []
         }
     }
 
@@ -341,7 +345,10 @@ public final class ActionExecutor {
         }
         let content = try await SCShareableContent.excludingDesktopWindows(
             true,
-            onScreenWindowsOnly: requireFrontmost && frameValidation != .identityOnly
+            onScreenWindowsOnly: Self.requiresOnScreenWindowList(
+                frameValidation: frameValidation,
+                requireFrontmost: requireFrontmost
+            )
         )
         guard let window = content.windows.first(where: { $0.windowID == context.windowID }),
               window.owningApplication?.processID == context.processID,
@@ -379,6 +386,17 @@ public final class ActionExecutor {
         }
     }
 
+    static func requiresOnScreenWindowList(
+        frameValidation: WindowFrameValidation,
+        requireFrontmost: Bool
+    ) -> Bool {
+        requireFrontmost && frameValidation != .identityOnly
+    }
+
+    static func usesFrontmostHIDRouting(for key: String) -> Bool {
+        Action.key(key).mayChangeFrontmostWindow
+    }
+
     private func dispatchContextAction(_ action: Action, processID: pid_t) async throws {
         switch action {
         case let .type(text):
@@ -394,9 +412,10 @@ public final class ActionExecutor {
             ) else {
                 throw ExecutionFailure.eventCreationFailed
             }
-            down.flags = parsed.flags
+            down.flags = parsed.keyDownFlags
             down.post(tap: .cghidEventTap)
             heldKeyCode = parsed.keyCode
+            heldKeyUpFlags = parsed.keyUpFlags
             try await Task.sleep(for: .milliseconds(durationMilliseconds))
             guard let up = CGEvent(
                 keyboardEventSource: nil,
@@ -405,9 +424,10 @@ public final class ActionExecutor {
             ) else {
                 throw ExecutionFailure.eventCreationFailed
             }
-            up.flags = parsed.flags
+            up.flags = parsed.keyUpFlags
             up.post(tap: .cghidEventTap)
             heldKeyCode = nil
+            heldKeyUpFlags = []
         case let .scroll(deltaX, deltaY, nil):
             guard let event = CGEvent(
                 scrollWheelEvent2Source: nil,
@@ -489,16 +509,18 @@ public final class ActionExecutor {
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: true) else {
                 throw ExecutionFailure.eventCreationFailed
             }
-            down.flags = parsed.flags
+            down.flags = parsed.keyDownFlags
             down.post(tap: .cghidEventTap)
             heldKeyCode = parsed.keyCode
+            heldKeyUpFlags = parsed.keyUpFlags
             try await Task.sleep(for: .milliseconds(durationMilliseconds))
             guard let up = CGEvent(keyboardEventSource: nil, virtualKey: parsed.keyCode, keyDown: false) else {
                 throw ExecutionFailure.eventCreationFailed
             }
-            up.flags = parsed.flags
+            up.flags = parsed.keyUpFlags
             up.post(tap: .cghidEventTap)
             heldKeyCode = nil
+            heldKeyUpFlags = []
         case let .wait(durationMilliseconds):
             try await Task.sleep(for: .milliseconds(durationMilliseconds))
         }
@@ -697,23 +719,52 @@ public final class ActionExecutor {
         else {
             throw ExecutionFailure.eventCreationFailed
         }
-        down.flags = parsed.flags
-        up.flags = parsed.flags
-        down.postToPid(processID)
-        up.postToPid(processID)
+        down.flags = parsed.keyDownFlags
+        up.flags = parsed.keyUpFlags
+        if Self.usesFrontmostHIDRouting(for: value) {
+            // Window-management shortcuts must enter normal HID routing so the
+            // frontmost approved application can select or create its window.
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        } else {
+            down.postToPid(processID)
+            up.postToPid(processID)
+        }
     }
 }
 
 struct ParsedKey: Equatable {
     let keyCode: CGKeyCode
     let flags: CGEventFlags
+    let modifierFlag: CGEventFlags
+
+    init(
+        keyCode: CGKeyCode,
+        flags: CGEventFlags,
+        modifierFlag: CGEventFlags = []
+    ) {
+        self.keyCode = keyCode
+        self.flags = flags
+        self.modifierFlag = modifierFlag
+    }
+
+    var keyDownFlags: CGEventFlags {
+        flags.union(modifierFlag)
+    }
+
+    var keyUpFlags: CGEventFlags {
+        flags
+    }
 }
 
 enum KeyParser {
     static func parse(_ value: String) throws -> ParsedKey {
         let components = value.uppercased().split(separator: "+").map(String.init)
-        guard let rawKeyName = components.last,
-              let keyCode = keyCodes[normalizedKeyName(rawKeyName)]
+        guard let rawKeyName = components.last else {
+            throw ExecutionFailure.unsupportedKey
+        }
+        let keyName = normalizedKeyName(rawKeyName)
+        guard let keyCode = keyCodes[keyName]
         else {
             throw ExecutionFailure.unsupportedKey
         }
@@ -727,7 +778,11 @@ enum KeyParser {
             default: throw ExecutionFailure.unsupportedKey
             }
         }
-        return ParsedKey(keyCode: keyCode, flags: flags)
+        return ParsedKey(
+            keyCode: keyCode,
+            flags: flags,
+            modifierFlag: modifierFlags[keyName] ?? []
+        )
     }
 
     private static func normalizedKeyName(_ value: String) -> String {
@@ -745,10 +800,24 @@ enum KeyParser {
         "5": 23, "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29,
         "]": 30, "O": 31, "U": 32, "[": 33, "I": 34, "P": 35, "L": 37,
         "J": 38, "'": 39, "K": 40, ";": 41, "\\": 42, ",": 43, "/": 44,
-        "N": 45, "M": 46, ".": 47, "TAB": 48, "SPACE": 49, "DELETE": 51,
+        "N": 45, "M": 46, ".": 47, "TAB": 48, "SPACE": 49, "`": 50,
+        "DELETE": 51, "BACKSPACE": 51,
         "ESC": 53, "ESCAPE": 53, "RETURN": 36, "ENTER": 36,
+        "CMD": 55, "COMMAND": 55, "SUPER": 55, "SHIFT": 56,
+        "ALT": 58, "OPTION": 58, "CTRL": 59, "CONTROL": 59,
         "LEFT": 123, "RIGHT": 124, "DOWN": 125, "UP": 126,
         "PAGEUP": 116, "PAGEDOWN": 121, "HOME": 115, "END": 119,
+    ]
+
+    private static let modifierFlags: [String: CGEventFlags] = [
+        "CMD": .maskCommand,
+        "COMMAND": .maskCommand,
+        "SUPER": .maskCommand,
+        "SHIFT": .maskShift,
+        "ALT": .maskAlternate,
+        "OPTION": .maskAlternate,
+        "CTRL": .maskControl,
+        "CONTROL": .maskControl,
     ]
 }
 

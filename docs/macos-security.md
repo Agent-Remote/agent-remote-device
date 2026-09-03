@@ -35,7 +35,13 @@ signed process, window ID, and display binding while allowing macOS to adjust a
 full-screen window's frame during Space activation. While that transition is in
 flight, their exact window ID is resolved from the all-Space window list only after
 the signed target process is confirmed frontmost; coordinate actions remain limited
-to the current on-screen list.
+to the current on-screen list. After an interactive action completes, the follow-up
+observation resolves the target process's frontmost window without forcing the prior
+window ID. If the action created or selected another window, the Executor discards
+the prior window's AX state before returning the newly bound observation.
+Window-management keyboard shortcuts are injected through normal HID routing only
+after that exact process is frontmost; this is required for macOS and the application
+to handle window creation or selection rather than a PID-local event queue.
 
 Approval UI or Executor XPC invalidation immediately cancels the active relay.
 Executor input release is best effort after the Executor becomes unavailable,
@@ -109,6 +115,18 @@ latest model-visible mapping; a new state or window/display change replaces only
 that application's mapping. A turn pause, generation rotation, or Executor restart
 clears every mapping. A lost diff base returns a bounded full state with an
 explicit reset marker.
+
+For observations that combine AX and pixels, the Executor binds AX traversal to
+the exact ScreenCaptureKit-selected window. It prefers an exact match between the
+AX window number and ScreenCaptureKit window ID, together with a sufficiently
+matching frame. When AX does not expose a window number, it requires the frame
+and, when ScreenCaptureKit supplies one, a unique normalized window-title match.
+The title comparison permits only the application suffix that macOS AX appends
+after a ` - ` boundary. More than one matching candidate is ambiguous and fails
+closed. This disambiguates same-process windows with identical frames. If the AX
+window identity cannot be proven, observation fails closed instead of returning
+AX state from a neighboring window. The title remains inside the Executor for
+identity checking and is never added to logs or telemetry.
 
 ## State-bound element execution
 

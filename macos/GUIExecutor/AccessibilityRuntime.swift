@@ -3,6 +3,36 @@ import ApplicationServices
 import DeviceProtocol
 import DeviceSecurity
 import Foundation
+import OSLog
+
+@_silgen_name("_AXUIElementGetWindow")
+private func systemWindowID(
+    _ element: AXUIElement,
+    _ windowID: UnsafeMutablePointer<CGWindowID>
+) -> AXError
+
+func accessibilityWindowID(_ element: AXUIElement) -> CGWindowID? {
+    var numberValue: CFTypeRef?
+    if AXUIElementCopyAttributeValue(
+        element,
+        "AXWindowNumber" as CFString,
+        &numberValue
+    ) == .success,
+       let number = numberValue as? NSNumber,
+       number.int64Value > 0,
+       number.uint64Value <= UInt64(UInt32.max)
+    {
+        return CGWindowID(number.uint32Value)
+    }
+
+    // Chromium omits AXWindowNumber for some windows. HIServices can still
+    // provide the exact WindowServer identity without title or frame matching.
+    var resolvedWindowID = kCGNullWindowID
+    guard systemWindowID(element, &resolvedWindowID) == .success,
+          resolvedWindowID != kCGNullWindowID
+    else { return nil }
+    return resolvedWindowID
+}
 
 public enum AccessibilityFailure: Error, Equatable, Sendable {
     case permissionMissing
@@ -30,6 +60,15 @@ public enum AccessibilityFailure: Error, Equatable, Sendable {
         case .ambiguousText: "selection_text_is_ambiguous"
         case .invalidSelection: "selection_range_invalid"
         case .operationFailed: "accessibility_operation_failed"
+        }
+    }
+
+    public var isTransientDuringSettle: Bool {
+        switch self {
+        case .windowUnavailable, .operationFailed:
+            true
+        default:
+            false
         }
     }
 }
@@ -74,6 +113,8 @@ public struct AccessibilityStabilityFingerprint: Equatable, Sendable {
 
 @MainActor
 public final class AccessibilityRuntime {
+    private let logger = Logger(subsystem: "dev.agentremote.device", category: "accessibility")
+
     private struct Snapshot {
         let context: AccessibilityStateContext
         let nodes: [AccessibilityNode]
@@ -191,7 +232,12 @@ public final class AccessibilityRuntime {
     ) throws -> AccessibilitySnapshotResult {
         guard AXIsProcessTrusted() else { throw AccessibilityFailure.permissionMissing }
         guard policy.hasValidParameters else { throw AccessibilityFailure.operationFailed }
-        let root = try focusedWindow(processID: window.processID, matching: window.windowFrame)
+        let root = try focusedWindow(
+            processID: window.processID,
+            matching: window.windowFrame,
+            windowID: window.windowID,
+            title: window.windowTitle
+        )
         let focusedElement = focusedElement(processID: window.processID)
         let previous = snapshots[window.application.stableDigest]
         var renderer = BoundedAXRenderer(
@@ -397,7 +443,12 @@ public final class AccessibilityRuntime {
         trackingElementIndex: UInt32? = nil
     ) throws -> AccessibilityStabilityFingerprint {
         guard AXIsProcessTrusted() else { throw AccessibilityFailure.permissionMissing }
-        let root = try focusedWindow(processID: context.processID, matching: context.windowFrame)
+        let root = try focusedWindow(
+            processID: context.processID,
+            matching: context.windowFrame,
+            windowID: context.windowID,
+            title: context.windowTitle
+        )
         let focusedElement = focusedElement(processID: context.processID)
         let previous = snapshots[context.application.stableDigest]
         var renderer = BoundedAXRenderer(
@@ -418,24 +469,62 @@ public final class AccessibilityRuntime {
         )
     }
 
-    private func focusedWindow(processID: pid_t, matching expectedFrame: CGRect) throws -> AXUIElement {
+    private func focusedWindow(
+        processID: pid_t,
+        matching expectedFrame: CGRect,
+        windowID expectedWindowID: CGWindowID,
+        title expectedTitle: String?
+    ) throws -> AXUIElement {
         let application = AXUIElementCreateApplication(processID)
         AXUIElementSetMessagingTimeout(application, 0.5)
         enableDynamicAccessibility(on: application)
-        if let focused: AXUIElement = attribute(kAXFocusedWindowAttribute, from: application),
-           windowFrame(focused).map({ Self.windowMatchScore($0, expectedFrame) >= 0.7 }) == true
+        let focused: AXUIElement? = attribute(kAXFocusedWindowAttribute, from: application)
+        let frontmostMatches = Self.frontmostWindowID(processID: processID) == expectedWindowID
+        let focusedFrame = focused.flatMap(windowFrame)
+        let focusedWindowID = focused.flatMap(windowID)
+        if let focused,
+           frontmostMatches,
+           let frame = focusedFrame,
+           Self.focusedWindowCanRepresent(
+               frame: frame,
+               expectedFrame: expectedFrame,
+               windowID: focusedWindowID,
+               expectedWindowID: expectedWindowID
+           )
         {
             return focused
         }
-        let windows: [AXUIElement] = attribute(kAXWindowsAttribute, from: application) ?? []
-        let candidates = windows.compactMap { window -> (AXUIElement, CGFloat)? in
-            guard let frame = windowFrame(window) else { return nil }
-            return (window, Self.windowMatchScore(frame, expectedFrame))
+        var windows: [AXUIElement] = attribute(kAXWindowsAttribute, from: application) ?? []
+        if let focused,
+           !windows.contains(where: { CFEqual($0, focused) })
+        {
+            windows.insert(focused, at: 0)
         }
-        guard let match = candidates.max(by: { $0.1 < $1.1 }), match.1 >= 0.7 else {
+        let candidates = windows.compactMap {
+            window -> (element: AXUIElement, windowID: CGWindowID?, score: CGFloat)? in
+            guard let frame = windowFrame(window) else { return nil }
+            let candidateWindowID = windowID(window)
+            return (
+                element: window,
+                windowID: candidateWindowID,
+                Self.windowMatchScore(
+                    frame,
+                    expectedFrame,
+                    windowID: candidateWindowID,
+                    expectedWindowID: expectedWindowID,
+                    title: windowTitle(window),
+                    expectedTitle: expectedTitle
+                )
+            )
+        }
+        guard let matchIndex = Self.preferredWindowMatchIndex(
+            candidates: candidates.map { ($0.windowID, $0.score) },
+            expectedWindowID: expectedWindowID
+        ) else {
+            logger.notice("AX window match unavailable")
             throw AccessibilityFailure.windowUnavailable
         }
-        return match.0
+        return candidates[matchIndex].element
     }
 
     private func focusedElement(processID: pid_t) -> AXUIElement? {
@@ -467,6 +556,105 @@ public final class AccessibilityRuntime {
               AXValueGetValue(sizeValue, .cgSize, &size)
         else { return nil }
         return CGRect(origin: position, size: size)
+    }
+
+    private func windowTitle(_ element: AXUIElement) -> String? {
+        attribute(kAXTitleAttribute, from: element)
+    }
+
+    private func windowID(_ element: AXUIElement) -> CGWindowID? {
+        accessibilityWindowID(element)
+    }
+
+    static func focusedWindowCanRepresent(
+        frame: CGRect,
+        expectedFrame: CGRect,
+        windowID: CGWindowID?,
+        expectedWindowID: CGWindowID
+    ) -> Bool {
+        guard windowID == nil || windowID == expectedWindowID else { return false }
+        return windowMatchScore(frame, expectedFrame) >= 0.7
+    }
+
+    private static func frontmostWindowID(processID: pid_t) -> CGWindowID? {
+        guard let values = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        for value in values {
+            guard let owner = (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  owner == processID,
+                  (value[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let number = value[kCGWindowNumber as String] as? NSNumber,
+                  let bounds = value[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds),
+                  frame.width >= 100,
+                  frame.height >= 100
+            else { continue }
+            return CGWindowID(number.uint32Value)
+        }
+        return nil
+    }
+
+    static func windowMatchScore(
+        _ left: CGRect,
+        _ right: CGRect,
+        windowID: CGWindowID?,
+        expectedWindowID: CGWindowID,
+        title: String?,
+        expectedTitle: String?
+    ) -> CGFloat {
+        if let windowID {
+            guard windowID == expectedWindowID else { return 0 }
+            return windowMatchScore(left, right)
+        }
+        return windowMatchScore(
+            left,
+            right,
+            title: title,
+            expectedTitle: expectedTitle
+        )
+    }
+
+    static func windowMatchScore(
+        _ left: CGRect,
+        _ right: CGRect,
+        title: String?,
+        expectedTitle: String?
+    ) -> CGFloat {
+        if let expectedTitle = normalizedWindowTitle(expectedTitle),
+           !windowTitlesMatch(normalizedWindowTitle(title), expectedTitle)
+        {
+            return 0
+        }
+        return windowMatchScore(left, right)
+    }
+
+    static func preferredWindowMatchIndex(
+        candidates: [(windowID: CGWindowID?, score: CGFloat)],
+        expectedWindowID: CGWindowID,
+        minimumScore: CGFloat = 0.7
+    ) -> Int? {
+        let matches = candidates.enumerated().filter { $0.element.score >= minimumScore }
+        let exactMatches = matches.filter { $0.element.windowID == expectedWindowID }
+        if exactMatches.count == 1 {
+            return exactMatches[0].offset
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0].offset
+    }
+
+    private static func windowTitlesMatch(_ title: String?, _ expectedTitle: String) -> Bool {
+        guard let title else { return false }
+        if title == expectedTitle { return true }
+        return title.hasPrefix(expectedTitle + " - ")
+            || expectedTitle.hasPrefix(title + " - ")
+    }
+
+    private static func normalizedWindowTitle(_ title: String?) -> String? {
+        guard let title else { return nil }
+        let normalized = title.split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
+        return normalized.isEmpty ? nil : normalized
     }
 
     static func windowMatchScore(_ left: CGRect, _ right: CGRect) -> CGFloat {

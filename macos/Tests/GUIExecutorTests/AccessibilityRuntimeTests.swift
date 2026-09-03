@@ -1,3 +1,4 @@
+import CoreGraphics
 import DeviceProtocol
 import Foundation
 @testable import GUIExecutor
@@ -474,6 +475,36 @@ import Testing
     #expect(try KeyParser.parse("End").keyCode == 119)
 }
 
+@Test func keyParserAcceptsBacktickBackspaceAndModifierOnlyKeys() throws {
+    #expect(try KeyParser.parse("CMD+`") == ParsedKey(keyCode: 50, flags: .maskCommand))
+    #expect(try KeyParser.parse("Backspace").keyCode == 51)
+    let modifiers: [(String, CGKeyCode, CGEventFlags)] = [
+        ("Shift", 56, .maskShift),
+        ("Command", 55, .maskCommand),
+        ("Control", 59, .maskControl),
+        ("Option", 58, .maskAlternate),
+    ]
+    for (key, keyCode, flag) in modifiers {
+        let parsed = try KeyParser.parse(key)
+        #expect(parsed.keyCode == keyCode)
+        #expect(parsed.keyDownFlags == flag)
+        #expect(parsed.keyUpFlags.isEmpty)
+    }
+    let commandShift = try KeyParser.parse("CMD+SHIFT")
+    #expect(commandShift.keyDownFlags == [.maskCommand, .maskShift])
+    #expect(commandShift.keyUpFlags == .maskCommand)
+    #expect(throws: ExecutionFailure.unsupportedKey) {
+        try KeyParser.parse("NotAKey")
+    }
+}
+
+@Test func onlyTransientAccessibilityFailuresAreRetriedDuringSettle() {
+    #expect(AccessibilityFailure.windowUnavailable.isTransientDuringSettle)
+    #expect(AccessibilityFailure.operationFailed.isTransientDuringSettle)
+    #expect(!AccessibilityFailure.permissionMissing.isTransientDuringSettle)
+    #expect(!AccessibilityFailure.staleTarget.isTransientDuringSettle)
+}
+
 @Test func accessibilityVisibilityRejectsHiddenAndOffWindowContent() {
     let window = CGRect(x: 100, y: 100, width: 800, height: 600)
 
@@ -532,6 +563,122 @@ import Testing
 
     #expect(AccessibilityRuntime.windowMatchScore(unrelated, expected) == 0)
     #expect(AccessibilityRuntime.windowMatchScore(dialog, expected) < 0.7)
+}
+
+@MainActor
+@Test func accessibilityWindowMatchingDisambiguatesIdenticalFramesByTitle() {
+    let frame = CGRect(x: 100, y: 80, width: 1_200, height: 800)
+
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        title: "New Incognito Tab - Google Chrome",
+        expectedTitle: "  New Incognito Tab  -  Google Chrome  "
+    ) == 1)
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        title: "Agent Remote - Google Chrome",
+        expectedTitle: "New Incognito Tab - Google Chrome"
+    ) == 0)
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        title: "Agent Remote - Google Chrome",
+        expectedTitle: nil
+    ) == 1)
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        title: "Agent Remote - Google Chrome",
+        expectedTitle: "Agent Remote"
+    ) == 1)
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        title: "Agent Remote",
+        expectedTitle: "Agent"
+    ) == 0)
+}
+
+@MainActor
+@Test func accessibilityWindowMatchingPrefersTheExactNumericWindowID() {
+    let frame = CGRect(x: 100, y: 80, width: 1_200, height: 800)
+
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        windowID: 42,
+        expectedWindowID: 42,
+        title: "AX title format",
+        expectedTitle: "ScreenCaptureKit title format"
+    ) == 1)
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        windowID: 43,
+        expectedWindowID: 42,
+        title: "Matching title",
+        expectedTitle: "Matching title"
+    ) == 0)
+    #expect(AccessibilityRuntime.windowMatchScore(
+        frame,
+        frame,
+        windowID: nil,
+        expectedWindowID: 42,
+        title: "Matching title",
+        expectedTitle: "Matching title"
+    ) == 1)
+}
+
+@MainActor
+@Test func accessibilityWindowSelectionPrefersAnExactIDOverAnIDLessAmbiguousMatch() {
+    let candidates: [(windowID: CGWindowID?, score: CGFloat)] = [
+        (windowID: 42, score: 1),
+        (windowID: nil, score: 1),
+    ]
+
+    #expect(AccessibilityRuntime.preferredWindowMatchIndex(
+        candidates: candidates,
+        expectedWindowID: 42
+    ) == 0)
+    #expect(AccessibilityRuntime.preferredWindowMatchIndex(
+        candidates: [
+            (windowID: 43, score: 1),
+            (windowID: nil, score: 1),
+        ],
+        expectedWindowID: 42
+    ) == nil)
+}
+
+@MainActor
+@Test func focusedAccessibilityWindowFallbackRequiresMatchingIdentityWhenAvailable() {
+    let frame = CGRect(x: 0, y: 40, width: 1_800, height: 1_070)
+
+    #expect(AccessibilityRuntime.focusedWindowCanRepresent(
+        frame: frame,
+        expectedFrame: frame,
+        windowID: nil,
+        expectedWindowID: 222_315
+    ))
+    #expect(AccessibilityRuntime.focusedWindowCanRepresent(
+        frame: frame,
+        expectedFrame: frame,
+        windowID: 222_315,
+        expectedWindowID: 222_315
+    ))
+    #expect(!AccessibilityRuntime.focusedWindowCanRepresent(
+        frame: frame,
+        expectedFrame: frame,
+        windowID: 221_756,
+        expectedWindowID: 222_315
+    ))
+    #expect(!AccessibilityRuntime.focusedWindowCanRepresent(
+        frame: CGRect(x: 500, y: 500, width: 400, height: 300),
+        expectedFrame: frame,
+        windowID: nil,
+        expectedWindowID: 222_315
+    ))
 }
 
 @Test func accessibilityTraversalPrefersBoundedBrowserAndRowChildren() {

@@ -987,10 +987,11 @@ fn compact_clipboard_result_v2(result: DeviceResultV2) -> Result<CallToolResult,
 
 fn render_v2_result(result: &DeviceResultV2) -> Result<String, String> {
     let mut lines = vec![format!(
-        "state={} generation={} screenshot_generation={} settle={:?} elapsed_ms={}",
+        "state={} generation={} screenshot_generation={} window_id={} settle={:?} elapsed_ms={}",
         result.state_id,
         result.state_generation,
         result.screenshot_generation,
+        result.window_id,
         result.settle.status,
         result.settle.elapsed_ms,
     )];
@@ -1909,6 +1910,33 @@ mod tests {
             typed_text_confirmation(&diff, "missing text"),
             TypedTextConfirmation::Inconclusive
         );
+    }
+
+    #[test]
+    fn rendered_v2_state_includes_the_selected_window_id() {
+        use crate::protocol_v2::{SettleResult, SettleStatus};
+
+        let result = DeviceResultV2 {
+            message: "Action completed.".to_owned(),
+            state_generation: 3,
+            screenshot_generation: 2,
+            state_id: Uuid::new_v4(),
+            application_digest: "a".repeat(64),
+            window_id: 42,
+            display_fingerprint: "display".to_owned(),
+            base_state_id: None,
+            observation: None,
+            settle: SettleResult {
+                status: SettleStatus::Settled,
+                elapsed_ms: 10,
+            },
+            screenshot: None,
+            retry_count: 0,
+            manual_recovery: false,
+        };
+
+        let rendered = render_v2_result(&result).expect("render v2 result");
+        assert!(rendered.contains("screenshot_generation=2 window_id=42 settle=Settled"));
     }
 
     #[test]

@@ -488,12 +488,24 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         var priorContent: Int?
         var stableSamples = 0
         repeat {
-            let fingerprint = try await MainActor.run {
-                try accessibility.stabilityFingerprint(
-                    context: context,
-                    policy: policy,
-                    trackingElementIndex: preparation?.trackedElementIndex
+            let fingerprint: AccessibilityStabilityFingerprint
+            do {
+                fingerprint = try await MainActor.run {
+                    try accessibility.stabilityFingerprint(
+                        context: context,
+                        policy: policy,
+                        trackingElementIndex: preparation?.trackedElementIndex
+                    )
+                }
+            } catch let failure as AccessibilityFailure
+                where failure.isTransientDuringSettle
+            {
+                let remainingMilliseconds = Int64(deadline.timeIntervalSinceNow * 1_000)
+                guard remainingMilliseconds > 0 else { break }
+                try await Task.sleep(
+                    for: .milliseconds(min(100, remainingMilliseconds))
                 )
+                continue
             }
             if let baseline {
                 let trackedElementDisappeared = baseline.trackedElementPresent == true
@@ -766,7 +778,8 @@ enum ActionSettleTiming {
         _ action: ActionV2,
         pressTargetsEditableText: Bool
     ) -> Bool {
-        switch action {
+        if action.mayChangeFrontmostWindow { return true }
+        return switch action {
         case .press:
             !pressTargetsEditableText
         case let .secondaryAction(_, actionName):

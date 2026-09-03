@@ -140,6 +140,58 @@ import Testing
     #expect(await recorder.preferredWindowIDs == [[], [7]])
 }
 
+@Test func legacyWindowManagementKeysDoNotRetainThePreviousWindowBinding() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        screenshotGeneration: 0,
+        action: .screenshot
+    ))
+    let newWindowData = try await controller.performAction(actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        screenshotGeneration: 1,
+        action: .key("CMD+N")
+    ))
+    let nextWindowData = try await controller.performAction(actionEnvelope(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 3,
+        screenshotGeneration: 2,
+        action: .key("CMD+`")
+    ))
+    let newWindow = try JSONDecoder().decode(ExecutorActionResponse.self, from: newWindowData)
+    let nextWindow = try JSONDecoder().decode(ExecutorActionResponse.self, from: nextWindowData)
+
+    #expect(newWindow.status == .success)
+    #expect(nextWindow.status == .success)
+    #expect(await recorder.actions == [.key("CMD+N"), .key("CMD+`")])
+    #expect(await recorder.preferredWindowIDs == [[], [], []])
+}
+
 @Test func repeatedAccessibilityObservationsReuseTheLatestBoundWindow() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
@@ -233,6 +285,7 @@ import Testing
     #expect(await recorder.elementActions == [.press(target)])
     #expect(await recorder.settlePhases == ["prepare", "execute"])
     #expect(await recorder.accessibilityClearCount == 0)
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
 
     let staleData = try await controller.performAction(actionEnvelopeV2(
         configuration: session,
@@ -302,6 +355,7 @@ import Testing
     let keyboard = try JSONDecoder().decode(ActionResponseV2.self, from: keyboardData)
     #expect(keyboard.status == .success)
     #expect(await recorder.actions == [.key("CMD+A")])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
 
     let clickData = try await controller.performAction(actionEnvelopeV2(
         configuration: session,
@@ -321,6 +375,489 @@ import Testing
     #expect(click.status == .failed)
     #expect(click.message.hasPrefix("fresh_screenshot_required:"))
     #expect(await recorder.actions == [.key("CMD+A")])
+}
+
+@Test func passiveWaitRetainsTheCurrentWindowBinding() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let waitData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.wait(50))
+    ))
+    let response = try JSONDecoder().decode(ActionResponseV2.self, from: waitData)
+
+    #expect(response.status == .success)
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
+}
+
+@Test func interactiveActionRetriesAndRebindsToANewFrontmostWindow() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextWindowIDs: [7, 7, 8]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        baseStateID: observed.stateID,
+        observation: ObservationPolicy(mode: .axDiff),
+        action: .coordinate(.key("CMD+`"))
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.windowID == 8)
+    #expect(action.baseStateID == nil)
+    #expect(await recorder.actions == [.key("CMD+`")])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [], []])
+    #expect(await recorder.accessibilityClearCount == 1)
+    #expect(await recorder.observationBaseStateIDs == [nil, nil])
+    #expect(await recorder.windowRefreshPhases == [
+        "window_context", "execute", "window_context", "window_context", "settle",
+    ])
+}
+
+@Test func elementWindowReplacementRetriesWithoutTheStaleWindowBinding() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextFailures: [nil, .approvedWindowMissing],
+            windowContextWindowIDs: [7, 8]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let target = ElementTarget(
+        stateID: try #require(observed.stateID),
+        stateGeneration: observed.stateGeneration,
+        applicationDigest: try #require(observed.applicationDigest),
+        windowID: try #require(observed.windowID),
+        displayFingerprint: try #require(observed.displayFingerprint),
+        elementIndex: 0
+    )
+
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: observed.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: observed.stateID,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .press(target)
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.windowID == 8)
+    #expect(action.baseStateID == nil)
+    #expect(await recorder.elementActions == [.press(target)])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7], []])
+    #expect(await recorder.accessibilityClearCount == 1)
+}
+
+@Test func elementWindowReplacementStillFailsClosedWithoutAnApprovedReplacement() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextFailures: [nil, .approvedWindowMissing, .approvedWindowMissing]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let observedData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let observed = try JSONDecoder().decode(ActionResponseV2.self, from: observedData)
+    let target = ElementTarget(
+        stateID: try #require(observed.stateID),
+        stateGeneration: observed.stateGeneration,
+        applicationDigest: try #require(observed.applicationDigest),
+        windowID: try #require(observed.windowID),
+        displayFingerprint: try #require(observed.displayFingerprint),
+        elementIndex: 0
+    )
+
+    let failureData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: observed.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: observed.stateID,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .press(target)
+    ))
+    let failure = try JSONDecoder().decode(ActionResponseV2.self, from: failureData)
+
+    #expect(failure.status == .failed)
+    #expect(failure.message.hasPrefix("window_refresh_failed:"))
+    #expect(await recorder.elementActions == [.press(target)])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7], []])
+    #expect(await controller.currentState() == .failed)
+    #expect(!(await controller.hasActiveSession()))
+}
+
+@Test func interactiveWindowRefreshTimesOutAStalledContextLookup() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextDelays: [0, 10_000]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+
+    let started = ContinuousClock.now
+    let failureData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settleTimeoutMilliseconds: 100
+        ),
+        action: .coordinate(.key("CMD+`"))
+    ))
+    let elapsed = ContinuousClock.now - started
+    let failure = try JSONDecoder().decode(ActionResponseV2.self, from: failureData)
+
+    #expect(failure.status == .failed)
+    #expect(failure.message.hasPrefix("window_refresh_failed:"))
+    #expect(elapsed < .seconds(1))
+    #expect(await controller.currentState() == .failed)
+    #expect(!(await controller.hasActiveSession()))
+    #expect(await recorder.actions == [.key("CMD+`")])
+}
+
+@Test func interactiveWindowRefreshUsesTheSettleDeadlineWithoutRestartingIt() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            settleDelayMilliseconds: 30,
+            windowContextWindowIDs: [7, 7]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let failureData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settleTimeoutMilliseconds: 1
+        ),
+        action: .coordinate(.key("CMD+`"))
+    ))
+    let failure = try JSONDecoder().decode(ActionResponseV2.self, from: failureData)
+
+    #expect(failure.status == .failed)
+    #expect(failure.message.hasPrefix("window_refresh_failed:"))
+    #expect(await recorder.actions == [.key("CMD+`")])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[]])
+    #expect(await recorder.windowRefreshPhases == [
+        "window_context", "execute",
+    ])
+    #expect(await controller.currentState() == .failed)
+    #expect(!(await controller.hasActiveSession()))
+}
+
+@Test func interactiveWindowRefreshFailureFailsClosedAfterTheActionWasAccepted() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextFailures: [nil, .approvedWindowMissing]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let failureData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.key("CMD+`"))
+    ))
+    let failure = try JSONDecoder().decode(ActionResponseV2.self, from: failureData)
+
+    #expect(failure.status == .failed)
+    #expect(failure.message.hasPrefix("window_refresh_failed:"))
+    #expect(await controller.currentState() == .failed)
+    #expect(!(await controller.hasActiveSession()))
+    #expect(await recorder.actions == [.key("CMD+`")])
+}
+
+@Test func noSettleWindowRefreshHonorsTheRequestLease() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextDelays: [0, 2_000]
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+
+    let shortLease = Date(
+        timeIntervalSince1970: ceil(Date().timeIntervalSince1970) + 2
+    )
+    let started = ContinuousClock.now
+    let failureData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        leaseUntil: shortLease,
+        observation: ObservationPolicy(
+            mode: .none,
+            settle: .none,
+            settleTimeoutMilliseconds: 0,
+            imageProfile: .none
+        ),
+        action: .coordinate(.key("CMD+`"))
+    ))
+    let elapsed = ContinuousClock.now - started
+    let failure = try JSONDecoder().decode(ActionResponseV2.self, from: failureData)
+
+    #expect(failure.status == .failed)
+    #expect(failure.message.hasPrefix("window_refresh_failed:"))
+    #expect(elapsed < .seconds(5))
+    #expect(await controller.currentState() == .failed)
 }
 
 @Test func executorReturnsV2ActivationFailureWithoutDroppingTheSession() async throws {
@@ -914,6 +1451,12 @@ import Testing
             for: .coordinate(.key(shortcut))
         ) == 6)
     }
+    for shortcut in ["cmd+n", "cmd+shift+n", "shift+cmd+n", "cmd+`", "command+shift+`"] {
+        let action = ActionV2.coordinate(.key(shortcut))
+        #expect(action.mayChangeFrontmostWindow)
+        #expect(ActionSettleTiming.requiresMeaningfulChange(for: action))
+        #expect(ActionSettleTiming.requiredStableSamples(for: action) == 6)
+    }
     #expect(ActionSettleTiming.noChangeGraceMilliseconds(for: .press(target)) == 2_000)
     #expect(ActionSettleTiming.noChangeGraceMilliseconds(
         for: .coordinate(.type("text"))
@@ -1255,7 +1798,7 @@ import Testing
             guardState: guardState,
             recorder: recorder,
             settleStatus: .timeout,
-            settleElapsedMilliseconds: 5_000
+            settleElapsedMilliseconds: 5_001
         )
     }
     let base = configuration(leaseUntil: Date().addingTimeInterval(60))
@@ -1304,6 +1847,127 @@ import Testing
     #expect(action.image == nil)
     #expect(await recorder.observationBaseStateIDs == [nil, initialStateID])
     #expect(await recorder.actions == [.key("Tab")])
+}
+
+@Test func fixedSettleLeavesABoundedWindowRefreshBudget() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            settleDelayMilliseconds: 30
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let initialData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let initial = try JSONDecoder().decode(ActionResponseV2.self, from: initialData)
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: initial.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: initial.stateID,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settle: .fixed,
+            settleTimeoutMilliseconds: 1,
+            imageProfile: .none
+        ),
+        action: .coordinate(.key("Tab"))
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.settle.status == .settled)
+    #expect(await recorder.actions == [.key("Tab")])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
+}
+
+@Test func automaticSettleLeavesABoundedSameWindowRefreshBudget() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            settleStatus: .timeout,
+            settleElapsedMilliseconds: 30,
+            settleDelayMilliseconds: 30
+        )
+    }
+    let base = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let session = ExecutorSessionConfiguration(
+        binding: base.binding,
+        leaseUntil: base.leaseUntil,
+        approvals: base.approvals.map {
+            LocalApproval(
+                application: $0.application,
+                controlLevel: .fullControl,
+                clipboardAllowed: $0.clipboardAllowed,
+                generation: $0.generation
+            )
+        }
+    )
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let initialData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    let initial = try JSONDecoder().decode(ActionResponseV2.self, from: initialData)
+    let actionData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: initial.stateGeneration,
+        screenshotGeneration: 0,
+        baseStateID: initial.stateID,
+        observation: ObservationPolicy(
+            mode: .axDiff,
+            settle: .auto,
+            settleTimeoutMilliseconds: 1,
+            imageProfile: .none
+        ),
+        action: .coordinate(.key("Return"))
+    ))
+    let action = try JSONDecoder().decode(ActionResponseV2.self, from: actionData)
+
+    #expect(action.status == .success)
+    #expect(action.settle == SettleResult(status: .timeout, elapsedMilliseconds: 1))
+    #expect(await recorder.actions == [.key("Return")])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
+    #expect(await controller.currentState() == .active)
 }
 
 @Test func executorSessionControllerActivatesStopsAndEndsOneBoundSession() async throws {
@@ -3534,6 +4198,7 @@ private func actionEnvelopeV2(
     stateGeneration: UInt64,
     screenshotGeneration: UInt64,
     baseStateID: UUID? = nil,
+    leaseUntil: Date? = nil,
     observation: ObservationPolicy,
     action: ActionV2
 ) throws -> Data {
@@ -3553,7 +4218,7 @@ private func actionEnvelopeV2(
             currentScreenshotGeneration: screenshotGeneration,
             baseStateID: baseStateID
         ),
-        leaseUntil: configuration.leaseUntil,
+        leaseUntil: leaseUntil ?? configuration.leaseUntil,
         observation: observation,
         action: action
     )
@@ -3588,6 +4253,7 @@ private actor RuntimeRecorder {
     private(set) var valueFreshnessCalls: [(ElementTarget, String, Date)] = []
     private(set) var observationBaseStateIDs: [UUID?] = []
     private(set) var settlePhases: [String] = []
+    private(set) var windowRefreshPhases: [String] = []
 
     func captured(targetApplication: String? = nil) {
         captureCount += 1
@@ -3600,6 +4266,7 @@ private actor RuntimeRecorder {
 
     func resolvedWindowContext(preferredWindowContexts: [WindowContext]) {
         windowContextPreferredWindowIDs.append(preferredWindowContexts.map(\.windowID))
+        windowRefreshPhases.append("window_context")
     }
 
     func readClipboard(maximumBytes: Int) {
@@ -3609,11 +4276,13 @@ private actor RuntimeRecorder {
     func executed(_ action: Action) {
         actions.append(action)
         settlePhases.append("execute")
+        windowRefreshPhases.append("execute")
     }
 
     func executedElement(_ action: ActionV2) {
         elementActions.append(action)
         settlePhases.append("execute")
+        windowRefreshPhases.append("execute")
     }
 
     func released() {
@@ -3639,6 +4308,10 @@ private actor RuntimeRecorder {
 
     func preparedSettle() {
         settlePhases.append("prepare")
+    }
+
+    func settled() {
+        windowRefreshPhases.append("settle")
     }
 }
 
@@ -3979,38 +4652,50 @@ private actor RuntimeStub: GUIActionRuntime {
     private let recorder: RuntimeRecorder
     private var observationValues: [String?]
     private let contextActionFailure: CaptureFailure?
+    private var windowContextFailures: [CaptureFailure?]
     private let valueFreshnessConfirmed: Bool
     private let settleObservedMeaningfulChange: Bool
     private let settlePressTargetWasEditableText: Bool
     private let settleStatus: SettleStatus
     private let settleElapsedMilliseconds: UInt32
+    private let settleDelayMilliseconds: UInt64
     private let currentSnapshotHasPageIdentity: Bool
     private var windowContextFrames: [CGRect]
+    private var windowContextWindowIDs: [UInt32]
+    private var windowContextDelays: [UInt64]
 
     init(
         guardState: SessionGuard,
         recorder: RuntimeRecorder,
         observationValues: [String?] = [],
         contextActionFailure: CaptureFailure? = nil,
+        windowContextFailures: [CaptureFailure?] = [],
         valueFreshnessConfirmed: Bool = true,
         settleObservedMeaningfulChange: Bool = false,
         settlePressTargetWasEditableText: Bool = false,
         settleStatus: SettleStatus = .settled,
         settleElapsedMilliseconds: UInt32 = 0,
+        settleDelayMilliseconds: UInt64 = 0,
         currentSnapshotHasPageIdentity: Bool = true,
-        windowContextFrames: [CGRect] = []
+        windowContextFrames: [CGRect] = [],
+        windowContextWindowIDs: [UInt32] = [],
+        windowContextDelays: [UInt64] = []
     ) {
         self.guardState = guardState
         self.recorder = recorder
         self.observationValues = observationValues
         self.contextActionFailure = contextActionFailure
+        self.windowContextFailures = windowContextFailures
         self.valueFreshnessConfirmed = valueFreshnessConfirmed
         self.settleObservedMeaningfulChange = settleObservedMeaningfulChange
         self.settlePressTargetWasEditableText = settlePressTargetWasEditableText
         self.settleStatus = settleStatus
         self.settleElapsedMilliseconds = settleElapsedMilliseconds
+        self.settleDelayMilliseconds = settleDelayMilliseconds
         self.currentSnapshotHasPageIdentity = currentSnapshotHasPageIdentity
         self.windowContextFrames = windowContextFrames
+        self.windowContextWindowIDs = windowContextWindowIDs
+        self.windowContextDelays = windowContextDelays
     }
 
     func capture(
@@ -4057,14 +4742,31 @@ private actor RuntimeStub: GUIActionRuntime {
         await recorder.resolvedWindowContext(
             preferredWindowContexts: preferredWindowContexts
         )
+        if !windowContextDelays.isEmpty {
+            let delay = windowContextDelays.removeFirst()
+            if delay > 0 {
+                try await Task.sleep(for: .milliseconds(delay))
+            }
+        }
+        if !windowContextFailures.isEmpty,
+           let windowContextFailure = windowContextFailures.removeFirst()
+        {
+            throw windowContextFailure
+        }
         let capture = try await capture(
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
-        guard !windowContextFrames.isEmpty else { return capture.windowContext }
+        guard !windowContextFrames.isEmpty || !windowContextWindowIDs.isEmpty else {
+            return capture.windowContext
+        }
         return WindowContext(
-            windowID: capture.windowID,
-            windowFrame: windowContextFrames.removeFirst(),
+            windowID: windowContextWindowIDs.isEmpty
+                ? capture.windowID
+                : windowContextWindowIDs.removeFirst(),
+            windowFrame: windowContextFrames.isEmpty
+                ? capture.windowFrame
+                : windowContextFrames.removeFirst(),
             processID: capture.processID,
             application: capture.application,
             displayFingerprint: capture.displayFingerprint
@@ -4189,7 +4891,11 @@ private actor RuntimeStub: GUIActionRuntime {
         preparation _: ActionSettlePreparation?,
         deadline _: Date
     ) async throws -> ActionSettleOutcome {
-        ActionSettleOutcome(
+        if settleDelayMilliseconds > 0 {
+            try await Task.sleep(for: .milliseconds(settleDelayMilliseconds))
+        }
+        await recorder.settled()
+        return ActionSettleOutcome(
             result: SettleResult(
                 status: policy.settle == .none ? .notRequested : settleStatus,
                 elapsedMilliseconds: policy.settle == .none ? 0 : settleElapsedMilliseconds

@@ -213,7 +213,27 @@ actions, retain the exact signed process, window ID, and display fingerprint but
 not reject the frame transition macOS may report while activating a full-screen Space.
 During that transition they may resolve the exact window ID from the all-Space list
 after the target process is confirmed frontmost. Coordinate actions still require
-the window to be on-screen.
+the window to be on-screen. The follow-up observation may bind to a newly frontmost
+window created or selected by the interactive action; changing that identity resets
+the prior window's accessibility state. If an interactive action has already been
+accepted but its post-action window cannot be resolved before the adaptive settle
+deadline, the Executor returns a failed `window_refresh_failed` response with no
+state fields and fails the local session closed. `fixed` settling is a compatibility
+and diagnostic path: its requested wait is followed by a separately bounded
+post-action context phase, still capped by the lease. The proxy treats that stable
+error code as terminal and poisons the current transport generation; it never
+attempts to send another action with an unverified sequence.
+An automatic-settle window-management shortcut resolves and confirms the new
+frontmost window before settling, then debounces the new window's AX tree within
+the original settle deadline. A transiently unavailable AX window is retried inside
+that deadline without weakening the exact window binding.
+
+Keyboard actions accept `Backspace` as an alias for `Delete`, the backtick key, and
+modifier-only keys including `Shift`, `Cmd`/`Command`/`Super`, `Ctrl`/`Control`, and
+`Alt`/`Option`. Modifier combinations continue to use `+`.
+Window-management shortcuts such as `Cmd+N` and `Cmd+grave` are sent through normal HID
+routing after the exact approved process is frontmost, so macOS can create or select
+the intended application window instead of treating the shortcut as a PID-local key.
 
 ### Bounded accessibility state and diffs
 
@@ -298,10 +318,12 @@ WebArea role, title, and URL, so focus, tab-memory labels, and browser-chrome po
 changes cannot falsely satisfy navigation settle. The complete normalized AX
 fingerprint must then stabilize before return. Non-browser applications fall back
 to a meaningful complete-tree change. If no change occurs, one bounded two-second
-grace lets a legitimate no-op finish without waiting for the hard timeout. Settling
-stops at the minimum of five seconds, the requested
-hard-bounded timeout, the remaining lease, and the action deadline. Timeout returns
-the newest safe state with `status: timeout`; it is not reported as settled.
+grace lets a legitimate no-op finish without waiting for the hard timeout. Adaptive
+settling stops at the minimum of five seconds, the requested hard-bounded timeout,
+the remaining lease, and the action deadline. Fixed settling waits its requested
+bounded interval and then uses the separate bounded post-action context phase
+described above. Timeout returns the newest safe state with `status: timeout`; it is
+not reported as settled.
 
 A press bound to a settable `AXTextField`, `AXTextArea`, or `AXSearchField` is
 classified as local focus rather than navigation. It uses the shorter local settle

@@ -10,6 +10,27 @@ import Testing
     #expect(!Action.zoom(Region(x: 0, y: 0, width: 1, height: 1)).requiresForegroundApplication)
     #expect(Action.key("return").requiresForegroundApplication)
     #expect(Action.leftClick(Point(x: 0, y: 0)).requiresForegroundApplication)
+    #expect(!ActionV2.coordinate(.wait(50)).requiresForegroundApplication)
+    #expect(ActionV2.coordinate(.key("return")).requiresForegroundApplication)
+}
+
+@Test func frontmostWindowShortcutsUseTheCanonicalActionClassifier() {
+    for key in ["cmd+n", "cmd+shift+n", "shift+cmd+n", "cmd+`", "command+shift+`"] {
+        #expect(Action.key(key).mayChangeFrontmostWindow)
+        #expect(ActionV2.coordinate(.key(key)).mayChangeFrontmostWindow)
+    }
+    for key in ["cmd+tab", "cmd+alt+n", "ctrl+n", "n"] {
+        #expect(!Action.key(key).mayChangeFrontmostWindow)
+        #expect(!ActionV2.coordinate(.key(key)).mayChangeFrontmostWindow)
+    }
+    #expect(!ActionV2.press(ElementTarget(
+        stateID: UUID(),
+        stateGeneration: 1,
+        applicationDigest: "app",
+        windowID: 1,
+        displayFingerprint: "display",
+        elementIndex: 0
+    )).mayChangeFrontmostWindow)
 }
 
 @Test func decodesCrossLanguageVector() throws {
@@ -190,4 +211,18 @@ import Testing
         #expect(Action.key(key).hasValidParameters)
     }
     #expect(Action.key("CMD+[").hasValidParameters)
+    for key in ["Backspace", "CMD+`", "Shift", "Command", "Control", "Option"] {
+        #expect(Action.key(key).hasValidParameters)
+    }
+    #expect(!Action.key("not/a/key").hasValidParameters)
+}
+
+@Test func decodesCrossLanguageKeyVector() throws {
+    let url = try #require(Bundle.module.url(
+        forResource: "action-request-key-valid",
+        withExtension: "json",
+        subdirectory: "Fixtures"
+    ))
+    let request = try ActionRequest.decodeStrict(Data(contentsOf: url))
+    #expect(request.action == .key("CMD+`"))
 }

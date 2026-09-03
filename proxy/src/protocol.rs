@@ -201,13 +201,23 @@ fn valid_key(key: &str) -> bool {
             | "N"
             | "M"
             | "."
+            | "`"
             | "TAB"
             | "SPACE"
             | "DELETE"
+            | "BACKSPACE"
             | "ESC"
             | "ESCAPE"
             | "RETURN"
             | "ENTER"
+            | "CMD"
+            | "COMMAND"
+            | "SUPER"
+            | "SHIFT"
+            | "ALT"
+            | "OPTION"
+            | "CTRL"
+            | "CONTROL"
             | "LEFT"
             | "RIGHT"
             | "DOWN"
@@ -245,8 +255,31 @@ mod tests {
         for key in ["Page Up", "PageUp", "Page Down", "PageDown", "Home", "End"] {
             assert!(valid_key(key), "expected {key} to be accepted");
         }
-        assert!(!valid_key("CMD+`"));
+        for key in [
+            "Backspace",
+            "CMD+`",
+            "Shift",
+            "Command",
+            "Control",
+            "Option",
+        ] {
+            assert!(valid_key(key), "expected {key} to be accepted");
+        }
+        assert!(!valid_key("CMD/DELETE"));
         assert!(!valid_key("not/a/key"));
+    }
+
+    #[test]
+    fn cross_language_key_vector_decodes() {
+        let raw = include_str!("../../protocol/test-vectors/action-request-key-valid.json");
+        let request: ActionRequest = serde_json::from_str(raw).expect("valid key fixture");
+        assert_eq!(
+            request.action,
+            Action::Key {
+                key: "CMD+`".to_owned()
+            }
+        );
+        assert!(request.action.validate_parameters());
     }
 
     #[test]

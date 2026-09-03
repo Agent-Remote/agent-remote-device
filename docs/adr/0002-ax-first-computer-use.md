@@ -55,7 +55,9 @@ window ID, display fingerprint, and index. A stale target is rejected; the
 Executor never searches by name or substitutes a neighboring element. AX frames
 are metadata, not screenshot coordinates; explicit coordinates remain a
 screenshot-generation-bound fallback. Adaptive settling is bounded by the request,
-lease, and action deadline and reports timeout honestly. Navigation-capable actions
+lease, and action deadline and reports timeout honestly. Fixed settling remains a
+compatibility and diagnostic path with a separate bounded post-action context phase.
+Navigation-capable actions
 wait for an `AXWebArea` page-identity change before their stable debounce, then
 require the complete AX fingerprint to stabilize. Browser chrome and focus noise
 cannot satisfy the page-identity gate. Non-browser apps use a complete-tree change,
@@ -70,6 +72,18 @@ Editable text-field presses use the local settle class and retain their bounded
 diff. The timeout path is covered deterministically: it returns one finite safe
 observation with `status=timeout` and does not retry the action. Acceptance runs do
 not manufacture a timeout; an untriggered conditional branch is not a warning.
+
+If an interactive action has already been accepted but its post-action window
+cannot be resolved before the adaptive settle deadline, the Executor fails the
+local session closed and returns a state-free `window_refresh_failed` rejection.
+For an automatic-settle window-management shortcut, the Executor confirms the
+new frontmost window first and then debounces that new window's AX tree within the
+same deadline; it does not spend the deadline settling the window that was just
+left. Transient AX window lookup failures during settle are retried only within
+that existing deadline.
+Fixed settling receives its bounded context phase after the requested wait, still
+within the lease. The proxy poisons that transport generation instead of attempting
+to reuse the consumed sequence.
 
 Retained bindings also support direct cross-application workflows. Before acting
 on a background application's retained element, the Executor requires that exact

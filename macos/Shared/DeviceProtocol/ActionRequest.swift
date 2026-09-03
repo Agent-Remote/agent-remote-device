@@ -150,12 +150,49 @@ public enum Action: Sendable, Equatable {
         }
     }
 
-    private static func isValidKey(_ key: String) -> Bool {
-        !key.isEmpty && key.utf8.count <= 64 && key.utf8.allSatisfy {
-            ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
-                || [32, 39, 43, 44, 45, 46, 59, 61, 91, 92, 93, 95].contains($0)
-        }
+    /// Whether normal HID routing is required because the key can change the
+    /// frontmost window within the approved application.
+    public var mayChangeFrontmostWindow: Bool {
+        guard case let .key(key) = self else { return false }
+        return Self.isFrontmostWindowShortcut(key)
     }
+
+    private static func isValidKey(_ key: String) -> Bool {
+        guard !key.isEmpty, key.utf8.count <= 64 else { return false }
+        let components = key.components(separatedBy: "+").map { $0.uppercased() }
+        guard let rawKeyName = components.last, !rawKeyName.isEmpty else { return false }
+        let validModifiers = Set([
+            "CMD", "COMMAND", "SUPER", "CTRL", "CONTROL", "ALT", "OPTION", "SHIFT",
+        ])
+        guard components.dropLast().allSatisfy(validModifiers.contains) else { return false }
+        let keyName = switch rawKeyName {
+        case "PAGE UP", "PAGE_UP", "PAGE-UP": "PAGEUP"
+        case "PAGE DOWN", "PAGE_DOWN", "PAGE-DOWN": "PAGEDOWN"
+        default: rawKeyName
+        }
+        return validKeyNames.contains(keyName)
+    }
+
+    private static func isFrontmostWindowShortcut(_ key: String) -> Bool {
+        let components = key.uppercased().split(separator: "+").map(String.init)
+        guard let keyName = components.last else { return false }
+        let modifiers = Set(components.dropLast())
+        let commandModifiers: Set<String> = ["CMD", "COMMAND", "SUPER"]
+        guard !modifiers.isDisjoint(with: commandModifiers),
+              modifiers.isSubset(of: commandModifiers.union(["SHIFT"]))
+        else { return false }
+        return keyName == "N" || keyName == "`"
+    }
+
+    private static let validKeyNames = Set([
+        "A", "S", "D", "F", "H", "G", "Z", "X", "C", "V", "B", "Q", "W", "E",
+        "R", "Y", "T", "1", "2", "3", "4", "6", "5", "=", "9", "7", "-", "8",
+        "0", "]", "O", "U", "[", "I", "P", "L", "J", "'", "K", ";", "\\", ",",
+        "/", "N", "M", ".", "`", "TAB", "SPACE", "DELETE", "BACKSPACE", "ESC",
+        "ESCAPE", "RETURN", "ENTER", "CMD", "COMMAND", "SUPER", "SHIFT", "ALT",
+        "OPTION", "CTRL", "CONTROL", "LEFT", "RIGHT", "DOWN", "UP", "PAGEUP",
+        "PAGEDOWN", "HOME", "END",
+    ])
 }
 
 extension Action: Codable {

@@ -20,6 +20,7 @@ public actor GUIExecutorSessionController {
     private let runtimeFactory: RuntimeFactory
     private let automaticTerminationHandler: @Sendable (Bool) -> Void
     private var automaticTerminationDisabled = false
+    private static let windowContextRefreshTimeoutSeconds: TimeInterval = 8
 
     public init(
         runtimeFactory: @escaping RuntimeFactory = { guardState in
@@ -369,7 +370,9 @@ public actor GUIExecutorSessionController {
                 capture = try await runtime.captureV2(
                     approvedApplications: approvedApplications,
                     targetApplication: latestCapture.application.bundleIdentifier,
-                    preferredWindowContexts: [latestCapture.windowContext],
+                    preferredWindowContexts: request.action.mayChangeFrontmostWindow
+                        ? []
+                        : [latestCapture.windowContext],
                     profile: .standard,
                     region: nil
                 )
@@ -679,17 +682,203 @@ public actor GUIExecutorSessionController {
             ? nil
             : request.context.baseStateID
         let actionApplication = windowContext.application.bundleIdentifier
-        if !isObservationOnly {
+        let settleDeadline = min(
+            Date().addingTimeInterval(
+                Double(request.observation.settleTimeoutMilliseconds) / 1_000
+            ),
+            request.leaseUntil
+        )
+        let mayChangeFrontmostWindow = request.action.mayChangeFrontmostWindow
+        // A no-settle request still gets one context refresh. It has no settle
+        // retry window, but the lookup remains bounded by both its lease and the
+        // normal context lookup timeout.
+        let postActionDeadline: Date = switch request.observation.settle {
+        case .none:
+            min(
+                request.leaseUntil,
+                Date().addingTimeInterval(Self.windowContextRefreshTimeoutSeconds)
+            )
+        case .fixed:
+            // A fixed settle consumes its requested wait before the mandatory
+            // post-action context check. Keep that check bounded without
+            // making the fixed wait path fail by construction.
+            min(
+                request.leaseUntil,
+                settleDeadline.addingTimeInterval(Self.windowContextRefreshTimeoutSeconds)
+            )
+        case .auto:
+            if mayChangeFrontmostWindow {
+                settleDeadline
+            } else {
+                min(
+                    request.leaseUntil,
+                    settleDeadline.addingTimeInterval(Self.windowContextRefreshTimeoutSeconds)
+                )
+            }
+        }
+        let refreshBeforeSettle = mayChangeFrontmostWindow
+            && request.observation.settle == .auto
+        var settlePreparationForContext = settlePreparation
+
+        if refreshBeforeSettle {
             do {
-                let refreshed = try await runtime.windowContext(
+                let preferredWindowContexts = windowContextsByApplication.values.filter {
+                    $0.application.stableDigest != windowContext.application.stableDigest
+                }
+                var refreshed = try await Self.boundedWindowContext(
+                    runtime: runtime,
                     approvedApplications: approvedApplications,
                     targetApplication: actionApplication,
-                    preferredWindowContexts: [windowContext]
-                        + windowContextsByApplication.values.filter {
-                            $0.application.stableDigest
-                                != windowContext.application.stableDigest
-                        }
+                    preferredWindowContexts: Array(preferredWindowContexts),
+                    deadline: postActionDeadline
                 )
+                while Self.sameAccessibilityIdentity(refreshed, windowContext),
+                      Date() < postActionDeadline
+                {
+                    let remainingMilliseconds = Int64(
+                        postActionDeadline.timeIntervalSinceNow * 1_000
+                    )
+                    guard remainingMilliseconds > 0 else { break }
+                    try await Task.sleep(
+                        for: .milliseconds(min(100, remainingMilliseconds))
+                    )
+                    refreshed = try await Self.boundedWindowContext(
+                        runtime: runtime,
+                        approvedApplications: approvedApplications,
+                        targetApplication: actionApplication,
+                        preferredWindowContexts: Array(preferredWindowContexts),
+                        deadline: postActionDeadline
+                    )
+                }
+                if Self.sameAccessibilityIdentity(refreshed, windowContext) {
+                    return try await failClosedResponseV2(
+                        request: request,
+                        code: "window_refresh_failed",
+                        message: "The action may have changed the frontmost window, but the new window could not be confirmed before the action deadline."
+                    )
+                }
+                latestCapture = nil
+                let applicationDigest = windowContext.application.stableDigest
+                await runtime.clearAccessibilityState(applicationDigest: applicationDigest)
+                await guardState.discardState(applicationDigest: applicationDigest)
+                windowContextsByApplication.removeValue(forKey: applicationDigest)
+                observationBaseStateID = nil
+                windowContext = refreshed
+                // The confirmed window identity is the meaningful change. Settle
+                // now needs only to debounce that new window's AX tree.
+                settlePreparationForContext = ActionSettlePreparation(
+                    baseline: nil,
+                    pressTargetWasEditableText: false
+                )
+            } catch let failure as CaptureFailure {
+                return try await failClosedResponseV2(
+                    request: request,
+                    code: "window_refresh_failed",
+                    message: failure.userMessage
+                )
+            } catch {
+                return try await failClosedResponseV2(
+                    request: request,
+                    code: "window_refresh_failed",
+                    message: "The post-action window context could not be resolved."
+                )
+            }
+        }
+        let settleOutcome: ActionSettleOutcome
+        if isObservationOnly {
+            settleOutcome = ActionSettleOutcome(
+                result: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
+                observedMeaningfulChange: false
+            )
+        } else {
+            do {
+                settleOutcome = try await runtime.settle(
+                    context: windowContext,
+                    policy: request.observation,
+                    action: request.action,
+                    preparation: settlePreparationForContext,
+                    deadline: settleDeadline
+                )
+            } catch {
+                settleOutcome = ActionSettleOutcome(
+                    result: SettleResult(status: .timeout, elapsedMilliseconds: 0),
+                    observedMeaningfulChange: false
+                )
+                message += " Adaptive settle was unavailable."
+            }
+        }
+        let settle = SettleResult(
+            status: settleOutcome.result.status,
+            elapsedMilliseconds: min(
+                settleOutcome.result.elapsedMilliseconds,
+                request.observation.settleTimeoutMilliseconds
+            )
+        )
+
+        if !isObservationOnly, !refreshBeforeSettle {
+            do {
+                let retainedCurrentContext = mayChangeFrontmostWindow
+                    ? []
+                    : [windowContext]
+                let preferredWindowContexts = retainedCurrentContext
+                    + windowContextsByApplication.values.filter {
+                        $0.application.stableDigest
+                            != windowContext.application.stableDigest
+                    }
+                var refreshed: WindowContext
+                do {
+                    refreshed = try await Self.boundedWindowContext(
+                        runtime: runtime,
+                        approvedApplications: approvedApplications,
+                        targetApplication: actionApplication,
+                        preferredWindowContexts: preferredWindowContexts,
+                        deadline: postActionDeadline
+                    )
+                } catch let failure as CaptureFailure
+                    where failure == .approvedWindowMissing
+                        && Self.mayCloseOrReplaceWindow(request.action)
+                {
+                    // An AX press or named action may have closed the bound
+                    // window. Re-resolve within the approved application once
+                    // without forcing the stale window ID; a second failure
+                    // remains terminal because the action already ran.
+                    refreshed = try await Self.boundedWindowContext(
+                        runtime: runtime,
+                        approvedApplications: approvedApplications,
+                        targetApplication: actionApplication,
+                        preferredWindowContexts: [],
+                        deadline: postActionDeadline
+                    )
+                }
+                while request.observation.settle != .none,
+                      mayChangeFrontmostWindow,
+                      Self.sameAccessibilityIdentity(refreshed, windowContext),
+                      Date() < postActionDeadline
+                {
+                    let remainingMilliseconds = Int64(
+                        postActionDeadline.timeIntervalSinceNow * 1_000
+                    )
+                    guard remainingMilliseconds > 0 else { break }
+                    try await Task.sleep(
+                        for: .milliseconds(min(100, remainingMilliseconds))
+                    )
+                    refreshed = try await Self.boundedWindowContext(
+                        runtime: runtime,
+                        approvedApplications: approvedApplications,
+                        targetApplication: actionApplication,
+                        preferredWindowContexts: preferredWindowContexts,
+                        deadline: postActionDeadline
+                    )
+                }
+                if mayChangeFrontmostWindow,
+                   Self.sameAccessibilityIdentity(refreshed, windowContext)
+                {
+                    return try await failClosedResponseV2(
+                        request: request,
+                        code: "window_refresh_failed",
+                        message: "The action may have changed the frontmost window, but the new window could not be confirmed before the action deadline."
+                    )
+                }
                 if !Self.sameAccessibilityIdentity(refreshed, windowContext) {
                     latestCapture = nil
                     let applicationDigest = windowContext.application.stableDigest
@@ -700,37 +889,19 @@ public actor GUIExecutorSessionController {
                 }
                 windowContext = refreshed
             } catch let failure as CaptureFailure {
-                message += " Follow-up window refresh failed (\(failure.diagnosticCode))."
-            }
-        }
-        let settleOutcome: ActionSettleOutcome
-        if isObservationOnly {
-            settleOutcome = ActionSettleOutcome(
-                result: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
-                observedMeaningfulChange: false
-            )
-        } else {
-            let requestedDeadline = Date().addingTimeInterval(
-                Double(request.observation.settleTimeoutMilliseconds) / 1_000
-            )
-            let deadline = min(requestedDeadline, request.leaseUntil)
-            do {
-                settleOutcome = try await runtime.settle(
-                    context: windowContext,
-                    policy: request.observation,
-                    action: request.action,
-                    preparation: settlePreparation,
-                    deadline: deadline
+                return try await failClosedResponseV2(
+                    request: request,
+                    code: "window_refresh_failed",
+                    message: failure.userMessage
                 )
             } catch {
-                settleOutcome = ActionSettleOutcome(
-                    result: SettleResult(status: .timeout, elapsedMilliseconds: 0),
-                    observedMeaningfulChange: false
+                return try await failClosedResponseV2(
+                    request: request,
+                    code: "window_refresh_failed",
+                    message: "The post-action window context could not be resolved."
                 )
-                message += " Adaptive settle was unavailable."
             }
         }
-        let settle = settleOutcome.result
 
         var observation: AccessibilityObservation?
         var stateContext: AccessibilityStateContext?
@@ -967,6 +1138,15 @@ public actor GUIExecutorSessionController {
             && left.displayFingerprint == right.displayFingerprint
     }
 
+    private static func mayCloseOrReplaceWindow(_ action: ActionV2) -> Bool {
+        switch action {
+        case .press, .secondaryAction:
+            true
+        default:
+            false
+        }
+    }
+
     static func needsNavigationObservationRecovery(
         settleOutcome: ActionSettleOutcome,
         observation: AccessibilityObservation,
@@ -1041,6 +1221,50 @@ public actor GUIExecutorSessionController {
             image: nil
         )
         return try JSONEncoder().encode(response)
+    }
+
+    private func failClosedResponseV2(
+        request: ActionRequestV2,
+        code: String,
+        message: String
+    ) async throws -> Data {
+        await failCurrentSession()
+        return try failureResponseV2(
+            request: request,
+            code: code,
+            message: message
+        )
+    }
+
+    private static func boundedWindowContext(
+        runtime: any GUIActionRuntime,
+        approvedApplications: [ApplicationIdentity],
+        targetApplication: String?,
+        preferredWindowContexts: [WindowContext],
+        deadline: Date?
+    ) async throws -> WindowContext {
+        if let deadline {
+            let remainingMilliseconds = Int64(deadline.timeIntervalSinceNow * 1_000)
+            guard remainingMilliseconds > 0 else {
+                throw CaptureFailure.operationTimedOut
+            }
+            return try await WindowCapture.withOperationTimeout(
+                .milliseconds(max(1, remainingMilliseconds))
+            ) {
+                try await runtime.windowContext(
+                    approvedApplications: approvedApplications,
+                    targetApplication: targetApplication,
+                    preferredWindowContexts: preferredWindowContexts
+                )
+            }
+        }
+        return try await WindowCapture.withOperationTimeout {
+            try await runtime.windowContext(
+                approvedApplications: approvedApplications,
+                targetApplication: targetApplication,
+                preferredWindowContexts: preferredWindowContexts
+            )
+        }
     }
 
     private func recoverableGuardFailureV2(

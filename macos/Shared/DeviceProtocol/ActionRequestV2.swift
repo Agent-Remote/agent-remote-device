@@ -313,6 +313,23 @@ public enum ActionV2: Sendable, Equatable {
         }
     }
 
+    public var requiresForegroundApplication: Bool {
+        switch self {
+        case .observe, .readClipboard:
+            false
+        case let .coordinate(action):
+            action.requiresForegroundApplication
+        case .press, .setValue, .selectText, .scrollElement, .secondaryAction:
+            true
+        }
+    }
+
+    /// Whether the coordinate key can create or select a different window.
+    public var mayChangeFrontmostWindow: Bool {
+        guard case let .coordinate(action) = self else { return false }
+        return action.mayChangeFrontmostWindow
+    }
+
     private static func validBoundedText(_ value: String, maximumCharacters: Int) -> Bool {
         !value.isEmpty && value.count <= maximumCharacters
             && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
