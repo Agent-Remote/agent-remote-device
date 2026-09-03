@@ -2,6 +2,13 @@
 
 All notable changes to this repository are recorded here.
 
+## v0.2.12 - 2026-09-03
+
+- feat: add session full-trust device control (c7e333d)
+- tune(device-control): improve compact image fidelity (63cc155)
+- fix(device-control): harden screenshot relay and freshness tests (f4c4733)
+- fix(device-control): harden window targeting and recovery (177e3fb)
+
 ## v0.2.11 - 2026-09-02
 
 - fix(device-control): preserve exact window targeting (39fafb3)
