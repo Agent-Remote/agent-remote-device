@@ -176,6 +176,7 @@ public final class ActionExecutor {
                 false
             }
             var actionError: Error?
+            var editableFocusVerifiedByAction = false
             for attempt in 0 ..< (requiresEditableFocus ? 12 : 1) {
                 do {
                     try rejectSecureInput(for: action)
@@ -210,7 +211,10 @@ public final class ActionExecutor {
                             }
                         }
                     } else {
-                        try accessibility.perform(action, target: target)
+                        editableFocusVerifiedByAction = try accessibility.perform(
+                            action,
+                            target: target
+                        )
                     }
                     actionError = nil
                     break
@@ -224,7 +228,10 @@ public final class ActionExecutor {
                 }
             }
             if let actionError { throw actionError }
-            if requiresEditableFocus {
+            if Self.shouldVerifyEditableFocusAfterAction(
+                requiresEditableFocus: requiresEditableFocus,
+                verifiedDuringAction: editableFocusVerifiedByAction
+            ) {
                 var focused = false
                 for _ in 0 ..< 10 {
                     if try accessibility.focusEditableTextTarget(target) {
@@ -240,6 +247,13 @@ public final class ActionExecutor {
             releasePressedState()
             throw error
         }
+    }
+
+    static func shouldVerifyEditableFocusAfterAction(
+        requiresEditableFocus: Bool,
+        verifiedDuringAction: Bool
+    ) -> Bool {
+        requiresEditableFocus && !verifiedDuringAction
     }
 
     private func postVerifiedPageScroll(
@@ -480,11 +494,19 @@ public final class ActionExecutor {
         frameValidation: WindowFrameValidation = .approximate,
         requireFrontmost: Bool = true
     ) async throws -> String {
-        if requireFrontmost, !WindowCapture.isFrontmost(
-            application: context.application,
-            requiredProcessID: context.processID
-        ) {
-            throw ExecutionFailure.applicationChanged
+        if requireFrontmost {
+            guard WindowCapture.isFrontmost(
+                application: context.application,
+                requiredProcessID: context.processID
+            ) else {
+                throw ExecutionFailure.applicationChanged
+            }
+            guard WindowCapture.isWindowFrontmost(
+                processID: context.processID,
+                windowID: context.windowID
+            ) else {
+                throw ExecutionFailure.windowChanged
+            }
         }
         let content = try await SCShareableContent.excludingDesktopWindows(
             true,
@@ -725,15 +747,22 @@ public final class ActionExecutor {
         let location = try mapped(point, capture: capture)
         let downType: CGEventType = button == .right ? .rightMouseDown : (button == .center ? .otherMouseDown : .leftMouseDown)
         let upType: CGEventType = button == .right ? .rightMouseUp : (button == .center ? .otherMouseUp : .leftMouseUp)
-        guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: location, mouseButton: button),
-              let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: location, mouseButton: button)
-        else {
-            throw ExecutionFailure.eventCreationFailed
+        for clickState in Self.clickStates(count: count) {
+            guard let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: location, mouseButton: button),
+                  let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: location, mouseButton: button)
+            else {
+                throw ExecutionFailure.eventCreationFailed
+            }
+            down.setIntegerValueField(.mouseEventClickState, value: clickState)
+            up.setIntegerValueField(.mouseEventClickState, value: clickState)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
         }
-        down.setIntegerValueField(.mouseEventClickState, value: count)
-        up.setIntegerValueField(.mouseEventClickState, value: count)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+    }
+
+    static func clickStates(count: Int64) -> ClosedRange<Int64> {
+        precondition(count > 0)
+        return 1 ... count
     }
 
     private func mapped(_ point: Point, capture: CapturedWindow) throws -> CGPoint {

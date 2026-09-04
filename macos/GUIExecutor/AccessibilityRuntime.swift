@@ -187,6 +187,13 @@ public final class AccessibilityRuntime {
         let truncated: Bool
     }
 
+    private struct EditableFocusTarget {
+        let role: String
+        let frame: CGRect?
+        let windowID: CGWindowID?
+        let semanticValues: Set<String>
+    }
+
     private var snapshots: [String: Snapshot] = [:]
 
     public init() {}
@@ -379,7 +386,17 @@ public final class AccessibilityRuntime {
               Self.isEditableTextRole(node.role, settable: node.settable),
               let element = current.elements[target.elementIndex]
         else { return false }
-        if isFocused(element) { return true }
+        let verificationTarget = EditableFocusTarget(
+            role: node.role,
+            frame: windowFrame(element),
+            windowID: containingWindowID(element),
+            semanticValues: editableFocusSemanticValues(of: element)
+        )
+        if isFocused(
+            element,
+            target: verificationTarget,
+            expectedWindowID: current.context.windowID
+        ) { return true }
 
         var settable = DarwinBoolean(false)
         guard AXUIElementIsAttributeSettable(
@@ -393,7 +410,20 @@ public final class AccessibilityRuntime {
                 kCFBooleanTrue
             ) == .success
         else { return false }
-        return isFocused(element)
+        // Chromium can replace the exposed text field with a focused combo box
+        // asynchronously. Verify against the evidence captured before the write;
+        // the original AX object may become unusable once that replacement lands.
+        for attempt in 0 ..< 10 {
+            if isFocused(
+                element,
+                target: verificationTarget,
+                expectedWindowID: current.context.windowID
+            ) { return true }
+            if attempt < 9 {
+                Thread.sleep(forTimeInterval: 0.025)
+            }
+        }
+        return false
     }
 
     static func isEditableTextRole(_ role: String, settable: Bool) -> Bool {
@@ -412,6 +442,43 @@ public final class AccessibilityRuntime {
               let applicationBundleIdentifier
         else { return false }
         return applicationBundleIdentifier.lowercased().hasPrefix("com.apple.")
+    }
+
+    static func editableFocusIsVerified(
+        applicationFocusedElementMatches: Bool,
+        targetReportsFocused: Bool?,
+        replacementMatches: Bool
+    ) -> Bool {
+        applicationFocusedElementMatches || targetReportsFocused == true || replacementMatches
+    }
+
+    static func editableFocusReplacementMatches(
+        targetRole: String,
+        targetFrame: CGRect?,
+        targetWindowID: CGWindowID?,
+        targetSemanticValues: Set<String>,
+        focusedRole: String,
+        focusedFrame: CGRect?,
+        focusedWindowID: CGWindowID?,
+        focusedSemanticValues: Set<String>,
+        expectedWindowID: CGWindowID
+    ) -> Bool {
+        let editableRoles = ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"]
+        guard editableRoles.contains(targetRole), editableRoles.contains(focusedRole),
+              targetWindowID.map({ $0 == expectedWindowID }) ?? true,
+              focusedWindowID.map({ $0 == expectedWindowID }) ?? true,
+              !targetSemanticValues.isDisjoint(with: focusedSemanticValues),
+              let targetFrame, let focusedFrame
+        else { return false }
+        let targetArea = targetFrame.width * targetFrame.height
+        let focusedArea = focusedFrame.width * focusedFrame.height
+        let intersection = targetFrame.intersection(focusedFrame)
+        guard targetArea > 0, focusedArea > 0,
+              !intersection.isNull, !intersection.isInfinite,
+              intersection.width > 0, intersection.height > 0
+        else { return false }
+        let smallerArea = min(targetArea, focusedArea)
+        return intersection.width * intersection.height / smallerArea >= 0.9
     }
 
     public func rebindCurrent(
@@ -506,7 +573,8 @@ public final class AccessibilityRuntime {
         )
     }
 
-    public func perform(_ action: ActionV2, target: ElementTarget) throws {
+    @discardableResult
+    public func perform(_ action: ActionV2, target: ElementTarget) throws -> Bool {
         guard AXIsProcessTrusted() else { throw AccessibilityFailure.permissionMissing }
         guard let current = snapshots[target.applicationDigest], current.context.matches(target) else {
             throw AccessibilityFailure.staleTarget
@@ -524,15 +592,17 @@ public final class AccessibilityRuntime {
             // Some native Apple search fields reject AXFocused while exposing a
             // working AXPress; use that fallback only for Apple-owned apps.
             if Self.shouldFocusEditableTextDirectly(role: node.role, settable: node.settable) {
-                if try !focusEditableTextTarget(target) {
-                    guard Self.shouldFallbackEditableTextFocusToPress(
-                        applicationBundleIdentifier: bundleIdentifier(of: element),
-                        actions: node.actions
-                    ) else {
-                        throw AccessibilityFailure.operationFailed
-                    }
-                    try performNamedAction(kAXPressAction as String, on: element)
+                if try focusEditableTextTarget(target) {
+                    return true
                 }
+                guard Self.shouldFallbackEditableTextFocusToPress(
+                    applicationBundleIdentifier: bundleIdentifier(of: element),
+                    actions: node.actions
+                ) else {
+                    throw AccessibilityFailure.operationFailed
+                }
+                try performNamedAction(kAXPressAction as String, on: element)
+                return false
             } else {
                 try performNamedAction(kAXPressAction as String, on: element)
             }
@@ -575,6 +645,7 @@ public final class AccessibilityRuntime {
         default:
             throw AccessibilityFailure.actionUnavailable
         }
+        return false
     }
 
     private func scrollUsingSettableScrollBar(
@@ -693,20 +764,83 @@ public final class AccessibilityRuntime {
         return false
     }
 
-    private func isFocused(_ element: AXUIElement) -> Bool {
+    private func isFocused(
+        _ element: AXUIElement,
+        target: EditableFocusTarget,
+        expectedWindowID: CGWindowID
+    ) -> Bool {
         var processID: pid_t = 0
         guard AXUIElementGetPid(element, &processID) == .success else { return false }
         let application = AXUIElementCreateApplication(processID)
         var rawFocused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        AXUIElementCopyAttributeValue(
             application,
             kAXFocusedUIElementAttribute as CFString,
             &rawFocused
-        ) == .success,
-            let rawFocused,
-            CFGetTypeID(rawFocused) == AXUIElementGetTypeID()
-        else { return false }
-        return CFEqual(rawFocused, element)
+        )
+        let applicationFocusedElementMatches = rawFocused.map { CFEqual($0, element) } == true
+        var rawTargetFocused: CFTypeRef?
+        AXUIElementCopyAttributeValue(
+            element,
+            kAXFocusedAttribute as CFString,
+            &rawTargetFocused
+        )
+        let targetReportsFocused = (rawTargetFocused as? NSNumber)?.boolValue
+        let replacementMatches: Bool
+        if let rawFocused,
+           CFGetTypeID(rawFocused) == AXUIElementGetTypeID()
+        {
+            let focusedElement = unsafeDowncast(rawFocused, to: AXUIElement.self)
+            replacementMatches = Self.editableFocusReplacementMatches(
+                targetRole: target.role,
+                targetFrame: target.frame,
+                targetWindowID: target.windowID,
+                targetSemanticValues: target.semanticValues,
+                focusedRole: attribute(kAXRoleAttribute as String, from: focusedElement) ?? "",
+                focusedFrame: windowFrame(focusedElement),
+                focusedWindowID: containingWindowID(focusedElement),
+                focusedSemanticValues: editableFocusSemanticValues(of: focusedElement),
+                expectedWindowID: expectedWindowID
+            )
+        } else {
+            replacementMatches = false
+        }
+        return Self.editableFocusIsVerified(
+            applicationFocusedElementMatches: applicationFocusedElementMatches,
+            targetReportsFocused: targetReportsFocused,
+            replacementMatches: replacementMatches
+        )
+    }
+
+    private func editableFocusSemanticValues(of element: AXUIElement) -> Set<String> {
+        Set([
+            attribute(kAXTitleAttribute as String, from: element),
+            attribute(kAXDescriptionAttribute as String, from: element),
+            attribute(kAXPlaceholderValueAttribute as String, from: element),
+        ].compactMap { (value: String?) in
+            value?.split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
+        }.filter { !$0.isEmpty })
+    }
+
+    private func containingWindowID(_ element: AXUIElement) -> CGWindowID? {
+        let window: AXUIElement? = attribute(kAXWindowAttribute as String, from: element)
+        let topLevel: AXUIElement? = attribute(
+            kAXTopLevelUIElementAttribute as String,
+            from: element
+        )
+        return Self.preferredContainingWindowID(
+            windowAttributeID: window.flatMap(accessibilityWindowID),
+            topLevelUIElementID: topLevel.flatMap(accessibilityWindowID),
+            directElementID: accessibilityWindowID(element)
+        )
+    }
+
+    static func preferredContainingWindowID(
+        windowAttributeID: CGWindowID?,
+        topLevelUIElementID: CGWindowID?,
+        directElementID: CGWindowID?
+    ) -> CGWindowID? {
+        windowAttributeID ?? topLevelUIElementID ?? directElementID
     }
 
     private func bundleIdentifier(of element: AXUIElement) -> String? {

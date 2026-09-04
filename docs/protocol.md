@@ -258,13 +258,29 @@ resolve the exact signed process and window without activating it. Window captur
 includes the resolved target window on another Space so observing a full-screen browser does
 not pull the user away from a terminal. Before interactive input against a retained
 background binding, the Executor records the user's current foreground process,
-activates the exact signed target, and waits until macOS reports it as frontmost.
-A `press` on a settable editable text node also establishes and verifies AX focus
-before the action sequence is committed. After the action, settling, and follow-up
-observation complete, the Executor restores the prior foreground process if the
+activates the exact signed target process and bound WindowServer window, and waits
+until macOS reports that exact window as frontmost. A neighboring window in the same
+process fails the pre-dispatch context check.
+A `press` on a settable editable text node also establishes AX focus, then performs a
+bounded verification wait using evidence captured before the focus write. Verification
+accepts either the application's exact focused-element identity or the target's own
+focused attribute, or an editable replacement whose enclosing accessibility window,
+frame, and semantic identity match because Chromium may asynchronously replace its
+focused AX object and role, before the action sequence is committed. After the action,
+settling, and follow-up observation complete, the Executor restores the prior foreground
+process if the
 remote target is still frontmost. Pressed mouse or key state defers restoration
 until release. A successful returned state can therefore be followed directly by
 context-bound text input without an extra observation.
+A named `observe` for an application with an existing model-visible binding retains
+that exact process and WindowServer window for AX-only and screenshot modes. An
+unnamed `observe` continues to follow the eligible frontmost application. On the
+first named observation, multiple substantial windows or signed application
+instances are resolved only when one exact matching process is frontmost, and
+selection is restricted to that process; otherwise the request fails closed with
+`approved_application_not_frontmost` instead of selecting an arbitrary background
+window. A deliberate window switch uses a window-changing action and its returned
+new binding, not a repeated named observation.
 Coordinate actions continue to require the exact model-visible window frame.
 Context-bound keyboard and unpositioned scroll actions, and state-bound AX element
 actions, retain the exact signed process, window ID, and display fingerprint but do

@@ -77,13 +77,13 @@ import Testing
     #expect(await controller.currentState() == .active)
 }
 
-@Test func repeatedNamedAccessibilityObservationsFollowTheFrontmostWindow() async throws {
+@Test func repeatedNamedAccessibilityObservationsRetainTheBoundWindow() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
         RuntimeStub(
             guardState: guardState,
             recorder: recorder,
-            windowContextWindowIDs: [7, 8]
+            windowContextWindowIDs: [7, 7]
         )
     }
     let session = configuration(leaseUntil: Date().addingTimeInterval(60))
@@ -116,13 +116,13 @@ import Testing
     #expect(first.status == .success)
     #expect(first.windowID == 7)
     #expect(second.status == .success)
-    #expect(second.windowID == 8)
-    #expect(second.baseStateID == nil)
-    #expect(await recorder.windowContextPreferredWindowIDs == [[], []])
-    #expect(await recorder.observationBaseStateIDs == [nil, nil])
+    #expect(second.windowID == 7)
+    #expect(second.baseStateID == first.stateID)
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
+    #expect(await recorder.observationBaseStateIDs == [nil, first.stateID])
 }
 
-@Test func repeatedNamedScreenshotsFollowTheFrontmostWindow() async throws {
+@Test func repeatedNamedScreenshotsRetainTheBoundWindow() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
         RuntimeStub(guardState: guardState, recorder: recorder)
@@ -158,7 +158,7 @@ import Testing
     #expect(screenshot.status == .success)
     #expect(screenshot.screenshotGeneration == 2)
     #expect(screenshot.windowID == 7)
-    #expect(await recorder.preferredWindowIDs == [[], []])
+    #expect(await recorder.preferredWindowIDs == [[], [7]])
 }
 
 @Test func legacyScreenshotsReuseTheLatestBoundWindow() async throws {
@@ -241,7 +241,7 @@ import Testing
     #expect(await recorder.preferredWindowIDs == [[], [], []])
 }
 
-@Test func repeatedAccessibilityObservationsResolveTheFrontmostWindow() async throws {
+@Test func repeatedNamedAccessibilityObservationsPassTheBoundWindow() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
         RuntimeStub(guardState: guardState, recorder: recorder)
@@ -268,6 +268,38 @@ import Testing
         screenshotGeneration: 0,
         observation: ObservationPolicy(mode: .axFull),
         action: .observe(application: "com.apple.Safari")
+    ))
+
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
+}
+
+@Test func repeatedUnnamedAccessibilityObservationsRemainFrontmostResolved() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(guardState: guardState, recorder: recorder)
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
+    ))
+    _ = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: nil)
     ))
 
     #expect(await recorder.windowContextPreferredWindowIDs == [[], []])

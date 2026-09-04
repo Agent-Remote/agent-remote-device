@@ -294,6 +294,42 @@ private func synchronouslyBlock(for seconds: Double) {
     ) == nil)
 }
 
+@Test func foregroundWindowValidationRejectsAnotherWindowInTheSameProcess() {
+    #expect(WindowCapture.windowIsFrontmost(
+        processIsFrontmost: true,
+        frontToBackWindowIDs: [10, 20],
+        focusedWindowID: 10,
+        requiredWindowID: 10
+    ))
+    #expect(!WindowCapture.windowIsFrontmost(
+        processIsFrontmost: true,
+        frontToBackWindowIDs: [10, 20],
+        focusedWindowID: 10,
+        requiredWindowID: 20
+    ))
+    #expect(!WindowCapture.windowIsFrontmost(
+        processIsFrontmost: false,
+        frontToBackWindowIDs: [20],
+        focusedWindowID: 20,
+        requiredWindowID: 20
+    ))
+}
+
+@Test func foregroundWindowValidationFallsBackToAccessibilityFocusOffSpace() {
+    #expect(WindowCapture.windowIsFrontmost(
+        processIsFrontmost: true,
+        frontToBackWindowIDs: [],
+        focusedWindowID: 20,
+        requiredWindowID: 20
+    ))
+    #expect(!WindowCapture.windowIsFrontmost(
+        processIsFrontmost: true,
+        frontToBackWindowIDs: [],
+        focusedWindowID: 10,
+        requiredWindowID: 20
+    ))
+}
+
 @Test func preferredWindowSelectsTheFrontmostSurfaceAcrossApplicationInstances() {
     let candidates = WindowCapture.matchingWindowCandidates(
         [
@@ -419,6 +455,58 @@ private func synchronouslyBlock(for seconds: Double) {
         candidates: candidates.map { ($0.windowID, $0.frame) },
         frontToBackWindowIDs: [8, 7]
     ) == 8)
+}
+
+@Test func unboundWindowSelectionRestrictsAmbiguousCandidatesToTheFrontmostProcess() throws {
+    let candidates = [
+        WindowCandidate(
+            windowID: 7,
+            frame: CGRect(x: 0, y: 0, width: 1_200, height: 800),
+            processID: 100
+        ),
+        WindowCandidate(
+            windowID: 8,
+            frame: CGRect(x: 0, y: 0, width: 1_200, height: 800),
+            processID: 200
+        ),
+    ]
+
+    #expect(try WindowCapture.windowSelectionProcessIDs(
+        matchingProcessIDs: [100, 200],
+        candidates: candidates,
+        frontmostProcessID: 200,
+        hasRequiredWindow: false
+    ) == [200])
+    #expect(throws: CaptureFailure.approvedApplicationNotFrontmost) {
+        try WindowCapture.windowSelectionProcessIDs(
+            matchingProcessIDs: [100, 200],
+            candidates: candidates,
+            frontmostProcessID: 300,
+            hasRequiredWindow: false
+        )
+    }
+}
+
+@Test func exactBoundWindowSelectionDoesNotRequireTheApplicationToBeFrontmost() throws {
+    let candidates = [
+        WindowCandidate(
+            windowID: 7,
+            frame: CGRect(x: 0, y: 0, width: 1_200, height: 800),
+            processID: 100
+        ),
+        WindowCandidate(
+            windowID: 8,
+            frame: CGRect(x: 0, y: 0, width: 1_200, height: 800),
+            processID: 200
+        ),
+    ]
+
+    #expect(try WindowCapture.windowSelectionProcessIDs(
+        matchingProcessIDs: [100, 200],
+        candidates: candidates,
+        frontmostProcessID: 300,
+        hasRequiredWindow: true
+    ) == [100, 200])
 }
 
 @Test func passiveWindowResolutionRetainsOffScreenSpaceCandidates() {
@@ -566,6 +654,12 @@ private final class EmptyPasteboardProvider: NSObject, NSPasteboardItemDataProvi
         pixelHeight: 500,
         windowFrame: CGRect(x: 0, y: 0, width: 100, height: 100)
     ) == nil)
+}
+
+@Test @MainActor func multiClickPostsEveryClickStateInOrder() {
+    #expect(Array(ActionExecutor.clickStates(count: 1)) == [1])
+    #expect(Array(ActionExecutor.clickStates(count: 2)) == [1, 2])
+    #expect(Array(ActionExecutor.clickStates(count: 3)) == [1, 2, 3])
 }
 
 @Test @MainActor func frameChangesOnlyInvalidateGeometryBoundActions() {

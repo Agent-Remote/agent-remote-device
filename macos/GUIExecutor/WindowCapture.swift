@@ -255,14 +255,16 @@ public struct WindowCapture: Sendable {
     @MainActor
     public func capture(
         application: ApplicationIdentity,
-        requiredWindowID: CGWindowID? = nil
+        requiredWindowID: CGWindowID? = nil,
+        requiredProcessID: pid_t? = nil
     ) async throws -> CapturedWindow {
         guard CGPreflightScreenCaptureAccess() else {
             throw CaptureFailure.screenRecordingPermissionMissing
         }
         let resolved = try await resolve(
             application: application,
-            requiredWindowID: requiredWindowID
+            requiredWindowID: requiredWindowID,
+            requiredProcessID: requiredProcessID
         )
         let size = Self.scaledSize(
             sourceWidth: resolved.captureFrame.width,
@@ -404,17 +406,32 @@ public struct WindowCapture: Sendable {
             shareable: shareableCandidates,
             visible: visibleCandidates
         )
-        let focusedWindowID = Self.focusedWindowID(processIDs: matchingProcessIDs)
+        let selectionProcessIDs = try Self.windowSelectionProcessIDs(
+            matchingProcessIDs: matchingProcessIDs,
+            candidates: candidates,
+            frontmostProcessID: Self.frontmostProcessID(),
+            hasRequiredWindow: requiredWindowID != nil
+        )
+        let selectionCandidates = candidates.filter {
+            selectionProcessIDs.contains($0.processID)
+        }
+        let selectionVisibleCandidates = visibleCandidates.filter {
+            selectionProcessIDs.contains($0.processID)
+        }
+        let selectionShareableCandidates = shareableCandidates.filter {
+            selectionProcessIDs.contains($0.processID)
+        }
+        let focusedWindowID = Self.focusedWindowID(processIDs: selectionProcessIDs)
         let selectedWindowID = Self.preferredWindowID(
-            candidates: candidates.map { ($0.windowID, $0.frame) },
-            frontToBackWindowIDs: visibleCandidates.map(\.windowID),
-            activeWindowIDs: shareableCandidates.filter(\.isActive).map(\.windowID),
-            shareableWindowIDs: shareableCandidates.map(\.windowID),
+            candidates: selectionCandidates.map { ($0.windowID, $0.frame) },
+            frontToBackWindowIDs: selectionVisibleCandidates.map(\.windowID),
+            activeWindowIDs: selectionShareableCandidates.filter(\.isActive).map(\.windowID),
+            shareableWindowIDs: selectionShareableCandidates.map(\.windowID),
             focusedWindowID: focusedWindowID,
             requiredWindowID: requiredWindowID
         )
         guard let selectedWindowID,
-              let selectedCandidate = candidates.first(where: {
+              let selectedCandidate = selectionCandidates.first(where: {
                   $0.windowID == selectedWindowID
               })
         else {
@@ -461,7 +478,8 @@ public struct WindowCapture: Sendable {
     @discardableResult
     public func activate(
         application: ApplicationIdentity,
-        processID requiredProcessID: pid_t? = nil
+        processID requiredProcessID: pid_t? = nil,
+        windowID requiredWindowID: CGWindowID? = nil
     ) async throws -> pid_t {
         guard application.bundleIdentifier != excludedBundleIdentifier else {
             throw CaptureFailure.applicationActivationRejected
@@ -471,18 +489,29 @@ public struct WindowCapture: Sendable {
             requiredProcessID: requiredProcessID
         )
         let isAlreadyFrontmost = await MainActor.run {
-            Self.isProcessFrontmost(target.processID)
+            if let requiredWindowID {
+                Self.isWindowFrontmost(
+                    processID: target.processID,
+                    windowID: requiredWindowID
+                )
+            } else {
+                Self.isProcessFrontmost(target.processID)
+            }
         }
         if isAlreadyFrontmost { return target.processID }
 
         await MainActor.run {
-            Self.requestProcessActivation(processID: target.processID)
+            Self.requestActivation(
+                processID: target.processID,
+                windowID: requiredWindowID
+            )
         }
         if let bundleURL = target.bundleURL {
             await Self.requestWorkspaceActivation(at: bundleURL)
         }
         if try await Self.waitUntilFrontmost(
             processID: target.processID,
+            windowID: requiredWindowID,
             attempts: Self.lightweightActivationAttempts
         ) {
             return target.processID
@@ -491,9 +520,16 @@ public struct WindowCapture: Sendable {
         if let bundleURL = target.bundleURL {
             await Self.requestWorkspaceActivation(at: bundleURL)
         }
+        await MainActor.run {
+            Self.requestActivation(
+                processID: target.processID,
+                windowID: requiredWindowID
+            )
+        }
 
         if try await Self.waitUntilFrontmost(
             processID: target.processID,
+            windowID: requiredWindowID,
             attempts: Self.workspaceActivationAttempts
         ) {
             return target.processID
@@ -533,16 +569,21 @@ public struct WindowCapture: Sendable {
 
     private static func waitUntilFrontmost(
         processID: pid_t,
+        windowID: CGWindowID?,
         attempts: Int
     ) async throws -> Bool {
         for attempt in 0 ..< attempts {
             let isFrontmost = await MainActor.run {
-                Self.isProcessFrontmost(processID)
+                if let windowID {
+                    Self.isWindowFrontmost(processID: processID, windowID: windowID)
+                } else {
+                    Self.isProcessFrontmost(processID)
+                }
             }
             if isFrontmost { return true }
             if attempt > 0, attempt.isMultiple(of: 10) {
                 await MainActor.run {
-                    requestProcessActivation(processID: processID)
+                    requestActivation(processID: processID, windowID: windowID)
                 }
             }
             try await Task.sleep(for: .milliseconds(50))
@@ -603,6 +644,35 @@ public struct WindowCapture: Sendable {
             ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
     }
 
+    @MainActor
+    public static func isWindowFrontmost(processID: pid_t, windowID: CGWindowID) -> Bool {
+        guard isProcessFrontmost(processID) else { return false }
+        let frontToBackWindowIDs = frontToBackWindowCandidates(
+            processIDs: [processID]
+        ).filter {
+            $0.frame.width >= 100 && $0.frame.height >= 100
+        }.map(\.windowID)
+        return windowIsFrontmost(
+            processIsFrontmost: true,
+            frontToBackWindowIDs: frontToBackWindowIDs,
+            focusedWindowID: focusedWindowID(processIDs: [processID]),
+            requiredWindowID: windowID
+        )
+    }
+
+    static func windowIsFrontmost(
+        processIsFrontmost: Bool,
+        frontToBackWindowIDs: [CGWindowID],
+        focusedWindowID: CGWindowID?,
+        requiredWindowID: CGWindowID
+    ) -> Bool {
+        guard processIsFrontmost else { return false }
+        if let visibleFrontmost = frontToBackWindowIDs.first {
+            return visibleFrontmost == requiredWindowID
+        }
+        return focusedWindowID == requiredWindowID
+    }
+
     private static func frontmostWindowProcessID() -> pid_t? {
         guard let values = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
@@ -625,6 +695,44 @@ public struct WindowCapture: Sendable {
         _ = application.unhide()
         _ = application.activate(options: [])
         requestAccessibilityActivation(processID: processID)
+    }
+
+    @MainActor
+    private static func requestActivation(processID: pid_t, windowID: CGWindowID?) {
+        requestProcessActivation(processID: processID)
+        guard let windowID,
+              let window = accessibilityWindow(processID: processID, windowID: windowID)
+        else { return }
+        let application = AXUIElementCreateApplication(processID)
+        _ = AXUIElementSetAttributeValue(
+            application,
+            kAXFocusedWindowAttribute as CFString,
+            window
+        )
+        _ = AXUIElementSetAttributeValue(
+            window,
+            kAXMainAttribute as CFString,
+            kCFBooleanTrue
+        )
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+    }
+
+    @MainActor
+    private static func accessibilityWindow(
+        processID: pid_t,
+        windowID: CGWindowID
+    ) -> AXUIElement? {
+        let application = AXUIElementCreateApplication(processID)
+        AXUIElementSetMessagingTimeout(application, 0.2)
+        var rawWindows: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            application,
+            kAXWindowsAttribute as CFString,
+            &rawWindows
+        ) == .success,
+            let windows = rawWindows as? [AXUIElement]
+        else { return nil }
+        return windows.first { accessibilityWindowID($0) == windowID }
     }
 
     @MainActor
@@ -893,6 +1001,26 @@ public struct WindowCapture: Sendable {
             selected.append(candidate)
         }
         return selected
+    }
+
+    static func windowSelectionProcessIDs(
+        matchingProcessIDs: Set<pid_t>,
+        candidates: [WindowCandidate],
+        frontmostProcessID: pid_t?,
+        hasRequiredWindow: Bool
+    ) throws -> Set<pid_t> {
+        guard !hasRequiredWindow else { return matchingProcessIDs }
+        let substantialCandidates = candidates.filter {
+            $0.frame.width >= 100 && $0.frame.height >= 100
+        }
+        guard substantialCandidates.count > 1 else { return matchingProcessIDs }
+        guard let frontmostProcessID,
+              matchingProcessIDs.contains(frontmostProcessID),
+              substantialCandidates.contains(where: { $0.processID == frontmostProcessID })
+        else {
+            throw CaptureFailure.approvedApplicationNotFrontmost
+        }
+        return [frontmostProcessID]
     }
 
     public static func withOperationTimeout<Value: Sendable>(

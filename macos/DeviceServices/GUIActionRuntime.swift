@@ -399,12 +399,13 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             CaptureProfile(maximumWidth: 1, maximumHeight: 1)
         }
         let engine = WindowCapture(profile: captureProfile)
-        let preferredWindowID = preferredWindowContexts.first {
+        let preferredWindowContext = preferredWindowContexts.first {
             $0.application.stableDigest == application.stableDigest
-        }?.windowID
+        }
         let capture = try await engine.capture(
             application: application,
-            requiredWindowID: preferredWindowID
+            requiredWindowID: preferredWindowContext?.windowID,
+            requiredProcessID: preferredWindowContext?.processID
         )
         return try region.map { try WindowCapture.cropped(capture, to: $0) } ?? capture
     }
@@ -418,12 +419,13 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
             approvedApplications: approvedApplications,
             targetApplication: targetApplication
         )
-        let preferredWindowID = preferredWindowContexts.first {
+        let preferredWindowContext = preferredWindowContexts.first {
             $0.application.stableDigest == application.stableDigest
-        }?.windowID
+        }
         return try await captureEngine.context(
             application: application,
-            requiredWindowID: preferredWindowID
+            requiredWindowID: preferredWindowContext?.windowID,
+            requiredProcessID: preferredWindowContext?.processID
         )
     }
 
@@ -495,10 +497,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         sequence: UInt64,
         context: WindowContext
     ) async throws {
-        try await activateForAction(
-            application: context.application,
-            processID: context.processID
-        )
+        try await activateForAction(context: context)
         try await executor.executeElement(
             action: action,
             target: target,
@@ -527,10 +526,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         context: WindowContext
     ) async throws {
         if action.requiresForegroundApplication {
-            try await activateForAction(
-                application: context.application,
-                processID: context.processID
-            )
+            try await activateForAction(context: context)
         }
         try await executor.executeContextAction(
             action: action,
@@ -752,10 +748,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         capture: CapturedWindow
     ) async throws {
         if action.requiresForegroundApplication {
-            try await activateForAction(
-                application: capture.application,
-                processID: capture.processID
-            )
+            try await activateForAction(context: capture.windowContext)
         }
         try await executor.execute(
             action: action,
@@ -829,10 +822,8 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         )
     }
 
-    private func activateForAction(
-        application: ApplicationIdentity,
-        processID: pid_t
-    ) async throws {
+    private func activateForAction(context: WindowContext) async throws {
+        let processID = context.processID
         let priorProcessID = await MainActor.run {
             WindowCapture.frontmostProcessID()
         }
@@ -845,8 +836,9 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         activatedProcessIDs.insert(processID)
         do {
             let activatedProcessID = try await captureEngine.activate(
-                application: application,
-                processID: processID
+                application: context.application,
+                processID: processID,
+                windowID: context.windowID
             )
             activatedProcessIDs.insert(activatedProcessID)
         } catch {

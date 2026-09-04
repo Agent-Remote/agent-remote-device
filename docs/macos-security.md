@@ -22,9 +22,12 @@ After local session selection, the app installs the exact versioned session auth
 other applications visible. It starts the global stop, screen-lock, user-switch,
 sleep, and network-loss monitors before it asks the Broker to activate the server
 session or start the relay. Passive observation, screenshots, waits, zooms, and
-global clipboard reads do not activate an application. Interactive
-input activates only the exact signed target process. After the action and its
-follow-up observation complete, the Executor restores the user's prior foreground
+global clipboard reads do not activate an application. Interactive input activates
+the exact signed target process and raises the bound window by its WindowServer
+identity, including when another window in the same process is frontmost. The
+Executor confirms that exact window is frontmost immediately before dispatch; a
+same-process neighboring window fails closed as a window-context change. After the
+action and its follow-up observation complete, the Executor restores the user's prior foreground
 application when the remote target is still frontmost. Pressed mouse or key state
 delays restoration until release. A local stop observed while
 activation is in flight leaves the UI paused and is forwarded as soon as Broker
@@ -115,6 +118,14 @@ latest model-visible mapping; a new state or window/display change replaces only
 that application's mapping. A turn pause, generation rotation, or Executor restart
 clears every mapping. A lost diff base returns a bounded full state with an
 explicit reset marker.
+
+A repeated named observation reuses that application's exact retained process and
+WindowServer window ID. An unnamed observation remains a request for the eligible
+frontmost application. When no retained binding exists and a named application has
+multiple substantial windows or signed application instances, passive resolution
+is allowed only while one of those exact processes is frontmost; selection is then
+restricted to that process and its frontmost substantial window. Otherwise the
+observation fails closed instead of exposing an arbitrary background window.
 
 For observations that combine AX and pixels, the Executor binds AX traversal to
 the exact ScreenCaptureKit-selected window. It prefers an exact match between the

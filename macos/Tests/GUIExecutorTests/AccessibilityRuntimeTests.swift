@@ -36,6 +36,124 @@ import Testing
 }
 
 @MainActor
+@Test func editableFocusAcceptsEitherSystemFocusRepresentation() {
+    #expect(AccessibilityRuntime.editableFocusIsVerified(
+        applicationFocusedElementMatches: true,
+        targetReportsFocused: false,
+        replacementMatches: false
+    ))
+    #expect(AccessibilityRuntime.editableFocusIsVerified(
+        applicationFocusedElementMatches: false,
+        targetReportsFocused: true,
+        replacementMatches: false
+    ))
+    #expect(AccessibilityRuntime.editableFocusIsVerified(
+        applicationFocusedElementMatches: false,
+        targetReportsFocused: false,
+        replacementMatches: true
+    ))
+    #expect(!AccessibilityRuntime.editableFocusIsVerified(
+        applicationFocusedElementMatches: false,
+        targetReportsFocused: false,
+        replacementMatches: false
+    ))
+    #expect(!AccessibilityRuntime.editableFocusIsVerified(
+        applicationFocusedElementMatches: false,
+        targetReportsFocused: nil,
+        replacementMatches: false
+    ))
+}
+
+@MainActor
+@Test func editableFocusReplacementRequiresMatchingWindowFrameAndSemantics() {
+    let targetFrame = CGRect(x: 100, y: 200, width: 300, height: 30)
+    #expect(AccessibilityRuntime.editableFocusReplacementMatches(
+        targetRole: "AXTextField",
+        targetFrame: targetFrame,
+        targetWindowID: 7,
+        targetSemanticValues: ["Search Wikipedia"],
+        focusedRole: "AXComboBox",
+        focusedFrame: CGRect(x: 100, y: 200, width: 300, height: 32),
+        focusedWindowID: 7,
+        focusedSemanticValues: ["Search Wikipedia"],
+        expectedWindowID: 7
+    ))
+    #expect(!AccessibilityRuntime.editableFocusReplacementMatches(
+        targetRole: "AXTextField",
+        targetFrame: targetFrame,
+        targetWindowID: 7,
+        targetSemanticValues: ["Search Wikipedia"],
+        focusedRole: "AXComboBox",
+        focusedFrame: CGRect(x: 500, y: 200, width: 300, height: 30),
+        focusedWindowID: 7,
+        focusedSemanticValues: ["Search Wikipedia"],
+        expectedWindowID: 7
+    ))
+    #expect(!AccessibilityRuntime.editableFocusReplacementMatches(
+        targetRole: "AXTextField",
+        targetFrame: targetFrame,
+        targetWindowID: 7,
+        targetSemanticValues: ["Search Wikipedia"],
+        focusedRole: "AXComboBox",
+        focusedFrame: targetFrame,
+        focusedWindowID: 8,
+        focusedSemanticValues: ["Search Wikipedia"],
+        expectedWindowID: 7
+    ))
+    #expect(!AccessibilityRuntime.editableFocusReplacementMatches(
+        targetRole: "AXTextField",
+        targetFrame: targetFrame,
+        targetWindowID: 7,
+        targetSemanticValues: ["Search Wikipedia"],
+        focusedRole: "AXComboBox",
+        focusedFrame: targetFrame,
+        focusedWindowID: 7,
+        focusedSemanticValues: ["Different field"],
+        expectedWindowID: 7
+    ))
+}
+
+@MainActor
+@Test func editableFocusPrefersContainingWindowIdentity() {
+    #expect(AccessibilityRuntime.preferredContainingWindowID(
+        windowAttributeID: 7,
+        topLevelUIElementID: 8,
+        directElementID: 9
+    ) == 7)
+    #expect(AccessibilityRuntime.preferredContainingWindowID(
+        windowAttributeID: nil,
+        topLevelUIElementID: 8,
+        directElementID: 9
+    ) == 8)
+    #expect(AccessibilityRuntime.preferredContainingWindowID(
+        windowAttributeID: nil,
+        topLevelUIElementID: nil,
+        directElementID: 9
+    ) == 9)
+    #expect(AccessibilityRuntime.preferredContainingWindowID(
+        windowAttributeID: nil,
+        topLevelUIElementID: nil,
+        directElementID: nil
+    ) == nil)
+}
+
+@MainActor
+@Test func editableFocusPostActionVerificationRunsOnlyWhenStillNeeded() {
+    #expect(!ActionExecutor.shouldVerifyEditableFocusAfterAction(
+        requiresEditableFocus: true,
+        verifiedDuringAction: true
+    ))
+    #expect(ActionExecutor.shouldVerifyEditableFocusAfterAction(
+        requiresEditableFocus: true,
+        verifiedDuringAction: false
+    ))
+    #expect(!ActionExecutor.shouldVerifyEditableFocusAfterAction(
+        requiresEditableFocus: false,
+        verifiedDuringAction: false
+    ))
+}
+
+@MainActor
 @Test func accessibilityValueFreshnessTreatsMissingEmptyValueAsCleared() {
     #expect(AccessibilityRuntime.valueMatches(nil, expectedValue: ""))
     #expect(AccessibilityRuntime.valueMatches("", expectedValue: ""))

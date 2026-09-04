@@ -533,6 +533,13 @@ public actor GUIExecutorSessionController {
         }
         let explicitlyRequestsImage = request.observation.mode == .screenshot
             || request.observation.mode == .both
+        let retainedNamedObservationContexts: [WindowContext] = if case .observe = request.action,
+                                                                   targetApplication != nil
+        {
+            Array(windowContextsByApplication.values)
+        } else {
+            []
+        }
         var prefetchedCapture: CapturedWindow?
         var observationAuthorized = false
         var sequenceAcceptedDuringDispatch = false
@@ -575,7 +582,7 @@ public actor GUIExecutorSessionController {
                 let capture = try await runtime.captureV2(
                     approvedApplications: approvedApplications,
                     targetApplication: targetApplication,
-                    preferredWindowContexts: [],
+                    preferredWindowContexts: retainedNamedObservationContexts,
                     profile: profile,
                     region: request.observation.region
                 )
@@ -585,7 +592,7 @@ public actor GUIExecutorSessionController {
                     windowContext = try await runtime.windowContext(
                         approvedApplications: approvedApplications,
                         targetApplication: targetApplication,
-                        preferredWindowContexts: []
+                        preferredWindowContexts: retainedNamedObservationContexts
                     )
                 } else if let elementApplicationDigest,
                           let elementContext = windowContextsByApplication[elementApplicationDigest]
