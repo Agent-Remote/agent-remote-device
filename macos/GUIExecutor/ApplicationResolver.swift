@@ -74,16 +74,12 @@ public enum ApplicationResolver {
            let candidate = installedTarget(at: bundleURL, exclusions: exclusions),
            candidate.identity.bundleIdentifier.caseInsensitiveCompare(target) == .orderedSame
         {
-            candidates.append(candidate)
+            return candidate
         }
         candidates.append(contentsOf: try installedApplicationURLs().compactMap {
             bundleURL in
-            guard let candidate = installedTarget(at: bundleURL, exclusions: exclusions),
-                  ApplicationTargetMatching.matches(
-                      target: target,
-                      bundleIdentifier: candidate.identity.bundleIdentifier,
-                      displayNames: displayNames(for: bundleURL)
-                  )
+            guard applicationMetadataMatches(target: target, at: bundleURL),
+                  let candidate = installedTarget(at: bundleURL, exclusions: exclusions)
             else {
                 return nil
             }
@@ -212,11 +208,23 @@ public enum ApplicationResolver {
         ].compactMap { $0 }
     }
 
+    static func applicationMetadataMatches(target: String, at bundleURL: URL) -> Bool {
+        guard let bundleIdentifier = Bundle(url: bundleURL)?.bundleIdentifier else {
+            return false
+        }
+        return ApplicationTargetMatching.matches(
+            target: target,
+            bundleIdentifier: bundleIdentifier,
+            displayNames: displayNames(for: bundleURL)
+        )
+    }
+
     private static func installedApplicationURLs() throws -> [URL] {
         let manager = FileManager.default
         var roots = [
             URL(fileURLWithPath: "/Applications", isDirectory: true),
             URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Library/CoreServices", isDirectory: true),
         ]
         if let userApplications = manager.urls(for: .applicationDirectory, in: .userDomainMask).first {
             roots.append(userApplications)

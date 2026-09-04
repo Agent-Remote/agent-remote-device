@@ -55,6 +55,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     private var pendingActivation: (binding: DeviceSessionBinding, identifier: UUID)?
     private var approvalUI: ApprovalUIXPCProtocol?
     private var turnPaused = false
+    private var approvalUIPausedBinding: DeviceSessionBinding?
+    private var locallyStoppedTurnBinding: DeviceSessionBinding?
     private var automaticTerminationDisabled = false
 
     public init(
@@ -452,6 +454,8 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
             reply.resolve(DeviceIPCFailure.invalidMessage.nsError)
             return
         }
+        markApprovalUITurnPaused(currentBinding)
+        markLocallyStoppedTurn(currentBinding)
         let currentRequest = BrokerAbortRequest(
             binding: currentBinding,
             reason: abortRequest.reason
@@ -551,6 +555,9 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
                             throw DeviceIPCFailure.serviceUnavailable
                         }
                         defer { self.finishRelayAction(relay, binding: configuration.binding) }
+                        if self.isLocallyStoppedTurn(binding: configuration.binding) {
+                            return try self.turnStoppedResponse(for: request)
+                        }
                         try await self.resumeTurnIfNeeded(configuration.binding)
                         let selection = try self.applicationSelection(
                             for: request,
@@ -1271,13 +1278,24 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     ) async throws {
         switch event {
         case .turnStop:
+            if isLocallyStoppedTurn(binding: binding) {
+                if !isTurnPaused(binding: binding) {
+                    try await pauseExecutorTurn(binding)
+                    setTurnPaused(true, binding: binding)
+                }
+                clearLocallyStoppedTurn(binding)
+                return
+            }
             guard !isTurnPaused(binding: binding) else { return }
             try await pauseExecutorTurn(binding)
+            try await notifyApprovalUI(kind: .turnStopped, binding: binding)
             setTurnPaused(true, binding: binding)
+            markApprovalUITurnPaused(binding)
         case .sessionEnd:
             cancelBackgroundLeaseTasks()
             try await endExecutorAndControlPlane(binding)
             try await notifyApprovalUI(kind: .sessionEnded, binding: binding)
+            clearApprovalUITurnPaused(binding)
             completeRelay(relay)
         }
     }
@@ -1303,9 +1321,14 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
     }
 
     private func resumeTurnIfNeeded(_ binding: DeviceSessionBinding) async throws {
-        guard isTurnPaused(binding: binding) else { return }
-        try await resumeExecutorTurn(binding)
-        setTurnPaused(false, binding: binding)
+        if isTurnPaused(binding: binding) {
+            try await resumeExecutorTurn(binding)
+            setTurnPaused(false, binding: binding)
+        }
+        if isApprovalUITurnPaused(binding: binding) {
+            try await notifyApprovalUI(kind: .turnStarted, binding: binding)
+            clearApprovalUITurnPaused(binding)
+        }
     }
 
     private func resumeExecutorTurn(_ binding: DeviceSessionBinding) async throws {
@@ -1356,6 +1379,84 @@ public final class NetworkBrokerService: NSObject, NetworkBrokerXPCProtocol, @un
         lock.withLock {
             guard relayBinding == binding else { return }
             turnPaused = paused
+        }
+    }
+
+    private func isApprovalUITurnPaused(binding: DeviceSessionBinding) -> Bool {
+        lock.withLock {
+            approvalUIPausedBinding?.matchesSessionIdentity(binding) == true
+        }
+    }
+
+    private func markApprovalUITurnPaused(_ binding: DeviceSessionBinding) {
+        lock.withLock { approvalUIPausedBinding = binding }
+    }
+
+    private func clearApprovalUITurnPaused(_ binding: DeviceSessionBinding) {
+        lock.withLock {
+            guard approvalUIPausedBinding?.matchesSessionIdentity(binding) == true else { return }
+            approvalUIPausedBinding = nil
+        }
+    }
+
+    private func isLocallyStoppedTurn(binding: DeviceSessionBinding) -> Bool {
+        lock.withLock {
+            locallyStoppedTurnBinding?.matchesSessionIdentity(binding) == true
+        }
+    }
+
+    private func markLocallyStoppedTurn(_ binding: DeviceSessionBinding) {
+        lock.withLock { locallyStoppedTurnBinding = binding }
+    }
+
+    private func clearLocallyStoppedTurn(_ binding: DeviceSessionBinding) {
+        lock.withLock {
+            guard locallyStoppedTurnBinding?.matchesSessionIdentity(binding) == true else { return }
+            locallyStoppedTurnBinding = nil
+        }
+    }
+
+    private func turnStoppedResponse(for data: Data) throws -> Data {
+        let envelope = try DeviceIPCEnvelope.decode(data)
+        guard let object = try JSONSerialization.jsonObject(
+            with: envelope.payload
+        ) as? [String: Any],
+            let version = object["version"] as? NSNumber
+        else {
+            throw DeviceIPCFailure.invalidMessage
+        }
+        let message = "turn_stopped: The current device-control turn was stopped locally."
+        switch version.uint8Value {
+        case DeviceProtocol.protocolVersion:
+            let request = try ActionRequest.decodeStrict(envelope.payload)
+            return try JSONEncoder().encode(ExecutorActionResponse(
+                requestID: request.requestID,
+                monotonicSequence: request.context.monotonicSequence,
+                screenshotGeneration: request.context.currentScreenshotGeneration,
+                status: .failed,
+                message: message,
+                image: nil
+            ))
+        case DeviceProtocol.protocolVersionV2:
+            let request = try ActionRequestV2.decodeStrict(envelope.payload)
+            return try JSONEncoder().encode(ActionResponseV2(
+                requestID: request.requestID,
+                monotonicSequence: request.context.monotonicSequence,
+                stateGeneration: request.context.currentStateGeneration,
+                screenshotGeneration: request.context.currentScreenshotGeneration,
+                stateID: nil,
+                applicationDigest: nil,
+                windowID: nil,
+                displayFingerprint: nil,
+                baseStateID: nil,
+                status: .failed,
+                message: message,
+                observation: nil,
+                settle: SettleResult(status: .notRequested, elapsedMilliseconds: 0),
+                image: nil
+            ))
+        default:
+            throw DeviceIPCFailure.invalidMessage
         }
     }
 

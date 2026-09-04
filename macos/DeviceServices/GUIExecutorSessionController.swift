@@ -575,7 +575,7 @@ public actor GUIExecutorSessionController {
                 let capture = try await runtime.captureV2(
                     approvedApplications: approvedApplications,
                     targetApplication: targetApplication,
-                    preferredWindowContexts: Array(windowContextsByApplication.values),
+                    preferredWindowContexts: [],
                     profile: profile,
                     region: request.observation.region
                 )
@@ -585,7 +585,7 @@ public actor GUIExecutorSessionController {
                     windowContext = try await runtime.windowContext(
                         approvedApplications: approvedApplications,
                         targetApplication: targetApplication,
-                        preferredWindowContexts: Array(windowContextsByApplication.values)
+                        preferredWindowContexts: []
                     )
                 } else if let elementApplicationDigest,
                           let elementContext = windowContextsByApplication[elementApplicationDigest]
@@ -621,7 +621,11 @@ public actor GUIExecutorSessionController {
                 message: failure.userMessage
             )
         }
-        if let latestWindowContext, latestWindowContext != windowContext {
+        let observationChangedWindow = isObservationOnly
+            && latestWindowContext.map {
+                !Self.sameAccessibilityIdentity($0, windowContext)
+            } == true
+        if observationChangedWindow {
             latestCapture = nil
         }
         let applicationDigest = windowContext.application.stableDigest
@@ -775,6 +779,7 @@ public actor GUIExecutorSessionController {
         }
 
         var observationBaseStateID = request.observation.mode == .axFull
+            || observationChangedWindow
             ? nil
             : request.context.baseStateID
         let actionApplication = windowContext.application.bundleIdentifier

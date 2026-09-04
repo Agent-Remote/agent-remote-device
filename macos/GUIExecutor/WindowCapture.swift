@@ -588,8 +588,35 @@ public struct WindowCapture: Sendable {
         // has no NSApplication event loop. NSRunningApplication.isActive reflects the
         // process activation state directly and avoids reporting a successful switch
         // as a timeout.
+        if let frontmostWindowProcessID = frontmostWindowProcessID() {
+            return frontmostWindowProcessID == processID
+        }
         return application.isActive
             || NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
+    }
+
+    @MainActor
+    public static func frontmostProcessID() -> pid_t? {
+        frontmostWindowProcessID()
+            ?? NSWorkspace.shared.runningApplications.first(where: { $0.isActive })?
+            .processIdentifier
+            ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+    }
+
+    private static func frontmostWindowProcessID() -> pid_t? {
+        guard let values = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        return values.lazy.compactMap { value -> pid_t? in
+            guard (value[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let owner = (value[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  let bounds = value[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds),
+                  frame.width >= 100, frame.height >= 100
+            else { return nil }
+            return owner
+        }.first
     }
 
     @MainActor
@@ -610,13 +637,33 @@ public struct WindowCapture: Sendable {
         )
     }
 
-    @MainActor
-    public static func restoreUserApplication(processID: pid_t) {
-        guard let application = NSRunningApplication(processIdentifier: processID),
-              !application.isTerminated
-        else { return }
-        _ = application.unhide()
-        _ = application.activate(options: [])
+    public static func restoreUserApplication(
+        processID: pid_t,
+        whileFrontmostProcessIsOneOf remotelyActivatedProcessIDs: Set<pid_t>
+    ) async {
+        let bundleURL = await MainActor.run { () -> URL? in
+            guard let application = NSRunningApplication(processIdentifier: processID),
+                  !application.isTerminated
+            else { return nil }
+            return application.bundleURL
+        }
+        guard bundleURL != nil else { return }
+
+        for attempt in 0 ..< 20 {
+            let status = await MainActor.run { () -> Int in
+                if isProcessFrontmost(processID) { return 1 }
+                guard remotelyActivatedProcessIDs.contains(where: isProcessFrontmost) else {
+                    return 0
+                }
+                requestProcessActivation(processID: processID)
+                return 2
+            }
+            if status != 2 { return }
+            if attempt == 9, let bundleURL {
+                await requestWorkspaceActivation(at: bundleURL)
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
     }
 
     public static func cropped(_ capture: CapturedWindow, to region: Region) throws -> CapturedWindow {

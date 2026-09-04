@@ -111,6 +111,71 @@ public struct AccessibilityStabilityFingerprint: Equatable, Sendable {
     }
 }
 
+public struct AccessibilityScrollPosition: Equatable, Sendable {
+    public let value: Double
+    public let minimum: Double
+    public let maximum: Double
+    private let movementValue: Double
+    private let source: Source
+
+    fileprivate enum Source: Equatable, Sendable {
+        case unspecified
+        case scrollBar
+        case visibleCharacterRange
+    }
+
+    public init(
+        value: Double,
+        minimum: Double,
+        maximum: Double,
+        movementValue: Double? = nil
+    ) {
+        self.value = value
+        self.minimum = minimum
+        self.maximum = maximum
+        self.movementValue = movementValue ?? value
+        source = .unspecified
+    }
+
+    fileprivate init(
+        value: Double,
+        minimum: Double,
+        maximum: Double,
+        movementValue: Double? = nil,
+        source: Source
+    ) {
+        self.value = value
+        self.minimum = minimum
+        self.maximum = maximum
+        self.movementValue = movementValue ?? value
+        self.source = source
+    }
+
+    public func isAtBoundary(for direction: ScrollDirection) -> Bool {
+        let epsilon = max((maximum - minimum) * 0.000_001, Double.ulpOfOne)
+        return direction.increasesScrollBarValue
+            ? value >= maximum - epsilon
+            : value <= minimum + epsilon
+    }
+
+    public func moved(from prior: Self, in direction: ScrollDirection) -> Bool {
+        guard source == prior.source else { return false }
+        let epsilon = max((prior.maximum - prior.minimum) * 0.000_001, Double.ulpOfOne)
+        return direction.increasesScrollBarValue
+            ? movementValue > prior.movementValue + epsilon
+            : movementValue < prior.movementValue - epsilon
+    }
+}
+
+private extension ScrollDirection {
+    var increasesScrollBarValue: Bool {
+        switch self {
+        case .down, .right: true
+        case .up, .left: false
+        }
+    }
+}
+
 @MainActor
 public final class AccessibilityRuntime {
     private let logger = Logger(subsystem: "dev.agentremote.device", category: "accessibility")
@@ -155,6 +220,156 @@ public final class AccessibilityRuntime {
               let node = current.nodes.first(where: { $0.index == target.elementIndex })
         else { return false }
         return Self.isEditableTextRole(node.role, settable: node.settable)
+    }
+
+    public func visibleScreenFrame(
+        for target: ElementTarget,
+        windowFrame: CGRect
+    ) throws -> CGRect {
+        guard let current = snapshots[target.applicationDigest], current.context.matches(target),
+              let node = current.nodes.first(where: { $0.index == target.elementIndex }),
+              let frame = node.frame,
+              let visible = Self.visibleScreenFrame(
+                relativeFrame: frame,
+                windowFrame: windowFrame
+              )
+        else { throw AccessibilityFailure.elementUnavailable }
+        return visible
+    }
+
+    static func visibleScreenFrame(
+        relativeFrame frame: [Int32],
+        windowFrame: CGRect
+    ) -> CGRect? {
+        guard frame.count == 4 else { return nil }
+        let screenFrame = CGRect(
+            x: windowFrame.minX + CGFloat(frame[0]),
+            y: windowFrame.minY + CGFloat(frame[1]),
+            width: CGFloat(frame[2]),
+            height: CGFloat(frame[3])
+        )
+        let visible = screenFrame.intersection(windowFrame)
+        guard visible.width > 0, visible.height > 0,
+              !visible.isInfinite, !visible.isNull
+        else { return nil }
+        return visible
+    }
+
+    public func scrollPosition(
+        for target: ElementTarget,
+        direction: ScrollDirection
+    ) throws -> AccessibilityScrollPosition {
+        guard let current = snapshots[target.applicationDigest], current.context.matches(target),
+              let node = current.nodes.first(where: { $0.index == target.elementIndex }),
+              let element = current.elements[target.elementIndex]
+        else { throw AccessibilityFailure.elementUnavailable }
+        let isVertical = direction == .up || direction == .down
+        if isVertical {
+            if let textElement = Self.scrollableTextDescendant(of: element),
+               let position = Self.textScrollPosition(of: textElement)
+            {
+                return position
+            }
+            let nodesByIndex = Dictionary(uniqueKeysWithValues: current.nodes.map { ($0.index, $0) })
+            for candidate in current.nodes where candidate.role == "AXTextArea"
+                && Self.isDescendant(candidate, of: node.index, nodesByIndex: nodesByIndex)
+            {
+                guard let textElement = current.elements[candidate.index],
+                      let position = Self.textScrollPosition(of: textElement)
+                else { continue }
+                return position
+            }
+        }
+        let scrollBarAttribute = isVertical
+            ? kAXVerticalScrollBarAttribute as String
+            : kAXHorizontalScrollBarAttribute as String
+        if let rawScrollBar = attributeValue(scrollBarAttribute, from: element),
+           CFGetTypeID(rawScrollBar) == AXUIElementGetTypeID(),
+           let position = Self.numericScrollPosition(of: rawScrollBar as! AXUIElement)
+        {
+            return position
+        }
+        throw AccessibilityFailure.operationFailed
+    }
+
+    private static func scrollableTextDescendant(of root: AXUIElement) -> AXUIElement? {
+        var pending = [root]
+        var visited: [CFHashCode: [AXUIElement]] = [:]
+        while !pending.isEmpty, visited.values.reduce(0, { $0 + $1.count }) < 64 {
+            let element = pending.removeFirst()
+            let hash = CFHash(element)
+            if visited[hash]?.contains(where: { CFEqual($0, element) }) == true { continue }
+            visited[hash, default: []].append(element)
+            if let role: String = attribute(kAXRoleAttribute as String, from: element),
+               role == "AXTextArea"
+            {
+                return element
+            }
+            for name in [kAXContentsAttribute as String, kAXChildrenAttribute as String] {
+                if let children = attributeValue(name, from: element) as? [AXUIElement] {
+                    pending.append(contentsOf: children)
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func textScrollPosition(
+        of element: AXUIElement
+    ) -> AccessibilityScrollPosition? {
+        guard let rawRange = attributeValue(
+            kAXVisibleCharacterRangeAttribute as String,
+            from: element
+        ),
+            CFGetTypeID(rawRange) == AXValueGetTypeID()
+        else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(rawRange as! AXValue, .cfRange, &range),
+              range.location >= 0, range.length >= 0
+        else { return nil }
+        let numericCount = (
+            attributeValue(kAXNumberOfCharactersAttribute as String, from: element) as? NSNumber
+        )?.intValue
+        let stringCount = (attributeValue(kAXValueAttribute as String, from: element) as? String)?
+            .utf16.count
+        guard let characterCount = numericCount ?? stringCount, characterCount >= 0 else {
+            return nil
+        }
+        var position = CGPoint.zero
+        let movementValue: Double?
+        if let rawPosition = attributeValue(kAXPositionAttribute as String, from: element),
+           CFGetTypeID(rawPosition) == AXValueGetTypeID(),
+           AXValueGetValue(rawPosition as! AXValue, .cgPoint, &position),
+           position.y.isFinite
+        {
+            movementValue = -Double(position.y)
+        } else {
+            movementValue = nil
+        }
+        return AccessibilityScrollPosition(
+            value: Double(range.location),
+            minimum: 0,
+            maximum: Double(max(0, characterCount - range.length)),
+            movementValue: movementValue,
+            source: .visibleCharacterRange
+        )
+    }
+
+    private static func numericScrollPosition(
+        of scrollBar: AXUIElement
+    ) -> AccessibilityScrollPosition? {
+        guard let value = (attributeValue(kAXValueAttribute as String, from: scrollBar) as? NSNumber)?.doubleValue,
+              let minimum = (attributeValue(kAXMinValueAttribute as String, from: scrollBar) as? NSNumber)?.doubleValue,
+              let maximum = (attributeValue(kAXMaxValueAttribute as String, from: scrollBar) as? NSNumber)?.doubleValue,
+              value.isFinite, minimum.isFinite, maximum.isFinite,
+              maximum >= minimum, value >= minimum, value <= maximum
+        else { return nil }
+        return AccessibilityScrollPosition(
+            value: value,
+            minimum: minimum,
+            maximum: maximum,
+            source: .scrollBar
+        )
     }
 
     public func focusEditableTextTarget(_ target: ElementTarget) throws -> Bool {
@@ -347,20 +562,135 @@ public final class AccessibilityRuntime {
                 in: element
             )
         case let .scrollElement(_, direction, pages):
-            let name = switch direction {
-            case .up: "AXScrollUpByPage"
-            case .down: "AXScrollDownByPage"
-            case .left: "AXScrollLeftByPage"
-            case .right: "AXScrollRightByPage"
-            }
             for _ in 0 ..< pages {
-                try performNamedAction(name, on: element)
+                try scrollUsingSettableScrollBar(
+                    element,
+                    node: node,
+                    nodes: current.nodes,
+                    direction: direction
+                )
             }
         case let .secondaryAction(_, actionName):
             try performNamedAction(actionName, on: element)
         default:
             throw AccessibilityFailure.actionUnavailable
         }
+    }
+
+    private func scrollUsingSettableScrollBar(
+        _ element: AXUIElement,
+        node: AccessibilityNode,
+        nodes: [AccessibilityNode],
+        direction: ScrollDirection
+    ) throws {
+        let isVertical = direction == .up || direction == .down
+        let attributeName = isVertical
+            ? kAXVerticalScrollBarAttribute as String
+            : kAXHorizontalScrollBarAttribute as String
+        guard let rawScrollBar = attributeValue(attributeName, from: element),
+              CFGetTypeID(rawScrollBar) == AXUIElementGetTypeID()
+        else { throw AccessibilityFailure.operationFailed }
+        let scrollBar = rawScrollBar as! AXUIElement
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            scrollBar,
+            kAXValueAttribute as CFString,
+            &settable
+        ) == .success, settable.boolValue,
+            let current = (attributeValue(kAXValueAttribute as String, from: scrollBar) as? NSNumber)?.doubleValue,
+            let minimum = (attributeValue(kAXMinValueAttribute as String, from: scrollBar) as? NSNumber)?.doubleValue,
+            let maximum = (attributeValue(kAXMaxValueAttribute as String, from: scrollBar) as? NSNumber)?.doubleValue,
+            let frame = node.frame,
+            frame.count == 4
+        else { throw AccessibilityFailure.operationFailed }
+
+        let viewportExtent = Double(isVertical ? frame[3] : frame[2])
+        let contentExtent = Self.maximumDescendantExtent(
+            of: node.index,
+            nodes: nodes,
+            vertical: isVertical
+        )
+        guard let proposed = Self.pageScrollValue(
+            current: current,
+            minimum: minimum,
+            maximum: maximum,
+            viewportExtent: viewportExtent,
+            contentExtent: contentExtent,
+            direction: direction
+        ) else { throw AccessibilityFailure.operationFailed }
+
+        let epsilon = max((maximum - minimum) * 0.000_001, Double.ulpOfOne)
+        if abs(proposed - current) <= epsilon {
+            return
+        }
+        guard AXUIElementSetAttributeValue(
+            scrollBar,
+            kAXValueAttribute as CFString,
+            NSNumber(value: proposed)
+        ) == .success,
+            let observed = (attributeValue(kAXValueAttribute as String, from: scrollBar) as? NSNumber)?.doubleValue,
+            direction.increasesScrollBarValue
+                ? observed > current + epsilon
+                : observed < current - epsilon
+        else { throw AccessibilityFailure.operationFailed }
+    }
+
+    static func pageScrollValue(
+        current: Double,
+        minimum: Double,
+        maximum: Double,
+        viewportExtent: Double,
+        contentExtent: Double?,
+        direction: ScrollDirection
+    ) -> Double? {
+        guard current.isFinite, minimum.isFinite, maximum.isFinite,
+              viewportExtent.isFinite, viewportExtent > 0,
+              maximum > minimum,
+              current >= minimum, current <= maximum
+        else { return nil }
+        let range = maximum - minimum
+        let fraction: Double
+        if let contentExtent, contentExtent.isFinite, contentExtent > viewportExtent {
+            fraction = min(1, viewportExtent * 0.9 / (contentExtent - viewportExtent))
+        } else {
+            fraction = 0.1
+        }
+        let delta = max(range * fraction, range * 0.01)
+        return min(maximum, max(
+            minimum,
+            current + (direction.increasesScrollBarValue ? delta : -delta)
+        ))
+    }
+
+    private static func maximumDescendantExtent(
+        of targetIndex: UInt32,
+        nodes: [AccessibilityNode],
+        vertical: Bool
+    ) -> Double? {
+        let nodesByIndex = Dictionary(uniqueKeysWithValues: nodes.map { ($0.index, $0) })
+        return nodes.lazy.compactMap { candidate -> Double? in
+            guard candidate.index != targetIndex,
+                  isDescendant(candidate, of: targetIndex, nodesByIndex: nodesByIndex),
+                  let frame = candidate.frame,
+                  frame.count == 4
+            else { return nil }
+            let extent = Double(vertical ? frame[3] : frame[2])
+            return extent > 0 ? extent : nil
+        }.max()
+    }
+
+    private static func isDescendant(
+        _ node: AccessibilityNode,
+        of ancestorIndex: UInt32,
+        nodesByIndex: [UInt32: AccessibilityNode]
+    ) -> Bool {
+        var parentIndex = node.parentIndex
+        var visited: Set<UInt32> = []
+        while let current = parentIndex, visited.insert(current).inserted {
+            if current == ancestorIndex { return true }
+            parentIndex = nodesByIndex[current]?.parentIndex
+        }
+        return false
     }
 
     private func isFocused(_ element: AXUIElement) -> Bool {

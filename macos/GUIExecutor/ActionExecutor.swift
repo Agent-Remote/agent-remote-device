@@ -179,7 +179,39 @@ public final class ActionExecutor {
             for attempt in 0 ..< (requiresEditableFocus ? 12 : 1) {
                 do {
                     try rejectSecureInput(for: action)
-                    try accessibility.perform(action, target: target)
+                    if case let .scrollElement(_, direction, pages) = action {
+                        let prior = try accessibility.scrollPosition(
+                            for: target,
+                            direction: direction
+                        )
+                        if !prior.isAtBoundary(for: direction) {
+                            var requiresFallback = false
+                            do {
+                                try accessibility.perform(action, target: target)
+                                try await Task.sleep(for: .milliseconds(150))
+                                let observed = try accessibility.scrollPosition(
+                                    for: target,
+                                    direction: direction
+                                )
+                                requiresFallback = !observed.moved(from: prior, in: direction)
+                            } catch let error as AccessibilityFailure
+                                where error == .operationFailed
+                            {
+                                requiresFallback = true
+                            }
+                            if requiresFallback {
+                                try await postVerifiedPageScroll(
+                                    direction: direction,
+                                    pages: pages,
+                                    target: target,
+                                    context: context,
+                                    accessibility: accessibility
+                                )
+                            }
+                        }
+                    } else {
+                        try accessibility.perform(action, target: target)
+                    }
                     actionError = nil
                     break
                 } catch let error as AccessibilityFailure where
@@ -207,6 +239,85 @@ public final class ActionExecutor {
         } catch {
             releasePressedState()
             throw error
+        }
+    }
+
+    private func postVerifiedPageScroll(
+        direction: ScrollDirection,
+        pages: UInt8,
+        target: ElementTarget,
+        context: WindowContext,
+        accessibility: AccessibilityRuntime
+    ) async throws {
+        let prior = try accessibility.scrollPosition(for: target, direction: direction)
+        if prior.isAtBoundary(for: direction) { return }
+        let visibleFrame = try accessibility.visibleScreenFrame(
+            for: target,
+            windowFrame: context.windowFrame
+        )
+        guard let deltas = Self.pageScrollDeltas(
+            direction: direction,
+            pages: pages,
+            visibleFrame: visibleFrame
+        ),
+            let originalPointer = CGEvent(source: nil)?.location,
+            let moveToElement = CGEvent(
+                mouseEventSource: nil,
+                mouseType: .mouseMoved,
+                mouseCursorPosition: CGPoint(x: visibleFrame.midX, y: visibleFrame.midY),
+                mouseButton: .left
+            ),
+            let scroll = CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .pixel,
+                wheelCount: 2,
+                wheel1: deltas.vertical,
+                wheel2: deltas.horizontal,
+                wheel3: 0
+            )
+        else { throw ExecutionFailure.eventCreationFailed }
+        defer {
+            CGEvent(
+                mouseEventSource: nil,
+                mouseType: .mouseMoved,
+                mouseCursorPosition: originalPointer,
+                mouseButton: .left
+            )?.post(tap: .cghidEventTap)
+        }
+        let targetPoint = CGPoint(x: visibleFrame.midX, y: visibleFrame.midY)
+        scroll.location = targetPoint
+        moveToElement.post(tap: .cghidEventTap)
+        try await Task.sleep(for: .milliseconds(50))
+        scroll.post(tap: .cghidEventTap)
+        try await Task.sleep(for: .milliseconds(150))
+        let observed = try accessibility.scrollPosition(for: target, direction: direction)
+        guard observed.moved(from: prior, in: direction) else {
+            throw AccessibilityFailure.operationFailed
+        }
+    }
+
+    static func pageScrollDeltas(
+        direction: ScrollDirection,
+        pages: UInt8,
+        visibleFrame: CGRect
+    ) -> (horizontal: Int32, vertical: Int32)? {
+        guard pages > 0, visibleFrame.width > 0, visibleFrame.height > 0,
+              !visibleFrame.isInfinite, !visibleFrame.isNull
+        else { return nil }
+        let pageCount = CGFloat(pages)
+        let verticalMagnitude = Int32(min(
+            10_000,
+            max(1, (visibleFrame.height * 0.9 * pageCount).rounded())
+        ))
+        let horizontalMagnitude = Int32(min(
+            10_000,
+            max(1, (visibleFrame.width * 0.9 * pageCount).rounded())
+        ))
+        return switch direction {
+        case .up: (0, verticalMagnitude)
+        case .down: (0, -verticalMagnitude)
+        case .left: (horizontalMagnitude, 0)
+        case .right: (-horizontalMagnitude, 0)
         }
     }
 

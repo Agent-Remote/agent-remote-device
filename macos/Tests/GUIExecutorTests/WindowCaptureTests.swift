@@ -89,6 +89,62 @@ import UniformTypeIdentifiers
     ))
 }
 
+@Test func exactBundleIdentifierResolvesTheLaunchServicesApplication() async throws {
+    let target = try await MainActor.run {
+        try ApplicationResolver.installedApplication(
+            matching: "com.apple.TextEdit",
+            excludedBundleIdentifiers: []
+        )
+    }
+
+    #expect(target.identity.bundleIdentifier == "com.apple.TextEdit")
+    #expect(target.bundleURL.lastPathComponent == "TextEdit.app")
+}
+
+@Test func humanReadableNameResolvesTheFinderCoreServicesApplication() async throws {
+    let target = try await MainActor.run {
+        try ApplicationResolver.installedApplication(
+            matching: "Finder",
+            excludedBundleIdentifiers: []
+        )
+    }
+
+    #expect(target.identity.bundleIdentifier == "com.apple.finder")
+    #expect(target.bundleURL.lastPathComponent == "Finder.app")
+}
+
+@Test func installedApplicationMetadataFiltersByNameBeforeIdentityValidation() throws {
+    let manager = FileManager.default
+    let root = manager.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? manager.removeItem(at: root) }
+    let application = root.appendingPathComponent("Visible Name.app", isDirectory: true)
+    let contents = application.appendingPathComponent("Contents", isDirectory: true)
+    try manager.createDirectory(at: contents, withIntermediateDirectories: true)
+    let info = contents.appendingPathComponent("Info.plist")
+    try PropertyListSerialization.data(
+        fromPropertyList: [
+            "CFBundleIdentifier": "com.example.metadata-filter",
+            "CFBundleName": "Metadata Filter",
+        ],
+        format: .xml,
+        options: 0
+    ).write(to: info)
+
+    #expect(ApplicationResolver.applicationMetadataMatches(
+        target: "Metadata Filter",
+        at: application
+    ))
+    #expect(ApplicationResolver.applicationMetadataMatches(
+        target: "Visible Name",
+        at: application
+    ))
+    #expect(!ApplicationResolver.applicationMetadataMatches(
+        target: "Unrelated",
+        at: application
+    ))
+}
+
 @Test func installedApplicationDiscoveryFindsNestedAppsAndFailsClosedAtItsBound() throws {
     let manager = FileManager.default
     let root = manager.temporaryDirectory

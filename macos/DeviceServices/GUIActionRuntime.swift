@@ -291,7 +291,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         deadline: Date
     ) async throws -> WindowContext {
         let priorProcessID = await MainActor.run {
-            NSWorkspace.shared.frontmostApplication?.processIdentifier
+            WindowCapture.frontmostProcessID()
         }
         let target = try await MainActor.run {
             try ApplicationResolver.installedApplication(
@@ -803,15 +803,30 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         let remotelyActivated = activatedProcessIDs
         activatedProcessIDs.removeAll(keepingCapacity: false)
         guard let processID else { return }
-        let shouldRestore = await MainActor.run {
-            guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
-            // A manual application switch supersedes the focus captured for this turn.
-            return remotelyActivated.contains(frontmost.processIdentifier)
+        let currentBeforeRestore = await MainActor.run { WindowCapture.frontmostProcessID() }
+        let shouldRestore = currentBeforeRestore.map(remotelyActivated.contains) == true
+        if currentBeforeRestore == processID {
+            // A cancelled activation can finish after cleanup first observes the
+            // user's application. Keep the captured focus alive briefly for that race.
+            for _ in 0 ..< 40 {
+                try? await Task.sleep(for: .milliseconds(50))
+                let current = await MainActor.run { WindowCapture.frontmostProcessID() }
+                if current == processID { continue }
+                guard current.map(remotelyActivated.contains) == true else { return }
+                await WindowCapture.restoreUserApplication(
+                    processID: processID,
+                    whileFrontmostProcessIsOneOf: remotelyActivated
+                )
+                return
+            }
+            return
         }
+        // A manual application switch supersedes the focus captured for this turn.
         guard shouldRestore else { return }
-        await MainActor.run {
-            WindowCapture.restoreUserApplication(processID: processID)
-        }
+        await WindowCapture.restoreUserApplication(
+            processID: processID,
+            whileFrontmostProcessIsOneOf: remotelyActivated
+        )
     }
 
     private func activateForAction(
@@ -819,7 +834,7 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         processID: pid_t
     ) async throws {
         let priorProcessID = await MainActor.run {
-            NSWorkspace.shared.frontmostApplication?.processIdentifier
+            WindowCapture.frontmostProcessID()
         }
         if let priorProcessID,
            priorProcessID != processID,

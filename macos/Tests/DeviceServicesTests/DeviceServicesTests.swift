@@ -77,7 +77,52 @@ import Testing
     #expect(await controller.currentState() == .active)
 }
 
-@Test func namedScreenshotReusesTheApplicationsLatestBoundWindow() async throws {
+@Test func repeatedNamedAccessibilityObservationsFollowTheFrontmostWindow() async throws {
+    let recorder = RuntimeRecorder()
+    let controller = GUIExecutorSessionController { guardState in
+        RuntimeStub(
+            guardState: guardState,
+            recorder: recorder,
+            windowContextWindowIDs: [7, 8]
+        )
+    }
+    let session = configuration(leaseUntil: Date().addingTimeInterval(60))
+    try await controller.updateSession(
+        envelope(payload: JSONEncoder().encode(session)).encoded()
+    )
+
+    let firstData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(mode: .axFull),
+        action: .observe(application: "com.apple.Safari")
+    ))
+    let first = try JSONDecoder().decode(ActionResponseV2.self, from: firstData)
+    let secondData = try await controller.performAction(actionEnvelopeV2(
+        configuration: session,
+        requestID: UUID(),
+        sequence: 2,
+        stateGeneration: 1,
+        screenshotGeneration: 0,
+        baseStateID: first.stateID,
+        observation: ObservationPolicy(mode: .axDiff),
+        action: .observe(application: "com.apple.Safari")
+    ))
+    let second = try JSONDecoder().decode(ActionResponseV2.self, from: secondData)
+
+    #expect(first.status == .success)
+    #expect(first.windowID == 7)
+    #expect(second.status == .success)
+    #expect(second.windowID == 8)
+    #expect(second.baseStateID == nil)
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], []])
+    #expect(await recorder.observationBaseStateIDs == [nil, nil])
+}
+
+@Test func repeatedNamedScreenshotsFollowTheFrontmostWindow() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
         RuntimeStub(guardState: guardState, recorder: recorder)
@@ -87,29 +132,33 @@ import Testing
         envelope(payload: JSONEncoder().encode(session)).encoded()
     )
 
-    _ = try await controller.performAction(actionEnvelopeV2(
+    let firstData = try await controller.performAction(actionEnvelopeV2(
         configuration: session,
         requestID: UUID(),
         sequence: 1,
         stateGeneration: 0,
         screenshotGeneration: 0,
-        observation: ObservationPolicy(mode: .axFull),
+        observation: ObservationPolicy(mode: .screenshot),
         action: .observe(application: "com.apple.Safari")
     ))
+    let first = try JSONDecoder().decode(ActionResponseV2.self, from: firstData)
     let screenshotData = try await controller.performAction(actionEnvelopeV2(
         configuration: session,
         requestID: UUID(),
         sequence: 2,
         stateGeneration: 1,
-        screenshotGeneration: 0,
+        screenshotGeneration: 1,
         observation: ObservationPolicy(mode: .screenshot),
         action: .observe(application: "com.apple.Safari")
     ))
     let screenshot = try JSONDecoder().decode(ActionResponseV2.self, from: screenshotData)
 
+    #expect(first.status == .success)
+    #expect(first.screenshotGeneration == 1)
     #expect(screenshot.status == .success)
+    #expect(screenshot.screenshotGeneration == 2)
     #expect(screenshot.windowID == 7)
-    #expect(await recorder.preferredWindowIDs == [[7]])
+    #expect(await recorder.preferredWindowIDs == [[], []])
 }
 
 @Test func legacyScreenshotsReuseTheLatestBoundWindow() async throws {
@@ -192,7 +241,7 @@ import Testing
     #expect(await recorder.preferredWindowIDs == [[], [], []])
 }
 
-@Test func repeatedAccessibilityObservationsReuseTheLatestBoundWindow() async throws {
+@Test func repeatedAccessibilityObservationsResolveTheFrontmostWindow() async throws {
     let recorder = RuntimeRecorder()
     let controller = GUIExecutorSessionController { guardState in
         RuntimeStub(guardState: guardState, recorder: recorder)
@@ -221,7 +270,7 @@ import Testing
         action: .observe(application: "com.apple.Safari")
     ))
 
-    #expect(await recorder.windowContextPreferredWindowIDs == [[], [7]])
+    #expect(await recorder.windowContextPreferredWindowIDs == [[], []])
 }
 
 @Test func executorRunsStateBoundV2ElementActionAndRejectsItsReuse() async throws {
@@ -3777,7 +3826,7 @@ import Testing
     )
     let ended = try JSONDecoder().decode(BrokerEndRequest.self, from: endedEnvelope.payload)
     #expect(ended == BrokerEndRequest(binding: session.binding))
-    #expect(await approvalUI.waitForEvents(1) == [.sessionEnded])
+    #expect(await approvalUI.waitForEvents(2) == [.turnStopped, .sessionEnded])
 }
 
 @Test func completedRemoteSessionDoesNotAbortWhenRelayClosesWithAnError() async throws {
@@ -3904,10 +3953,117 @@ import Testing
 
     #expect(approvalError == nil)
     #expect(await lifecycleRecorder.waitForEnd() == BrokerEndRequest(binding: session.binding))
-    #expect(await approvalUI.waitForEvents(1) == [.sessionEnded])
+    #expect(await approvalUI.waitForEvents(3) == [
+        .turnStopped,
+        .turnStarted,
+        .sessionEnded,
+    ])
     #expect(executor.paused != nil)
     #expect(executor.resumed != nil)
     #expect(executor.actioned == second as NSData)
+}
+
+@Test func localStopRejectsRemainingTurnActionsUntilTrustedTurnStop() async throws {
+    let executor = ExecutorStub()
+    let approvalUI = ApprovalUIStub()
+    let first = configuration(leaseUntil: Date().addingTimeInterval(60))
+    let second = rotatedConfiguration(first)
+    let cancellation = CancellationRecorder()
+    let responses = ActionDataRecorder()
+    let lifecycleRecorder = LifecycleRecorder()
+    let blocked = try actionEnvelopeV2(
+        configuration: second,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(),
+        action: .observe(application: "Finder")
+    )
+    let resumed = try actionEnvelopeV2(
+        configuration: second,
+        requestID: UUID(),
+        sequence: 1,
+        stateGeneration: 0,
+        screenshotGeneration: 0,
+        observation: ObservationPolicy(),
+        action: .observe(application: "Finder")
+    )
+    let broker = NetworkBrokerService(
+        executorOverride: executor,
+        approvalProvider: { decision in
+            decision.binding.generation == first.binding.generation ? first : second
+        },
+        abortProvider: { _ in
+            BrokerPendingSession(
+                binding: second.binding,
+                expiresAt: second.leaseUntil,
+                activationConfiguration: second
+            )
+        },
+        endProvider: { request in await lifecycleRecorder.recordEnd(request) },
+        relayProvider: { configuration in
+            if configuration.binding.generation == first.binding.generation {
+                return HoldingRelay(cancellationRecorder: cancellation)
+            }
+            return LocalStopRecoveryRelay(
+                blocked: blocked,
+                resumed: resumed,
+                responses: responses
+            )
+        },
+        lockProvider: { _ in }
+    )
+    broker.installApprovalUI(approvalUI)
+
+    let firstDecision = BrokerApprovalDecision(
+        binding: first.binding,
+        approvals: first.approvals,
+        result: .allowed
+    )
+    let firstRequest = try envelope(
+        payload: JSONEncoder().encode(firstDecision)
+    ).encoded() as NSData
+    let firstError = await withCheckedContinuation { continuation in
+        broker.approveSession(firstRequest) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+    #expect(firstError == nil)
+
+    let abort = BrokerAbortRequest(binding: first.binding, reason: .escape)
+    let abortData = try envelope(payload: JSONEncoder().encode(abort)).encoded() as NSData
+    let abortError = await withCheckedContinuation { continuation in
+        broker.stopCurrentAction(abortData) { continuation.resume(returning: $0?.code) }
+    }
+    #expect(abortError == nil)
+    #expect(cancellation.wasCancelled)
+
+    let secondDecision = BrokerApprovalDecision(
+        binding: second.binding,
+        approvals: second.approvals,
+        result: .allowed
+    )
+    let secondRequest = try envelope(
+        payload: JSONEncoder().encode(secondDecision)
+    ).encoded() as NSData
+    let secondError = await withCheckedContinuation { continuation in
+        broker.approveSession(secondRequest) { _, error in
+            continuation.resume(returning: error?.code)
+        }
+    }
+    #expect(secondError == nil)
+    #expect(await lifecycleRecorder.waitForEnd() == BrokerEndRequest(binding: second.binding))
+
+    let recorded = await responses.waitForValues(2)
+    let rejected = try JSONDecoder().decode(ActionResponseV2.self, from: recorded[0])
+    #expect(rejected.status == .failed)
+    #expect(rejected.message.hasPrefix("turn_stopped:"))
+    #expect(recorded[1] == resumed)
+    #expect(executor.turnPauseCount() == 1)
+    #expect(executor.resumed != nil)
+    #expect(executor.actioned == resumed as NSData)
+    #expect(await approvalUI.waitForEvents(2) == [.turnStarted, .sessionEnded])
 }
 
 @Test func simultaneousRelayAndRotationFailuresAbortOnlyOnce() async throws {
@@ -4828,6 +4984,21 @@ private actor AsyncEventRecorder {
     }
 }
 
+private actor ActionDataRecorder {
+    private var values: [Data] = []
+
+    func record(_ value: Data) {
+        values.append(value)
+    }
+
+    func waitForValues(_ count: Int) async -> [Data] {
+        for _ in 0 ..< 100 where values.count < count {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return values
+    }
+}
+
 private actor ConfigurationRecorder {
     private(set) var first: ExecutorSessionConfiguration?
     private var continuation: CheckedContinuation<ExecutorSessionConfiguration, Never>?
@@ -4931,6 +5102,30 @@ private final class TurnCycleRelay: NetworkBrokerRelayRunning, @unchecked Sendab
         _ = try await actionHandler(first)
         try await lifecycleHandler(.turnStop)
         _ = try await actionHandler(second)
+        try await lifecycleHandler(.sessionEnd)
+    }
+
+    func cancel() {}
+}
+
+private final class LocalStopRecoveryRelay: NetworkBrokerRelayRunning, @unchecked Sendable {
+    private let blocked: Data
+    private let resumed: Data
+    private let responses: ActionDataRecorder
+
+    init(blocked: Data, resumed: Data, responses: ActionDataRecorder) {
+        self.blocked = blocked
+        self.resumed = resumed
+        self.responses = responses
+    }
+
+    func run(
+        actionHandler: @escaping @Sendable (Data) async throws -> Data,
+        lifecycleHandler: @escaping @Sendable (RemoteLifecycleEvent) async throws -> Void
+    ) async throws {
+        await responses.record(try await actionHandler(blocked))
+        try await lifecycleHandler(.turnStop)
+        await responses.record(try await actionHandler(resumed))
         try await lifecycleHandler(.sessionEnd)
     }
 

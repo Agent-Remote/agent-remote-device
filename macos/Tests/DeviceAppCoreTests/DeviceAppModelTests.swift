@@ -366,6 +366,11 @@ import Testing
         try await Task.sleep(for: .milliseconds(5))
     }
     #expect(model.state == .paused)
+    #expect(model.lastUnsafeTransition == .escape)
+
+    try model.handleRuntimeEvent(.turnStarted)
+    #expect(model.state == .active)
+    #expect(model.lastUnsafeTransition == nil)
 }
 
 @MainActor

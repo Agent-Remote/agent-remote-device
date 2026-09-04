@@ -1011,3 +1011,106 @@ private func axNode(
         settable: false
     ))
 }
+
+@MainActor
+@Test func pageScrollFallbackUsesVisibleContentRatioAndDirection() throws {
+    let down = try #require(AccessibilityRuntime.pageScrollValue(
+        current: 0.2,
+        minimum: 0,
+        maximum: 1,
+        viewportExtent: 400,
+        contentExtent: 1_600,
+        direction: .down,
+    ))
+    #expect(abs(down - 0.5) < 0.000_001)
+
+    let up = try #require(AccessibilityRuntime.pageScrollValue(
+        current: 0.5,
+        minimum: 0,
+        maximum: 1,
+        viewportExtent: 400,
+        contentExtent: 1_600,
+        direction: .up
+    ))
+    #expect(abs(up - 0.2) < 0.000_001)
+}
+
+@MainActor
+@Test func pageScrollFallbackUsesBoundedDefaultAndRecognizesBoundary() throws {
+    let right = try #require(AccessibilityRuntime.pageScrollValue(
+        current: 0.95,
+        minimum: 0,
+        maximum: 1,
+        viewportExtent: 400,
+        contentExtent: nil,
+        direction: .right
+    ))
+    #expect(right == 1)
+    let boundary = try #require(AccessibilityRuntime.pageScrollValue(
+        current: 1,
+        minimum: 0,
+        maximum: 1,
+        viewportExtent: 400,
+        contentExtent: nil,
+        direction: .down
+    ))
+    #expect(boundary == 1)
+    #expect(AccessibilityRuntime.pageScrollValue(
+        current: 0,
+        minimum: 0,
+        maximum: 0,
+        viewportExtent: 400,
+        contentExtent: 1_600,
+        direction: .down
+    ) == nil)
+}
+
+@MainActor
+@Test func wheelFallbackMapsWindowRelativeFrameIntoScreenCoordinates() throws {
+    let window = CGRect(x: 600, y: 200, width: 800, height: 600)
+    let screen = try #require(AccessibilityRuntime.visibleScreenFrame(
+        relativeFrame: [20, 50, 300, 400],
+        windowFrame: window
+    ))
+    #expect(screen == CGRect(x: 620, y: 250, width: 300, height: 400))
+    #expect(AccessibilityRuntime.visibleScreenFrame(
+        relativeFrame: [900, 0, 100, 100],
+        windowFrame: window
+    ) == nil)
+}
+
+@MainActor
+@Test func verifiedScrollPositionHandlesMovementAndBoundaries() {
+    let middle = AccessibilityScrollPosition(value: 40, minimum: 0, maximum: 100)
+    #expect(!middle.isAtBoundary(for: .down))
+    #expect(!middle.isAtBoundary(for: .up))
+    #expect(AccessibilityScrollPosition(value: 70, minimum: 0, maximum: 100)
+        .moved(from: middle, in: .down))
+    #expect(AccessibilityScrollPosition(value: 10, minimum: 0, maximum: 100)
+        .moved(from: middle, in: .up))
+    #expect(!AccessibilityScrollPosition(value: 40, minimum: 0, maximum: 100)
+        .moved(from: middle, in: .down))
+    #expect(AccessibilityScrollPosition(value: 0, minimum: 0, maximum: 100)
+        .isAtBoundary(for: .up))
+    #expect(AccessibilityScrollPosition(value: 100, minimum: 0, maximum: 100)
+        .isAtBoundary(for: .down))
+
+    let geometryBefore = AccessibilityScrollPosition(
+        value: 20,
+        minimum: 0,
+        maximum: 100,
+        movementValue: 280
+    )
+    #expect(AccessibilityScrollPosition(
+        value: 18,
+        minimum: 0,
+        maximum: 100,
+        movementValue: 310
+    ).moved(from: geometryBefore, in: .down))
+    #expect(!AccessibilityScrollPosition(
+        value: 18,
+        minimum: 0,
+        maximum: 100,
+        movementValue: 310
+    ).moved(from: geometryBefore, in: .up))
+}

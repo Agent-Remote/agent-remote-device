@@ -88,17 +88,26 @@ private let delegate = AuthenticatedXPCListenerDelegate(
     exportedObject: service,
     peerPolicy: policy,
     onConnectionInvalidated: {
-        service.approvalUIConnectionInvalidated()
+        // NSXPC invokes invalidation handlers on its private connection queue.
+        // Hop to the main actor before touching the service so Swift's runtime
+        // isolation checks cannot trap during a broker/UI disconnect race.
+        Task { @MainActor in
+            service.approvalUIConnectionInvalidated()
+        }
     },
     remoteInterface: NSXPCInterface(with: ApprovalUIXPCProtocol.self),
     onConnectionAccepted: { connection in
-        guard let approvalUI = connection.remoteObjectProxyWithErrorHandler({ _ in
-            service.approvalUIConnectionInvalidated()
-        }) as? ApprovalUIXPCProtocol else {
-            service.approvalUIConnectionInvalidated()
-            return
+        Task { @MainActor in
+            guard let approvalUI = connection.remoteObjectProxyWithErrorHandler({ _ in
+                Task { @MainActor in
+                    service.approvalUIConnectionInvalidated()
+                }
+            }) as? ApprovalUIXPCProtocol else {
+                service.approvalUIConnectionInvalidated()
+                return
+            }
+            service.installApprovalUI(approvalUI)
         }
-        service.installApprovalUI(approvalUI)
     }
 )
 let listener = NSXPCListener.service()

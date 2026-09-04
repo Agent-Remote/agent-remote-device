@@ -429,13 +429,13 @@ public final class DeviceAppModel: ObservableObject {
             }
         case .turnStarted:
             guard state == .paused,
-                  lastUnsafeTransition == nil,
                   sessionFullTrustActive
             else {
                 throw DeviceAppFailure.invalidRuntimeTransition
             }
             do {
                 try startSafetyMonitoring()
+                lastUnsafeTransition = nil
                 state = .active
             } catch {
                 safetyMonitor?.stop()

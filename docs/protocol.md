@@ -542,6 +542,12 @@ Every safety-critical Broker request to the Executor or session UI has a
 bounded local reply deadline. Cancellation, timeout, or a missing callback
 fails the current relay and triggers fail-closed recovery.
 
+A local Stop rotates the transport generation but also carries a local turn-stop
+marker into the replacement relay. Actions received before the trusted
+`turn_stop` frame return `turn_stopped` without reaching the Executor. The frame
+clears that marker and leaves the replacement Executor paused, so only an action
+from the next Claude turn can resume local control.
+
 The proxy MCP process owns a session-private `/tmp/lifecycle.sock`. Fixed Claude
 `Stop`, `StopFailure`, and `SessionEnd` command hooks invoke the same verified proxy binary in
 notifier mode. The notifier validates the hook event name, sends one bounded

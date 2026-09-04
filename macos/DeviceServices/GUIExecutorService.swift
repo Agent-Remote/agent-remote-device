@@ -67,7 +67,9 @@ public final class GUIExecutorService: NSObject, GUIExecutorXPCProtocol, @unchec
                 let response = try await controller.performAction(data)
                 reply.resolve(data: response as NSData, error: nil)
             } catch {
-                logger.error("Executor action failed")
+                logger.error(
+                    "Executor action failed type=\(String(reflecting: type(of: error)), privacy: .public)"
+                )
                 reply.resolve(data: nil, error: DeviceIPCFailure.invalidMessage.nsError)
             }
         }

@@ -62,7 +62,10 @@ const BACKGROUND_CONTEXT_READY_WAIT: Duration = Duration::from_secs(10);
 const ACTION_LEASE_READY_WAIT: Duration = Duration::from_secs(15);
 const MIN_ACTION_LEASE_REMAINING: Duration = Duration::from_secs(30);
 const CONTEXT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_SAME_GENERATION_RECONNECTS: u16 = 3;
+// Control-plane generation rotation can briefly outlast the old three-attempt
+// (700 ms) window. Keep retries bounded, but allow the action's 60 s deadline
+// to absorb a normal relay restart without surfacing a transient TLS failure.
+const MAX_SAME_GENERATION_RECONNECTS: u16 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -756,9 +759,26 @@ impl ActivatedUnixDeviceTransport {
 
     /// Forwards one lifecycle event using the active generation binding.
     pub async fn notify_lifecycle(&self, event: LifecycleEvent) -> Result<(), TransportError> {
-        let context = load_managed_context(&self.managed_context_path, Duration::ZERO).await?;
+        let failed_generation = *self.failed_generation.lock().await;
+        let context = if failed_generation.is_some() {
+            load_action_context(
+                &self.managed_context_path,
+                RECOVERY_ACTION_CONTEXT_READY_WAIT,
+                failed_generation,
+            )
+            .await?
+        } else {
+            load_managed_context(&self.managed_context_path, Duration::ZERO).await?
+        };
         let transport = self.transport_for_context(context).await?;
-        transport.notify_lifecycle(event).await
+        let result = transport.notify_lifecycle(event).await;
+        if result.is_ok() && failed_generation.is_some() {
+            let mut failed = self.failed_generation.lock().await;
+            if *failed == failed_generation {
+                *failed = None;
+            }
+        }
+        result
     }
 
     /// Establishes the generation-bound relay before the first MCP action arrives.
@@ -2202,6 +2222,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_notification_waits_for_and_uses_the_rotated_generation() {
+        let directory = tempdir().expect("temp directory");
+        let context_path = directory.path().join("context.json");
+        let bridge_path = directory.path().join("bridge.sock");
+        let listener = UnixListener::bind(&bridge_path).expect("bind bridge socket");
+        let initial = test_context(4, Utc::now() + chrono::Duration::seconds(60));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&context_path)
+            .expect("create initial context");
+        serde_json::to_writer(&mut file, &initial).expect("write initial context");
+
+        let activated = ActivatedUnixDeviceTransport::new(&context_path, &bridge_path);
+        activated
+            .transport_for_context(initial.clone())
+            .await
+            .expect("seed initial transport");
+        *activated.failed_generation.lock().await =
+            Some((initial.device_session_id, initial.generation));
+
+        let mut rotated = initial.clone();
+        rotated.generation += 1;
+        let replacement_path = context_path.clone();
+        let replacement = rotated.clone();
+        let writer = tokio::spawn(async move {
+            sleep(Duration::from_millis(25)).await;
+            let temporary = replacement_path.with_extension("next");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .expect("create rotated context");
+            serde_json::to_writer(&mut file, &replacement).expect("write rotated context");
+            std::fs::rename(temporary, replacement_path).expect("publish rotated context");
+        });
+
+        let server_context = rotated.clone();
+        let server = tokio::spawn(async move {
+            let mut tls = accept_test_tls(&listener, &server_context, 0x54).await;
+            let lifecycle = read_framed_json(&mut tls).await;
+            assert_eq!(lifecycle["lifecycle"]["event"], "turn_stop");
+            assert_eq!(
+                lifecycle["lifecycle"]["context"]["generation"],
+                server_context.generation
+            );
+            let response = serde_json::json!({
+                "request_id": lifecycle["lifecycle"]["request_id"],
+                "status": "success"
+            });
+            write_framed_json(&mut tls, &response).await;
+        });
+
+        activated
+            .notify_lifecycle(LifecycleEvent::TurnStop)
+            .await
+            .expect("lifecycle should use the rotated generation");
+        assert_eq!(*activated.failed_generation.lock().await, None);
+        let active = activated.active.lock().await;
+        assert_eq!(
+            active.as_ref().expect("active transport").0.generation,
+            rotated.generation
+        );
+        drop(active);
+        writer.await.expect("context writer");
+        server.await.expect("bridge server");
+    }
+
+    #[tokio::test]
     async fn activated_transport_renews_without_resetting_action_state() {
         let directory = tempdir().expect("temp directory");
         let activated = ActivatedUnixDeviceTransport::new(
@@ -2518,7 +2609,7 @@ mod tests {
         let context = test_context(9, Utc::now() + chrono::Duration::seconds(60));
         let server_context = context.clone();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().await.expect("accept failed handshake");
                 let _: BridgeHello = read_bridge_control(&mut stream)
                     .await
@@ -2601,7 +2692,7 @@ mod tests {
             .await
             .expect("same action should recover after handshake failures");
         assert_eq!(result.message, "recovered");
-        assert_eq!(result.retry_count, 2);
+        assert_eq!(result.retry_count, 4);
         let state = transport.state.lock().await;
         assert!(!state.poisoned);
         assert_eq!(state.context.next_sequence, 2);
