@@ -48,6 +48,7 @@ public struct CapturedWindow: @unchecked Sendable {
     public let coordinateFrame: CGRect
     public let processID: pid_t
     public let application: ApplicationIdentity
+    public let applicationWindowIDs: Set<CGWindowID>
     public let displayFingerprint: String
     public let windowTitle: String?
 
@@ -61,6 +62,7 @@ public struct CapturedWindow: @unchecked Sendable {
         coordinateFrame: CGRect,
         processID: pid_t,
         application: ApplicationIdentity,
+        applicationWindowIDs: Set<CGWindowID>? = nil,
         displayFingerprint: String,
         windowTitle: String? = nil
     ) {
@@ -73,6 +75,7 @@ public struct CapturedWindow: @unchecked Sendable {
         self.coordinateFrame = coordinateFrame
         self.processID = processID
         self.application = application
+        self.applicationWindowIDs = applicationWindowIDs ?? [windowID]
         self.displayFingerprint = displayFingerprint
         self.windowTitle = windowTitle
     }
@@ -83,6 +86,7 @@ public struct WindowContext: Equatable, Sendable {
     public let windowFrame: CGRect
     public let processID: pid_t
     public let application: ApplicationIdentity
+    public let applicationWindowIDs: Set<CGWindowID>
     public let displayFingerprint: String
     public let windowTitle: String?
 
@@ -91,6 +95,7 @@ public struct WindowContext: Equatable, Sendable {
         windowFrame: CGRect,
         processID: pid_t,
         application: ApplicationIdentity,
+        applicationWindowIDs: Set<CGWindowID>? = nil,
         displayFingerprint: String,
         windowTitle: String? = nil
     ) {
@@ -98,6 +103,7 @@ public struct WindowContext: Equatable, Sendable {
         self.windowFrame = windowFrame
         self.processID = processID
         self.application = application
+        self.applicationWindowIDs = applicationWindowIDs ?? [windowID]
         self.displayFingerprint = displayFingerprint
         self.windowTitle = windowTitle
     }
@@ -132,6 +138,7 @@ private struct ResolvedWindow {
     let windowID: CGWindowID
     let windowFrame: CGRect
     let windowTitle: String?
+    let applicationWindowIDs: Set<CGWindowID>
     let display: SCDisplay
     let captureFrame: CGRect
 }
@@ -143,6 +150,7 @@ public extension CapturedWindow {
             windowFrame: windowFrame,
             processID: processID,
             application: application,
+            applicationWindowIDs: applicationWindowIDs,
             displayFingerprint: displayFingerprint,
             windowTitle: windowTitle
         )
@@ -264,7 +272,8 @@ public struct WindowCapture: Sendable {
         let resolved = try await resolve(
             application: application,
             requiredWindowID: requiredWindowID,
-            requiredProcessID: requiredProcessID
+            requiredProcessID: requiredProcessID,
+            preferFocusedWindow: false
         )
         let size = Self.scaledSize(
             sourceWidth: resolved.captureFrame.width,
@@ -321,6 +330,7 @@ public struct WindowCapture: Sendable {
             coordinateFrame: resolved.captureFrame,
             processID: resolved.processID,
             application: application,
+            applicationWindowIDs: resolved.applicationWindowIDs,
             displayFingerprint: Self.displayFingerprint(
                 resolved.content.displays,
                 selected: resolved.display
@@ -333,18 +343,23 @@ public struct WindowCapture: Sendable {
     public func context(
         application: ApplicationIdentity,
         requiredWindowID: CGWindowID? = nil,
-        requiredProcessID: pid_t? = nil
+        requiredProcessID: pid_t? = nil,
+        preferFocusedWindow: Bool = false,
+        excludedWindowIDs: Set<CGWindowID> = []
     ) async throws -> WindowContext {
         let resolved = try await resolve(
             application: application,
             requiredWindowID: requiredWindowID,
-            requiredProcessID: requiredProcessID
+            requiredProcessID: requiredProcessID,
+            preferFocusedWindow: preferFocusedWindow,
+            excludedWindowIDs: excludedWindowIDs
         )
         return WindowContext(
             windowID: resolved.windowID,
             windowFrame: resolved.windowFrame,
             processID: resolved.processID,
             application: application,
+            applicationWindowIDs: resolved.applicationWindowIDs,
             displayFingerprint: Self.displayFingerprint(
                 resolved.content.displays,
                 selected: resolved.display
@@ -357,7 +372,9 @@ public struct WindowCapture: Sendable {
     private func resolve(
         application: ApplicationIdentity,
         requiredWindowID: CGWindowID?,
-        requiredProcessID: pid_t? = nil
+        requiredProcessID: pid_t? = nil,
+        preferFocusedWindow: Bool,
+        excludedWindowIDs: Set<CGWindowID> = []
     ) async throws -> ResolvedWindow {
         guard application.bundleIdentifier != excludedBundleIdentifier else {
             throw CaptureFailure.applicationActivationRejected
@@ -406,10 +423,15 @@ public struct WindowCapture: Sendable {
             shareable: shareableCandidates,
             visible: visibleCandidates
         )
+        let frontmostProcessID: pid_t? = if requiredWindowID == nil {
+            try await Self.frontmostShareableProcessID(content: content)
+        } else {
+            nil
+        }
         let selectionProcessIDs = try Self.windowSelectionProcessIDs(
             matchingProcessIDs: matchingProcessIDs,
             candidates: candidates,
-            frontmostProcessID: Self.frontmostProcessID(),
+            frontmostProcessID: frontmostProcessID,
             hasRequiredWindow: requiredWindowID != nil
         )
         let selectionCandidates = candidates.filter {
@@ -428,7 +450,9 @@ public struct WindowCapture: Sendable {
             activeWindowIDs: selectionShareableCandidates.filter(\.isActive).map(\.windowID),
             shareableWindowIDs: selectionShareableCandidates.map(\.windowID),
             focusedWindowID: focusedWindowID,
-            requiredWindowID: requiredWindowID
+            requiredWindowID: requiredWindowID,
+            preferFocusedWindow: preferFocusedWindow,
+            excludedWindowIDs: excludedWindowIDs
         )
         guard let selectedWindowID,
               let selectedCandidate = selectionCandidates.first(where: {
@@ -470,6 +494,7 @@ public struct WindowCapture: Sendable {
             windowID: selectedWindowID,
             windowFrame: selectedCandidate.frame,
             windowTitle: window?.title,
+            applicationWindowIDs: Set(selectionCandidates.map(\.windowID)),
             display: display,
             captureFrame: captureFrame
         )
@@ -625,23 +650,73 @@ public struct WindowCapture: Sendable {
         else {
             return false
         }
-        // NSWorkspace's cached frontmost application can lag in an XPC service that
-        // has no NSApplication event loop. NSRunningApplication.isActive reflects the
-        // process activation state directly and avoids reporting a successful switch
-        // as a timeout.
-        if let frontmostWindowProcessID = frontmostWindowProcessID() {
-            return frontmostWindowProcessID == processID
-        }
-        return application.isActive
-            || NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
+        return frontmostProcessID() == processID
     }
 
     @MainActor
     public static func frontmostProcessID() -> pid_t? {
-        frontmostWindowProcessID()
-            ?? NSWorkspace.shared.runningApplications.first(where: { $0.isActive })?
-            .processIdentifier
-            ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+        preferredFrontmostProcessID(
+            windowServerProcessID: frontmostWindowProcessID(),
+            accessibilityProcessID: accessibilityFocusedApplicationProcessID(),
+            activeProcessID: NSWorkspace.shared.runningApplications.first(where: { $0.isActive })?
+                .processIdentifier,
+            workspaceProcessID: NSWorkspace.shared.frontmostApplication?.processIdentifier
+        )
+    }
+
+    @MainActor
+    public static func frontmostShareableProcessID() async throws -> pid_t? {
+        let content = try await withOperationTimeout {
+            try await SCShareableContent.excludingDesktopWindows(
+                true,
+                onScreenWindowsOnly: true
+            )
+        }
+        return try await frontmostShareableProcessID(content: content)
+    }
+
+    @MainActor
+    private static func frontmostShareableProcessID(
+        content: SCShareableContent
+    ) async throws -> pid_t? {
+        guard var candidate = content.windows.first(where: { isSubstantialLayerZeroWindow($0) })
+        else {
+            return frontmostProcessID()
+        }
+        var visitedWindowIDs: Set<CGWindowID> = [candidate.windowID]
+        for _ in 0 ..< min(content.windows.count, 128) {
+            let lowerWindow = candidate
+            let windowsAbove = try await withOperationTimeout(.seconds(2)) {
+                try await SCShareableContent.excludingDesktopWindows(
+                    true,
+                    onScreenWindowsOnlyAbove: lowerWindow
+                )
+            }
+            guard let next = windowsAbove.windows.first(where: {
+                isSubstantialLayerZeroWindow($0) && !visitedWindowIDs.contains($0.windowID)
+            }) else {
+                return candidate.owningApplication?.processID
+            }
+            candidate = next
+            visitedWindowIDs.insert(next.windowID)
+        }
+        return nil
+    }
+
+    private static func isSubstantialLayerZeroWindow(_ window: SCWindow) -> Bool {
+        window.windowLayer == 0
+            && window.frame.width >= 100
+            && window.frame.height >= 100
+            && window.owningApplication != nil
+    }
+
+    static func preferredFrontmostProcessID(
+        windowServerProcessID: pid_t?,
+        accessibilityProcessID: pid_t?,
+        activeProcessID: pid_t?,
+        workspaceProcessID: pid_t?
+    ) -> pid_t? {
+        windowServerProcessID ?? accessibilityProcessID ?? activeProcessID ?? workspaceProcessID
     }
 
     @MainActor
@@ -687,6 +762,30 @@ public struct WindowCapture: Sendable {
             else { return nil }
             return owner
         }.first
+    }
+
+    private static func accessibilityFocusedApplicationProcessID() -> pid_t? {
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, 0.2)
+        var focusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedApplicationAttribute as CFString,
+            &focusedValue
+        ) == .success,
+            let focusedValue,
+            CFGetTypeID(focusedValue) == AXUIElementGetTypeID()
+        else {
+            return nil
+        }
+        let focusedApplication = unsafeDowncast(focusedValue, to: AXUIElement.self)
+        var processID: pid_t = 0
+        guard AXUIElementGetPid(focusedApplication, &processID) == .success,
+              processID > 0
+        else {
+            return nil
+        }
+        return processID
     }
 
     @MainActor
@@ -811,6 +910,7 @@ public struct WindowCapture: Sendable {
             coordinateFrame: coordinateFrame,
             processID: capture.processID,
             application: capture.application,
+            applicationWindowIDs: capture.applicationWindowIDs,
             displayFingerprint: capture.displayFingerprint,
             windowTitle: capture.windowTitle
         )
@@ -941,38 +1041,54 @@ public struct WindowCapture: Sendable {
         activeWindowIDs: [CGWindowID] = [],
         shareableWindowIDs: [CGWindowID] = [],
         focusedWindowID: CGWindowID? = nil,
-        requiredWindowID: CGWindowID? = nil
+        requiredWindowID: CGWindowID? = nil,
+        preferFocusedWindow: Bool = false,
+        excludedWindowIDs: Set<CGWindowID> = []
     ) -> CGWindowID? {
         let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.windowID, $0.frame) })
         if let requiredWindowID {
             return byID[requiredWindowID] == nil ? nil : requiredWindowID
         }
+        let eligibleWindowIDs = Set(byID.keys).subtracting(excludedWindowIDs)
+        let eligibleFocusedWindowID: CGWindowID? = focusedWindowID.flatMap { windowID in
+            guard eligibleWindowIDs.contains(windowID),
+                  let frame = byID[windowID],
+                  frame.width >= 100,
+                  frame.height >= 100
+            else { return nil }
+            return windowID
+        }
+        if preferFocusedWindow, let eligibleFocusedWindowID {
+            return eligibleFocusedWindowID
+        }
         if let frontmostSubstantial = frontToBackWindowIDs.first(where: { windowID in
-            guard let frame = byID[windowID] else { return false }
+            guard eligibleWindowIDs.contains(windowID),
+                  let frame = byID[windowID]
+            else { return false }
             return frame.width >= 100 && frame.height >= 100
         }) {
             return frontmostSubstantial
         }
-        if let focusedWindowID,
-           let frame = byID[focusedWindowID],
-           frame.width >= 100,
-           frame.height >= 100
-        {
-            return focusedWindowID
+        if let eligibleFocusedWindowID {
+            return eligibleFocusedWindowID
         }
         if let activeWindowID = activeWindowIDs.first(where: { windowID in
-            guard let frame = byID[windowID] else { return false }
+            guard eligibleWindowIDs.contains(windowID),
+                  let frame = byID[windowID]
+            else { return false }
             return frame.width >= 100 && frame.height >= 100
         }) {
             return activeWindowID
         }
         if let shareableSubstantial = shareableWindowIDs.first(where: { windowID in
-            guard let frame = byID[windowID] else { return false }
+            guard eligibleWindowIDs.contains(windowID),
+                  let frame = byID[windowID]
+            else { return false }
             return frame.width >= 100 && frame.height >= 100
         }) {
             return shareableSubstantial
         }
-        return candidates.max { left, right in
+        return candidates.filter { eligibleWindowIDs.contains($0.windowID) }.max { left, right in
             let leftArea = left.frame.width * left.frame.height
             let rightArea = right.frame.width * right.frame.height
             if leftArea == rightArea { return left.windowID > right.windowID }

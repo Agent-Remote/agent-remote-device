@@ -387,6 +387,14 @@ import Testing
         windowID: 42,
         application: application
     )
+    try await guardState.authorizeContextAction(
+        action: .leftMouseUp,
+        sequence: 3,
+        stateGeneration: 4,
+        displayFingerprint: "display-a",
+        windowID: 42,
+        application: application
+    )
     await #expect(throws: GuardFailure.staleState) {
         try await guardState.authorizeContextAction(
             action: .type("query"),
@@ -400,6 +408,16 @@ import Testing
     await #expect(throws: GuardFailure.invalidParameters) {
         try await guardState.authorizeContextAction(
             action: .leftClick(Point(x: 10, y: 10)),
+            sequence: 3,
+            stateGeneration: 4,
+            displayFingerprint: "display-a",
+            windowID: 42,
+            application: application
+        )
+    }
+    await #expect(throws: GuardFailure.invalidParameters) {
+        try await guardState.authorizeContextAction(
+            action: .leftMouseDown,
             sequence: 3,
             stateGeneration: 4,
             displayFingerprint: "display-a",

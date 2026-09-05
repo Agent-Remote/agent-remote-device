@@ -853,16 +853,51 @@ enum TypedTextConfirmation {
 
 fn typed_text_confirmation(result: &DeviceResultV2, text: &str) -> TypedTextConfirmation {
     let normalized = text.trim().to_lowercase();
-    let without_scheme = normalized
-        .strip_prefix("https://")
-        .or_else(|| normalized.strip_prefix("http://"))
-        .unwrap_or(&normalized)
-        .trim_end_matches('/');
-    let needles = [normalized.as_str(), without_scheme];
     let Some(observation) = result.observation.as_ref() else {
         return TypedTextConfirmation::Inconclusive;
     };
-    if observation.nodes.iter().any(|node| {
+
+    if let Some(expected_url) = normalized_http_url_input(text) {
+        // An editable address field is stronger evidence than page URLs or labels.
+        // Browser autocomplete may retain the requested host while appending a
+        // historical path, query, or fragment; accepting that prefix and sending
+        // Return would navigate somewhere the caller did not request.
+        let mut editable_url_extension = false;
+        let mut editable_url_match = false;
+        for node in &observation.nodes {
+            if node.settable {
+                if let Some(value) = node.value.as_deref().map(normalized_url_value) {
+                    if value == expected_url {
+                        editable_url_match = true;
+                    }
+                    if url_extends(&value, &expected_url) {
+                        editable_url_extension = true;
+                    }
+                }
+            }
+        }
+        if editable_url_extension {
+            return TypedTextConfirmation::Missing;
+        }
+        if editable_url_match {
+            return TypedTextConfirmation::Confirmed;
+        }
+        let confirmed = observation.nodes.iter().any(|node| {
+            [
+                node.title.as_deref(),
+                node.label.as_deref(),
+                node.value.as_deref(),
+                node.url.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(normalized_url_value)
+            .any(|value| value == expected_url)
+        });
+        if confirmed {
+            return TypedTextConfirmation::Confirmed;
+        }
+    } else if observation.nodes.iter().any(|node| {
         [
             node.title.as_deref(),
             node.label.as_deref(),
@@ -872,11 +907,7 @@ fn typed_text_confirmation(result: &DeviceResultV2, text: &str) -> TypedTextConf
         .into_iter()
         .flatten()
         .map(str::to_lowercase)
-        .any(|value| {
-            needles
-                .iter()
-                .any(|needle| !needle.is_empty() && value.contains(needle))
-        })
+        .any(|value| !normalized.is_empty() && value.contains(&normalized))
     }) {
         return TypedTextConfirmation::Confirmed;
     }
@@ -890,6 +921,49 @@ fn typed_text_confirmation(result: &DeviceResultV2, text: &str) -> TypedTextConf
     } else {
         TypedTextConfirmation::Missing
     }
+}
+
+fn normalized_http_url_input(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let scheme_length = if trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        8
+    } else if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        7
+    } else {
+        return None;
+    };
+    let normalized = trimmed[scheme_length..].trim_end_matches('/');
+    (!normalized.is_empty()).then(|| normalized.to_owned())
+}
+
+fn normalized_url_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let without_scheme = if trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        &trimmed[8..]
+    } else if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        &trimmed[7..]
+    } else {
+        trimmed
+    };
+    without_scheme.trim_end_matches('/').to_owned()
+}
+
+fn url_extends(value: &str, expected: &str) -> bool {
+    value
+        .strip_prefix(expected)
+        .is_some_and(|suffix| matches!(suffix.as_bytes().first(), Some(b'/' | b'?' | b'#')))
 }
 
 fn input_text_actions(params: InputTextParameters) -> Vec<Action> {
@@ -1154,7 +1228,7 @@ impl DeviceMcp {
     }
 
     #[tool(
-        description = "Act on the latest observed Mac UI. Element forms: press={state_id,state_generation,element_index}; set_value adds value; clear_value uses the same three fields; select_text requires non-empty text and may add prefix, suffix, or selection_type; scroll_element adds direction; secondary_action adds action_name. Use an element form only when the latest node exposes the required AX action; scroll_element needs the matching AXScroll...ByPage action, otherwise use bounded context scroll. Use press, not left_click, for an AX element. Context forms never take state or element fields: key={key}; type={text}; left_click/right_click/middle_click/double_click/triple_click/mouse_move={coordinate}; left_click_drag={start,end,duration_ms?}; scroll={delta_x,delta_y,coordinate?}; wait={duration_ms}. Key uses macOS names and + modifiers, for example cmd+Left, Page Down, Home, cmd+a, or Return. Coordinates require a latest model-visible screenshot. A successful result already contains the next AX diff. settle_timeout_ms is optional and should only be shortened for bounded timeout-path testing"
+        description = "Act on the latest observed Mac UI. Element forms: press={state_id,state_generation,element_index}; set_value adds value; clear_value uses the same three fields; select_text requires non-empty text and may add prefix, suffix, or selection_type; scroll_element adds direction; secondary_action adds action_name. Use an element form only when the latest node exposes the required AX action; scroll_element needs the matching AXScroll...ByPage action, otherwise use bounded context scroll. Use press, not left_click, for an AX element. Context forms never take state or element fields: key={key}; type={text}; left_click/right_click/middle_click/double_click/triple_click/mouse_move={coordinate}; left_click_drag={start,end,duration_ms?}; left_mouse_down/left_mouse_up={}; scroll={delta_x,delta_y,coordinate?}; wait={duration_ms}. Key uses macOS names and + modifiers, for example cmd+Left, Page Down, Home, cmd+a, or Return. Coordinates and left_mouse_down require a latest model-visible screenshot; a paired left_mouse_up uses the latest state so it can safely release after screenshot invalidation. A successful result already contains the next AX diff. settle_timeout_ms is optional and should only be shortened for bounded timeout-path testing"
     )]
     async fn act(
         &self,
@@ -1972,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_text_confirmation_matches_ax_text_and_normalized_urls() {
+    fn typed_text_confirmation_matches_ax_text_and_exact_normalized_urls() {
         use crate::protocol_v2::{
             AccessibilityNode, AccessibilityObservation, AccessibilityObservationKind,
             SettleResult, SettleStatus,
@@ -2032,6 +2106,13 @@ mod tests {
         );
         assert_eq!(
             typed_text_confirmation(
+                &result_with_value(Some("example.com/path/from-history"), None),
+                "https://example.com/"
+            ),
+            TypedTextConfirmation::Missing
+        );
+        assert_eq!(
+            typed_text_confirmation(
                 &result_with_value(Some("different query"), Some("https://example.com/")),
                 "missing text"
             ),
@@ -2054,6 +2135,20 @@ mod tests {
         assert_eq!(
             typed_text_confirmation(&diff, "missing text"),
             TypedTextConfirmation::Inconclusive
+        );
+
+        let mut autocomplete_diff = result_with_value(
+            Some("example.com/path/from-history"),
+            Some("https://unrelated.example/"),
+        );
+        autocomplete_diff
+            .observation
+            .as_mut()
+            .expect("observation")
+            .kind = AccessibilityObservationKind::Diff;
+        assert_eq!(
+            typed_text_confirmation(&autocomplete_diff, "https://example.com/"),
+            TypedTextConfirmation::Missing
         );
     }
 

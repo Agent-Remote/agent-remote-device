@@ -60,7 +60,10 @@ public protocol GUIActionRuntime: Sendable {
     func windowContext(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?,
-        preferredWindowContexts: [WindowContext]
+        preferredWindowContexts: [WindowContext],
+        requiredProcessID: pid_t?,
+        preferFocusedWindow: Bool,
+        excludedWindowIDs: Set<CGWindowID>
     ) async throws -> WindowContext
     func observeAccessibility(
         context: WindowContext,
@@ -163,7 +166,10 @@ public extension GUIActionRuntime {
     func windowContext(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?,
-        preferredWindowContexts _: [WindowContext]
+        preferredWindowContexts _: [WindowContext],
+        requiredProcessID _: pid_t?,
+        preferFocusedWindow _: Bool,
+        excludedWindowIDs _: Set<CGWindowID>
     ) async throws -> WindowContext {
         try await capture(
             approvedApplications: approvedApplications,
@@ -277,12 +283,10 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         targetApplication: String?,
         excludedBundleIdentifiers: Set<String>
     ) async throws -> ApplicationIdentity {
-        try await MainActor.run {
-            try ApplicationResolver.runningApplication(
-                matching: targetApplication,
-                excludedBundleIdentifiers: excludedBundleIdentifiers
-            )
-        }
+        try await ApplicationResolver.runningApplication(
+            matching: targetApplication,
+            excludedBundleIdentifiers: excludedBundleIdentifiers
+        )
     }
 
     public func launchApplication(
@@ -413,7 +417,10 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
     public func windowContext(
         approvedApplications: [ApplicationIdentity],
         targetApplication: String? = nil,
-        preferredWindowContexts: [WindowContext] = []
+        preferredWindowContexts: [WindowContext] = [],
+        requiredProcessID: pid_t? = nil,
+        preferFocusedWindow: Bool = false,
+        excludedWindowIDs: Set<CGWindowID> = []
     ) async throws -> WindowContext {
         let application = try await selectedApplication(
             approvedApplications: approvedApplications,
@@ -425,7 +432,9 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         return try await captureEngine.context(
             application: application,
             requiredWindowID: preferredWindowContext?.windowID,
-            requiredProcessID: preferredWindowContext?.processID
+            requiredProcessID: requiredProcessID ?? preferredWindowContext?.processID,
+            preferFocusedWindow: preferFocusedWindow,
+            excludedWindowIDs: excludedWindowIDs
         )
     }
 
@@ -433,8 +442,12 @@ public actor LiveGUIActionRuntime: GUIActionRuntime {
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?
     ) async throws -> ApplicationIdentity {
-        let frontmostBundleIdentifier = await MainActor.run {
-            NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let frontmostBundleIdentifier = await MainActor.run { () -> String? in
+            guard let processID = WindowCapture.frontmostProcessID(),
+                  let application = NSRunningApplication(processIdentifier: processID),
+                  !application.isTerminated
+            else { return nil }
+            return application.bundleIdentifier
         }
         let candidates: [ApplicationIdentity]
         if let targetApplication {

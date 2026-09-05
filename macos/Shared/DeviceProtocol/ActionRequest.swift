@@ -132,7 +132,7 @@ public enum Action: Sendable, Equatable {
     public var requiresModelVisibleScreenshot: Bool {
         switch self {
         case .leftClick, .mouseMove, .leftClickDrag, .rightClick, .middleClick,
-             .doubleClick, .tripleClick, .leftMouseDown, .leftMouseUp:
+             .doubleClick, .tripleClick, .leftMouseDown:
             true
         case let .scroll(_, _, coordinate):
             coordinate != nil
@@ -155,6 +155,18 @@ public enum Action: Sendable, Equatable {
     public var mayChangeFrontmostWindow: Bool {
         guard case let .key(key) = self else { return false }
         return Self.isFrontmostWindowShortcut(key)
+    }
+
+    /// Whether the shortcut is expected to create a distinct top-level window.
+    public var requestsNewWindow: Bool {
+        guard case let .key(key) = self else { return false }
+        return Self.isNewWindowShortcut(key)
+    }
+
+    /// Whether the shortcut can close the currently bound top-level window.
+    public var mayCloseWindow: Bool {
+        guard case let .key(key) = self else { return false }
+        return Self.isWindowClosingShortcut(key)
     }
 
     private static func isValidKey(_ key: String) -> Bool {
@@ -182,6 +194,26 @@ public enum Action: Sendable, Equatable {
               modifiers.isSubset(of: commandModifiers.union(["SHIFT"]))
         else { return false }
         return keyName == "N" || keyName == "`"
+    }
+
+    private static func isNewWindowShortcut(_ key: String) -> Bool {
+        let components = key.uppercased().split(separator: "+").map(String.init)
+        guard let keyName = components.last else { return false }
+        let modifiers = Set(components.dropLast())
+        let commandModifiers: Set<String> = ["CMD", "COMMAND", "SUPER"]
+        return keyName == "N"
+            && !modifiers.isDisjoint(with: commandModifiers)
+            && modifiers.isSubset(of: commandModifiers.union(["SHIFT"]))
+    }
+
+    private static func isWindowClosingShortcut(_ key: String) -> Bool {
+        let components = key.uppercased().split(separator: "+").map(String.init)
+        guard let keyName = components.last else { return false }
+        let modifiers = Set(components.dropLast())
+        let commandModifiers: Set<String> = ["CMD", "COMMAND", "SUPER"]
+        return keyName == "W"
+            && !modifiers.isDisjoint(with: commandModifiers)
+            && modifiers.isSubset(of: commandModifiers.union(["SHIFT"]))
     }
 
     private static let validKeyNames = Set([

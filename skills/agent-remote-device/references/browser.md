@@ -7,7 +7,7 @@ Use a dedicated browser connector or structured integration when the task needs 
 ## Navigate And Search
 
 1. Call `observe` with the browser name or bundle identifier.
-2. For a known destination, prefer one `input_text` call with either the latest address-field AX target or the browser address-bar shortcut, complete URL, and Return. Both avoid an extra focus call and remain AX-first because they use no coordinate.
+2. For a known destination, prefer one `input_text` call with either the latest address-field AX target or the browser address-bar shortcut, complete URL, and Return. Both avoid an extra focus call and remain AX-first because they use no coordinate. Before Return, the proxy requires the visible address to match that URL exactly after ignoring only its HTTP(S) scheme and trailing slash; an autocomplete path, query, or fragment stops the sequence.
 3. Use a state-bound address-field action only when the browser shortcut is unavailable or the returned state requires an intermediate decision.
 4. Read the returned AX state. Same-page changes normally return a diff; a real navigation may correctly return a bounded full state with `reset=true`. Do not add a fixed wait or another observation unless settle timed out or the result is insufficient.
 

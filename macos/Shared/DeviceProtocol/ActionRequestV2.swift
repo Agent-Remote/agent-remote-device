@@ -340,6 +340,21 @@ public enum ActionV2: Sendable, Equatable {
         }
     }
 
+    /// Whether the coordinate shortcut is expected to create a distinct top-level window.
+    public var requestsNewWindow: Bool {
+        guard case let .coordinate(action) = self else { return false }
+        return action.requestsNewWindow
+    }
+
+    /// Whether the action can close or replace the currently bound top-level window.
+    public var mayCloseOrReplaceWindow: Bool {
+        switch self {
+        case .press, .secondaryAction: true
+        case let .coordinate(action): action.mayCloseWindow
+        default: false
+        }
+    }
+
     private static func validBoundedText(_ value: String, maximumCharacters: Int) -> Bool {
         !value.isEmpty && value.count <= maximumCharacters
             && value == value.trimmingCharacters(in: .whitespacesAndNewlines)

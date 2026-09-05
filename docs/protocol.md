@@ -35,7 +35,11 @@ proxy. A failed step stops the sequence and reports how many prefix steps comple
 so callers do not blindly replay partially applied input. Absence of typed text in
 a truncated full state or a diff is inconclusive and does not turn a successful
 device action into a false failure; a complete, non-truncated full state that omits
-the text still stops the sequence before its final key.
+the text still stops the sequence before its final key. URL confirmation ignores an
+`http://` or `https://` scheme and a trailing slash but otherwise requires an exact
+address match. If a settable AX field contains the requested address extended by an
+autocomplete path, query, or fragment, that is conclusive negative evidence even in
+a diff, and the sequence stops before its final key.
 
 On v2, each action already receives adaptive settle, so `input_text` does not emit
 the legacy trailing fixed `wait`; this keeps the typed action's confirming AX state
@@ -298,9 +302,16 @@ post-action context phase, still capped by the lease. The proxy treats that stab
 error code as terminal and poisons the current transport generation; it never
 attempts to send another action with an unverified sequence.
 An automatic-settle window-management shortcut resolves and confirms the new
-frontmost window before settling, then debounces the new window's AX tree within
-the original settle deadline. A transiently unavailable AX window is retried inside
-that deadline without weakening the exact window binding.
+frontmost window in the already bound signed process before settling, then debounces
+the new window's AX tree within the original settle deadline. The refresh releases
+only the prior window ID; it never broadens selection to another signed process, and
+it retries transient frontmost-process evidence inside that deadline rather than
+accepting another existing window. A transiently unavailable AX window is also retried
+without weakening the exact process binding.
+If `Cmd+W` or a state-bound AX action removes the bound top-level window, the
+post-action refresh drops only that stale window ID and retries replacement discovery
+within the same signed process and deadline. A browser tab close that leaves the bound
+window intact keeps the existing fast path and window identity.
 
 Keyboard actions accept `Backspace` as an alias for `Delete`, the backtick key, and
 modifier-only keys including `Shift`, `Cmd`/`Command`/`Super`, `Ctrl`/`Control`, and
@@ -374,6 +385,11 @@ actions remain available as a fallback and continue to require the latest
 model-visible `screenshot_generation` and exact returned image dimensions.
 They also require the live window frame to match that screenshot exactly; the
 frame relaxation used for non-coordinate and AX actions never applies to pixels.
+`left_mouse_down` follows that rule because it starts from the cursor position
+established through the visible image. Its paired `left_mouse_up` is the sole
+state-bound exception: it revalidates the latest application, process, window,
+display, lease, sequence, and state generation so release does not depend on an
+image invalidated while the button is held.
 After any successful interaction that does not return a new image, the Executor
 invalidates its local pixel capture even though the protocol generation remains
 unchanged. A later coordinate action then fails with `fresh_screenshot_required`

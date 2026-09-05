@@ -25,14 +25,31 @@ session or start the relay. Passive observation, screenshots, waits, zooms, and
 global clipboard reads do not activate an application. Interactive input activates
 the exact signed target process and raises the bound window by its WindowServer
 identity, including when another window in the same process is frontmost. The
+Executor resolves the passive frontmost application from ScreenCaptureKit's
+on-screen window order. It starts with a substantial layer-zero window and
+repeatedly requests the windows above it until it reaches the topmost substantial
+layer-zero window. If ScreenCaptureKit exposes no eligible window, resolution
+falls back to WindowServer ordering, system-wide Accessibility focus, and then
+process-active or cached workspace state. This prevents an XPC cache lag from
+silently redirecting observation to another application. The
 Executor confirms that exact window is frontmost immediately before dispatch; a
-same-process neighboring window fails closed as a window-context change. After the
-action and its follow-up observation complete, the Executor restores the user's prior foreground
-application when the remote target is still frontmost. Pressed mouse or key state
-delays restoration until release. A local stop observed while
+same-process neighboring window fails closed as a window-context change. When an
+action uses a system shortcut that can create or select another window, the bounded
+post-action refresh prefers the exact process's AX-focused window over potentially
+stale WindowServer ordering; explicit existing-window bindings still take priority.
+When `Cmd+W` or a state-bound AX action removes the bound top-level window, recovery
+releases only that stale window ID and polls for a replacement within the same signed
+process and bounded action deadline. If a browser tab closes without replacing its
+window, the exact existing binding remains in force.
+After the action and its follow-up observation complete, the Executor restores the
+user's prior foreground application when the remote target is still frontmost.
+Pressed mouse or key state delays restoration until release. A local stop observed while
 activation is in flight leaves the UI paused and is forwarded as soon as Broker
 authorization activation returns; activation completion cannot overwrite that paused state.
 Coordinate actions still require the model-visible window frame to remain exact.
+The paired mouse-up is deliberately state-bound so a held button can be released
+after mouse-down invalidates the prior pixel capture; it still verifies the latest
+state generation and exact application, process, window, display, lease, and sequence.
 Keyboard, unpositioned scrolling, and AX element actions instead retain the exact
 signed process, window ID, and display binding while allowing macOS to adjust a
 full-screen window's frame during Space activation. While that transition is in

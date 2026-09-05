@@ -40,6 +40,7 @@ An element index is only a shorthand for the proxy's latest state-bound handle f
   - AX element: `press` uses `state_id`, `state_generation`, and `element_index`; `set_value` adds `value`; `select_text` requires a non-empty `text` value and may add `prefix`, `suffix`, or `selection_type`; `scroll_element` adds `direction` and optional `pages` (1-10); `secondary_action` adds `action_name`.
   - Keyboard: `key` uses only `key`; `type` uses only `text`.
   - Screenshot coordinate: click/move uses only `coordinate`; drag uses `start` and `end`.
+  - Mouse button state: `left_mouse_down` requires the latest model-visible screenshot; send the paired state-bound `left_mouse_up` directly even when mouse-down invalidated that screenshot.
   - Context scroll: `scroll` uses both `delta_x` and `delta_y`; AX scrolling uses `scroll_element` with `direction`.
 - Use `press`, not `left_click`, to activate an AX `element_index`. Never add state or element fields to `key`, `type`, or coordinate actions.
 - Use `set_value` only for ordinary non-secure fields. Never use it for secure/password/credential fields.

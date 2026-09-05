@@ -26,7 +26,7 @@ public enum ApplicationResolver {
     public static func runningApplication(
         matching target: String?,
         excludedBundleIdentifiers: Set<String>
-    ) throws -> ApplicationIdentity {
+    ) async throws -> ApplicationIdentity {
         let exclusions = normalizedExclusions(excludedBundleIdentifiers)
         let candidates: [NSRunningApplication]
         if let target {
@@ -39,7 +39,8 @@ public enum ApplicationResolver {
                         displayNames: [application.localizedName].compactMap { $0 }
                     )
             }
-        } else if let frontmost = NSWorkspace.shared.frontmostApplication,
+        } else if let processID = try await WindowCapture.frontmostShareableProcessID(),
+                  let frontmost = NSRunningApplication(processIdentifier: processID),
                   isEligible(frontmost, exclusions: exclusions)
         {
             candidates = [frontmost]

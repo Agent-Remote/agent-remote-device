@@ -657,6 +657,10 @@ public final class ActionExecutor {
                 throw ExecutionFailure.eventCreationFailed
             }
             event.post(tap: .cghidEventTap)
+        case .leftMouseUp:
+            let point = CGEvent(source: nil)?.location ?? .zero
+            try requireMouseEvent(type: .leftMouseUp, point: point, button: .left)
+            leftMouseIsDown = false
         case let .wait(durationMilliseconds):
             try await Task.sleep(for: .milliseconds(durationMilliseconds))
         default:
@@ -876,15 +880,21 @@ public final class ActionExecutor {
             isSettable: settable.boolValue
         )
         let selectedRange = selectedTextRange(focused)
+        guard let insertionValue = Self.insertionValue(
+            current: current,
+            placeholder: normalizedPlaceholder,
+            text: text,
+            selectedRange: selectedRange
+        ) else {
+            // Without an exposed selection or caret range, synthesizing old + new
+            // can contradict the application's real editing state. Let keyboard
+            // input preserve the selection semantics owned by the target app.
+            return false
+        }
         return AXUIElementSetAttributeValue(
             focused,
             kAXValueAttribute as CFString,
-            Self.insertionValue(
-                current: current,
-                placeholder: normalizedPlaceholder,
-                text: text,
-                selectedRange: selectedRange
-            ) as CFString
+            insertionValue as CFString
         ) == .success
     }
 
@@ -907,7 +917,7 @@ public final class ActionExecutor {
         return NSRange(location: range.location, length: range.length)
     }
 
-    static func insertionValue(current: String, placeholder: String?, text: String) -> String {
+    static func insertionValue(current: String, placeholder: String?, text: String) -> String? {
         insertionValue(
             current: current,
             placeholder: placeholder,
@@ -921,17 +931,17 @@ public final class ActionExecutor {
         placeholder: String?,
         text: String,
         selectedRange: NSRange?
-    ) -> String {
+    ) -> String? {
         let base = AccessibilityTextNormalization.value(
             current,
             placeholder: placeholder
         ) ?? ""
-        guard let selectedRange else { return base + text }
+        guard let selectedRange else { return base.isEmpty ? text : nil }
         let utf16Length = (base as NSString).length
         guard selectedRange.location <= utf16Length,
               selectedRange.length <= utf16Length - selectedRange.location
         else {
-            return base + text
+            return nil
         }
         return (base as NSString).replacingCharacters(in: selectedRange, with: text)
     }

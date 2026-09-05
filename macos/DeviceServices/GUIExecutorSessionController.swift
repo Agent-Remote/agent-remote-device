@@ -592,7 +592,10 @@ public actor GUIExecutorSessionController {
                     windowContext = try await runtime.windowContext(
                         approvedApplications: approvedApplications,
                         targetApplication: targetApplication,
-                        preferredWindowContexts: retainedNamedObservationContexts
+                        preferredWindowContexts: retainedNamedObservationContexts,
+                        requiredProcessID: nil,
+                        preferFocusedWindow: false,
+                        excludedWindowIDs: []
                     )
                 } else if let elementApplicationDigest,
                           let elementContext = windowContextsByApplication[elementApplicationDigest]
@@ -797,6 +800,9 @@ public actor GUIExecutorSessionController {
             request.leaseUntil
         )
         let mayChangeFrontmostWindow = request.action.mayChangeFrontmostWindow
+        let excludedPostActionWindowIDs = request.action.requestsNewWindow
+            ? windowContext.applicationWindowIDs
+            : []
         // A no-settle request still gets one context refresh. It has no settle
         // retry window, but the lookup remains bounded by both its lease and the
         // normal context lookup timeout.
@@ -839,6 +845,9 @@ public actor GUIExecutorSessionController {
                     approvedApplications: approvedApplications,
                     targetApplication: actionApplication,
                     preferredWindowContexts: Array(preferredWindowContexts),
+                    requiredProcessID: windowContext.processID,
+                    preferFocusedWindow: true,
+                    excludedWindowIDs: excludedPostActionWindowIDs,
                     deadline: postActionDeadline
                 )
                 while Self.sameAccessibilityIdentity(refreshed, windowContext),
@@ -856,6 +865,9 @@ public actor GUIExecutorSessionController {
                         approvedApplications: approvedApplications,
                         targetApplication: actionApplication,
                         preferredWindowContexts: Array(preferredWindowContexts),
+                        requiredProcessID: windowContext.processID,
+                        preferFocusedWindow: true,
+                        excludedWindowIDs: excludedPostActionWindowIDs,
                         deadline: postActionDeadline
                     )
                 }
@@ -941,21 +953,29 @@ public actor GUIExecutorSessionController {
                         approvedApplications: approvedApplications,
                         targetApplication: actionApplication,
                         preferredWindowContexts: preferredWindowContexts,
+                        requiredProcessID: mayChangeFrontmostWindow
+                            ? windowContext.processID
+                            : nil,
+                        preferFocusedWindow: mayChangeFrontmostWindow,
+                        excludedWindowIDs: excludedPostActionWindowIDs,
                         deadline: postActionDeadline
                     )
                 } catch let failure as CaptureFailure
                     where failure == .approvedWindowMissing
-                        && Self.mayCloseOrReplaceWindow(request.action)
+                        && request.action.mayCloseOrReplaceWindow
                 {
-                    // An AX press or named action may have closed the bound
-                    // window. Re-resolve within the target application once
-                    // without forcing the stale window ID; a second failure
-                    // remains terminal because the action already ran.
+                    // A close-capable action may have removed the bound window.
+                    // Poll within the target process without forcing the stale
+                    // window ID while its replacement becomes observable.
                     refreshed = try await Self.boundedWindowContext(
                         runtime: runtime,
                         approvedApplications: approvedApplications,
                         targetApplication: actionApplication,
                         preferredWindowContexts: [],
+                        requiredProcessID: windowContext.processID,
+                        preferFocusedWindow: mayChangeFrontmostWindow,
+                        excludedWindowIDs: excludedPostActionWindowIDs,
+                        retryWindowMissing: true,
                         deadline: postActionDeadline
                     )
                 }
@@ -976,6 +996,9 @@ public actor GUIExecutorSessionController {
                         approvedApplications: approvedApplications,
                         targetApplication: actionApplication,
                         preferredWindowContexts: preferredWindowContexts,
+                        requiredProcessID: windowContext.processID,
+                        preferFocusedWindow: true,
+                        excludedWindowIDs: excludedPostActionWindowIDs,
                         deadline: postActionDeadline
                     )
                 }
@@ -1295,15 +1318,6 @@ public actor GUIExecutorSessionController {
             && left.displayFingerprint == right.displayFingerprint
     }
 
-    private static func mayCloseOrReplaceWindow(_ action: ActionV2) -> Bool {
-        switch action {
-        case .press, .secondaryAction:
-            true
-        default:
-            false
-        }
-    }
-
     static func needsNavigationObservationRecovery(
         settleOutcome: ActionSettleOutcome,
         observation: AccessibilityObservation,
@@ -1398,28 +1412,50 @@ public actor GUIExecutorSessionController {
         approvedApplications: [ApplicationIdentity],
         targetApplication: String?,
         preferredWindowContexts: [WindowContext],
+        requiredProcessID: pid_t?,
+        preferFocusedWindow: Bool,
+        excludedWindowIDs: Set<UInt32>,
+        retryWindowMissing: Bool = false,
         deadline: Date?
     ) async throws -> WindowContext {
         if let deadline {
-            let remainingMilliseconds = Int64(deadline.timeIntervalSinceNow * 1_000)
-            guard remainingMilliseconds > 0 else {
-                throw CaptureFailure.operationTimedOut
-            }
-            return try await WindowCapture.withOperationTimeout(
-                .milliseconds(max(1, remainingMilliseconds))
-            ) {
-                try await runtime.windowContext(
-                    approvedApplications: approvedApplications,
-                    targetApplication: targetApplication,
-                    preferredWindowContexts: preferredWindowContexts
-                )
+            while true {
+                let remainingMilliseconds = Int64(deadline.timeIntervalSinceNow * 1_000)
+                guard remainingMilliseconds > 0 else {
+                    throw CaptureFailure.operationTimedOut
+                }
+                do {
+                    return try await WindowCapture.withOperationTimeout(
+                        .milliseconds(max(1, remainingMilliseconds))
+                    ) {
+                        try await runtime.windowContext(
+                            approvedApplications: approvedApplications,
+                            targetApplication: targetApplication,
+                            preferredWindowContexts: preferredWindowContexts,
+                            requiredProcessID: requiredProcessID,
+                            preferFocusedWindow: preferFocusedWindow,
+                            excludedWindowIDs: excludedWindowIDs
+                        )
+                    }
+                } catch let failure as CaptureFailure
+                    where failure == .approvedApplicationNotFrontmost
+                        || (failure == .approvedWindowMissing
+                            && (!excludedWindowIDs.isEmpty || retryWindowMissing))
+                {
+                    let retryMilliseconds = Int64(deadline.timeIntervalSinceNow * 1_000)
+                    guard retryMilliseconds > 0 else { throw failure }
+                    try await Task.sleep(for: .milliseconds(min(100, retryMilliseconds)))
+                }
             }
         }
         return try await WindowCapture.withOperationTimeout {
             try await runtime.windowContext(
                 approvedApplications: approvedApplications,
                 targetApplication: targetApplication,
-                preferredWindowContexts: preferredWindowContexts
+                preferredWindowContexts: preferredWindowContexts,
+                requiredProcessID: requiredProcessID,
+                preferFocusedWindow: preferFocusedWindow,
+                excludedWindowIDs: excludedWindowIDs
             )
         }
     }

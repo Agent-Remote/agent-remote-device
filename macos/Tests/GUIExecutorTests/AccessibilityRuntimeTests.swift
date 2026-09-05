@@ -1031,7 +1031,7 @@ import Testing
         current: "existing ",
         placeholder: "Work with ChatGPT",
         text: "hello"
-    ) == "existing hello")
+    ) == nil)
     #expect(ActionExecutor.insertionValue(
         current: "https://old.example/path",
         placeholder: nil,
@@ -1044,6 +1044,12 @@ import Testing
         text: " ",
         selectedRange: NSRange(location: 6, length: 0)
     ) == "before after")
+    #expect(ActionExecutor.insertionValue(
+        current: "existing",
+        placeholder: nil,
+        text: "replacement",
+        selectedRange: NSRange(location: 99, length: 0)
+    ) == nil)
 }
 
 @Test func accessibilityTextNormalizationSuppressesMaterializedPlaceholders() {

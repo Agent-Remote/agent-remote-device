@@ -129,8 +129,7 @@ impl Action {
             | Self::MiddleClick { .. }
             | Self::DoubleClick { .. }
             | Self::TripleClick { .. }
-            | Self::LeftMouseDown
-            | Self::LeftMouseUp => true,
+            | Self::LeftMouseDown => true,
             Self::Scroll { coordinate, .. } => coordinate.is_some(),
             _ => false,
         }
@@ -267,6 +266,12 @@ mod tests {
         }
         assert!(!valid_key("CMD/DELETE"));
         assert!(!valid_key("not/a/key"));
+    }
+
+    #[test]
+    fn mouse_release_does_not_require_a_model_visible_screenshot() {
+        assert!(Action::LeftMouseDown.requires_model_visible_screenshot());
+        assert!(!Action::LeftMouseUp.requires_model_visible_screenshot());
     }
 
     #[test]

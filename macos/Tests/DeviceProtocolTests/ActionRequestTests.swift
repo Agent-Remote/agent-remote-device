@@ -33,6 +33,29 @@ import Testing
     )).mayChangeFrontmostWindow)
 }
 
+@Test func newWindowShortcutsUseTheCanonicalActionClassifier() {
+    for key in ["cmd+n", "cmd+shift+n", "shift+cmd+n", "command+n", "super+shift+n"] {
+        #expect(Action.key(key).requestsNewWindow)
+        #expect(ActionV2.coordinate(.key(key)).requestsNewWindow)
+    }
+    for key in ["cmd+`", "cmd+alt+n", "ctrl+n", "n"] {
+        #expect(!Action.key(key).requestsNewWindow)
+        #expect(!ActionV2.coordinate(.key(key)).requestsNewWindow)
+    }
+    #expect(!ActionV2.launchApplication("Safari").requestsNewWindow)
+}
+
+@Test func windowClosingShortcutsUseTheCanonicalActionClassifier() {
+    for key in ["cmd+w", "cmd+shift+w", "shift+command+w", "super+w"] {
+        #expect(Action.key(key).mayCloseWindow)
+        #expect(ActionV2.coordinate(.key(key)).mayCloseOrReplaceWindow)
+    }
+    for key in ["cmd+n", "cmd+alt+w", "ctrl+w", "w"] {
+        #expect(!Action.key(key).mayCloseWindow)
+        #expect(!ActionV2.coordinate(.key(key)).mayCloseOrReplaceWindow)
+    }
+}
+
 @Test func decodesCrossLanguageVector() throws {
     let url = try #require(Bundle.module.url(forResource: "action-request-valid", withExtension: "json", subdirectory: "Fixtures"))
     let data = try Data(contentsOf: url)
@@ -201,6 +224,11 @@ import Testing
 @Test func rejectsPointWithExtraCoordinate() throws {
     let data = Data("[1,2,3]".utf8)
     #expect(throws: DecodingError.self) { try JSONDecoder().decode(Point.self, from: data) }
+}
+
+@Test func mouseReleaseDoesNotRequireAModelVisibleScreenshot() {
+    #expect(Action.leftMouseDown.requiresModelVisibleScreenshot)
+    #expect(!Action.leftMouseUp.requiresModelVisibleScreenshot)
 }
 
 @Test func roundTripsEveryPublicAction() throws {

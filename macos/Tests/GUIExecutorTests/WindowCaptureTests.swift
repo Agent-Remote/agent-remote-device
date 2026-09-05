@@ -378,6 +378,67 @@ private func synchronouslyBlock(for seconds: Double) {
     ) == 7)
 }
 
+@Test func postActionWindowSelectionPrefersFocusedWindowOverStaleWindowServerOrder() {
+    let candidates: [(windowID: CGWindowID, frame: CGRect)] = [
+        (windowID: 7, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+        (windowID: 8, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+    ]
+
+    #expect(WindowCapture.preferredWindowID(
+        candidates: candidates,
+        frontToBackWindowIDs: [7, 8],
+        focusedWindowID: 8,
+        preferFocusedWindow: true
+    ) == 8)
+}
+
+@Test func postActionWindowSelectionStillUsesRequiredWindowBeforeFocus() {
+    let candidates: [(windowID: CGWindowID, frame: CGRect)] = [
+        (windowID: 7, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+        (windowID: 8, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+    ]
+
+    #expect(WindowCapture.preferredWindowID(
+        candidates: candidates,
+        frontToBackWindowIDs: [8, 7],
+        focusedWindowID: 8,
+        requiredWindowID: 7,
+        preferFocusedWindow: true
+    ) == 7)
+}
+
+@Test func postActionWindowSelectionExcludesEveryPreexistingWindow() {
+    let candidates: [(windowID: CGWindowID, frame: CGRect)] = [
+        (windowID: 7, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+        (windowID: 8, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+        (windowID: 9, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+    ]
+
+    #expect(WindowCapture.preferredWindowID(
+        candidates: candidates,
+        frontToBackWindowIDs: [8, 9, 7],
+        focusedWindowID: 8,
+        preferFocusedWindow: true,
+        excludedWindowIDs: [7, 8]
+    ) == 9)
+}
+
+@Test func requiredWindowSelectionOverridesTheExcludedWindowSet() {
+    let candidates: [(windowID: CGWindowID, frame: CGRect)] = [
+        (windowID: 7, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+        (windowID: 8, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
+    ]
+
+    #expect(WindowCapture.preferredWindowID(
+        candidates: candidates,
+        frontToBackWindowIDs: [8, 7],
+        focusedWindowID: 8,
+        requiredWindowID: 7,
+        preferFocusedWindow: true,
+        excludedWindowIDs: [7]
+    ) == 7)
+}
+
 @Test func preferredWindowUsesScreenCaptureKitActiveWindow() {
     let candidates: [(windowID: CGWindowID, frame: CGRect)] = [
         (windowID: 7, frame: CGRect(x: 0, y: 0, width: 1_200, height: 800)),
@@ -485,6 +546,33 @@ private func synchronouslyBlock(for seconds: Double) {
             hasRequiredWindow: false
         )
     }
+}
+
+@Test func frontmostProcessSelectionPrefersWindowServerEvidenceOverWorkspaceCaches() {
+    #expect(WindowCapture.preferredFrontmostProcessID(
+        windowServerProcessID: 100,
+        accessibilityProcessID: 150,
+        activeProcessID: 200,
+        workspaceProcessID: 300
+    ) == 100)
+    #expect(WindowCapture.preferredFrontmostProcessID(
+        windowServerProcessID: nil,
+        accessibilityProcessID: 150,
+        activeProcessID: 200,
+        workspaceProcessID: 300
+    ) == 150)
+    #expect(WindowCapture.preferredFrontmostProcessID(
+        windowServerProcessID: nil,
+        accessibilityProcessID: nil,
+        activeProcessID: 200,
+        workspaceProcessID: 300
+    ) == 200)
+    #expect(WindowCapture.preferredFrontmostProcessID(
+        windowServerProcessID: nil,
+        accessibilityProcessID: nil,
+        activeProcessID: nil,
+        workspaceProcessID: 300
+    ) == 300)
 }
 
 @Test func exactBoundWindowSelectionDoesNotRequireTheApplicationToBeFrontmost() throws {
