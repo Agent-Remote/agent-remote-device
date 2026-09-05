@@ -162,7 +162,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           key: fuzz
-          workspaces: fuzz -> fuzz/target
+          workspaces: fuzz -> target
       - name: Install cargo-fuzz for the runner host
         uses: taiki-e/install-action@v2
         with:
@@ -170,7 +170,9 @@ jobs:
       - name: Check fuzz package formatting
         run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - name: Run bounded protocol parser fuzzing
-        run: cargo fuzz run protocol fuzz/corpus/protocol -- -max_total_time=60 -timeout=10
+        run: >-
+          cargo fuzz run --target x86_64-unknown-linux-gnu
+          protocol fuzz/corpus/protocol -- -max_total_time=60 -timeout=10
 
   supply-chain:
     runs-on: ubuntu-latest

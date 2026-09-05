@@ -37,6 +37,10 @@ raise "CI still runs Rust tests before the coverage test run" if rust_steps.any?
 raise "CI coverage does not run all Rust tests" unless rust_steps.any? { |step| step.fetch("run", "").include?("cargo llvm-cov --workspace") }
 fuzz_steps = ci.dig("jobs", "fuzz", "steps")
 raise "CI fuzz job does not enforce formatting" unless fuzz_steps.any? { |step| step.fetch("run", "").include?("cargo fmt --manifest-path fuzz/Cargo.toml") }
+fuzz_commands = fuzz_steps.map { |step| step["run"] }.compact.join("\n")
+raise "CI fuzz job does not override the musl installer target" unless fuzz_commands.include?("--target x86_64-unknown-linux-gnu")
+raise "CI fuzz cache target is resolved twice" if ci_text.include?("workspaces: fuzz -> fuzz/target")
+raise "CI fuzz cache does not use the workspace-relative target" unless ci_text.include?("workspaces: fuzz -> target")
 
 resolved_version = rust_steps.find { |step| step["name"] == "Resolve proxy package version" }
 raise "CI does not resolve the proxy version from Cargo metadata" unless resolved_version&.fetch("run", "")&.include?("cargo metadata --format-version=1 --no-deps")
