@@ -8,19 +8,66 @@ on:
 permissions:
   contents: read
   id-token: write
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+      rust: ${{ steps.filter.outputs.rust }}
+      supply-chain: ${{ steps.filter.outputs.supply-chain }}
+      swift: ${{ steps.filter.outputs.swift }}
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: dorny/paths-filter@v4.0.3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '.github/workflows/ci.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'proxy/**'
+              - 'scripts/package-proxy-release.sh'
+            swift:
+              - '.github/workflows/**'
+              - 'Package.resolved'
+              - 'Package.swift'
+              - 'macos/**'
+              - 'scripts/**'
+              - 'tests/**'
+            fuzz:
+              - '.github/workflows/ci.yml'
+              - 'fuzz/**'
+              - 'proxy/**'
+            supply-chain:
+              - '.github/workflows/ci.yml'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'Package.resolved'
+              - 'deny.toml'
+              - 'scripts/audit-swift-dependencies.sh'
+
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate Rust coverage report
@@ -59,11 +106,23 @@ jobs:
 
   swift:
     runs-on: macos-15
+    timeout-minutes: 20
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
     steps:
       - uses: actions/checkout@v7.0.0
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swift-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}-${{ hashFiles('Package.swift', 'macos/**/*.swift') }}
+          restore-keys: |
+            swift-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}-
       - run: bash tests/release_scripts_test.sh
       - run: ruby tests/localization_catalog_test.rb
       - run: ruby tests/logging_privacy_contract_test.rb
+      - run: ruby tests/managed_skill_safety_contract_test.rb
       - run: ruby tests/swift_concurrency_contract_test.rb
       - run: ruby tests/isolation_evidence_verifier_test.rb
       - name: Run Swift tests with coverage
@@ -92,16 +151,32 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.fuzz == 'true'
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: fuzz
+          workspaces: fuzz -> fuzz/target
       - name: Install cargo-fuzz for the runner host
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Check fuzz package formatting
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - name: Run bounded protocol parser fuzzing
         run: cargo fuzz run protocol fuzz/corpus/protocol -- -max_total_time=60 -timeout=10
 
   supply-chain:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    if: needs.changes.outputs.supply-chain == 'true'
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@stable

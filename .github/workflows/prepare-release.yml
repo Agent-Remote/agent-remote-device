@@ -12,13 +12,27 @@ permissions:
   actions: write
   contents: write
 
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
 jobs:
   prepare:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swift-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}-${{ hashFiles('Package.swift', 'macos/**/*.swift') }}
+          restore-keys: |
+            swift-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}-
       - name: Normalize version
         id: version
         env:
@@ -59,6 +73,6 @@ jobs:
           fi
           git diff --exit-code
           git tag "v${VERSION}"
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin "HEAD:${GITHUB_REF_NAME}"
           git push origin "v${VERSION}"
           gh workflow run release.yml --ref "v${VERSION}" -f version="${VERSION}" -f build_number="${GITHUB_RUN_NUMBER}"

@@ -26,6 +26,17 @@ raise "version preparation does not commit CHANGELOG.md" unless prepare_commands
 
 rust_steps = ci.dig("jobs", "rust", "steps")
 raise "CI Rust job is missing" unless rust_steps
+ci_text = File.read(ci_path)
+raise "CI does not cancel superseded runs" unless ci_text.include?("concurrency:")
+raise "CI jobs do not have timeouts" unless ci_text.include?("timeout-minutes:")
+raise "CI does not classify changed paths" unless ci_text.include?("dorny/paths-filter@v4.0.3")
+raise "CI workflow changes can bypass release contract tests" unless ci_text.include?(".github/workflows/**")
+raise "CI does not cache Rust builds" unless ci_text.include?("Swatinem/rust-cache@v2.9.2")
+raise "CI does not cache Swift builds" unless ci_text.include?("actions/cache@v6.1.0")
+raise "CI still runs Rust tests before the coverage test run" if rust_steps.any? { |step| step["run"] == "cargo test --workspace" }
+raise "CI coverage does not run all Rust tests" unless rust_steps.any? { |step| step.fetch("run", "").include?("cargo llvm-cov --workspace") }
+fuzz_steps = ci.dig("jobs", "fuzz", "steps")
+raise "CI fuzz job does not enforce formatting" unless fuzz_steps.any? { |step| step.fetch("run", "").include?("cargo fmt --manifest-path fuzz/Cargo.toml") }
 
 resolved_version = rust_steps.find { |step| step["name"] == "Resolve proxy package version" }
 raise "CI does not resolve the proxy version from Cargo metadata" unless resolved_version&.fetch("run", "")&.include?("cargo metadata --format-version=1 --no-deps")
@@ -52,6 +63,11 @@ raise "release Swift vulnerability report is missing" unless validate_commands.i
 raise "release vulnerability reports are not signed" unless validate_commands.include?("cosign sign-blob")
 raise "release does not publish a GitHub Release" unless release.dig("jobs", "publish", "steps").any? { |step| step.fetch("uses", "").start_with?("softprops/action-gh-release@") }
 raise "release identity does not use release.yml" unless File.read(release_path).include?(".github/workflows/release.yml@${GITHUB_REF}")
+release_text = File.read(release_path)
+raise "release does not serialize duplicate runs" unless release_text.include?("concurrency:")
+raise "release jobs do not have timeouts" unless release_text.include?("timeout-minutes:")
+raise "release still compiles the cross installer" if release_text.include?("cargo install cross")
+raise "release does not install pinned cross efficiently" unless release_text.include?("tool: cross@0.2.5")
 
 raise "CI supply-chain job is missing" unless ci.dig("jobs", "supply-chain", "steps")
 

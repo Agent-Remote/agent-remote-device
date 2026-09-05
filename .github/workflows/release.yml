@@ -17,9 +17,14 @@ permissions:
   id-token: write
   attestations: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: taiki-e/install-action@v2
@@ -74,6 +79,7 @@ jobs:
   proxy:
     name: proxy (${{ matrix.label }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: validate
     strategy:
       fail-fast: false
@@ -90,8 +96,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: proxy-${{ matrix.target }}
       - name: Install pinned cross builder
-        run: cargo install cross --locked --version 0.2.5
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
       - name: Build proxy release
         env:
           BUILD_TOOL: cross
@@ -166,10 +177,19 @@ jobs:
   macos:
     name: community local-trust macOS application
     runs-on: macos-15
+    timeout-minutes: 45
     needs: validate
     environment: production-community-release
     steps:
       - uses: actions/checkout@v7.0.0
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: swift-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}-${{ hashFiles('Package.swift', 'macos/**/*.swift') }}
+          restore-keys: |
+            swift-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}-
       - name: Import persistent community signing certificate
         uses: apple-actions/import-codesign-certs@v3
         with:
@@ -279,6 +299,7 @@ jobs:
 
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: [proxy, macos]
     steps:
       - uses: actions/download-artifact@v8.0.1
