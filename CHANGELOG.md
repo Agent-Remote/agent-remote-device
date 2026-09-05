@@ -2,6 +2,16 @@
 
 All notable changes to this repository are recorded here.
 
+## v0.2.13 - 2026-09-05
+
+- fix(macos): handle scalar bounds and scroll fallback (287d0da)
+- fix(ci): use gnu target for fuzzing (329f08d)
+- ci: optimize workflow execution (5e3e453)
+- fix(macos): stabilize browser window and input handling (ec190e6)
+- fix(macos): harden window-bound GUI actions (6d9c5e3)
+- fix(logging): redact executor error type (85728d6)
+- fix: device control relay and GUI execution (bb436a9)
+
 ## v0.2.12 - 2026-09-03
 
 - feat: add session full-trust device control (c7e333d)
