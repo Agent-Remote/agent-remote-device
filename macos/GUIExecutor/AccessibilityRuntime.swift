@@ -2011,7 +2011,7 @@ enum AccessibilityTraversal {
     static func protocolSafeActions(_ actions: [String]) -> [String] {
         actions.filter { action in
             !action.isEmpty
-                && action.count <= 128
+                && action.unicodeScalars.count <= 128
                 && action.unicodeScalars.allSatisfy {
                     !CharacterSet.controlCharacters.contains($0)
                 }
@@ -2108,11 +2108,15 @@ enum AccessibilityTraversal {
         guard maximumCharacters > 0, maximumBytes > 0 else { return nil }
         var result = ""
         var resultBytes = 0
-        for character in value.prefix(maximumCharacters) {
-            let count = String(character).utf8.count
-            if resultBytes + count > maximumBytes { break }
-            result.append(character)
-            resultBytes += count
+        var scalarCount = 0
+        for scalar in value.unicodeScalars {
+            guard scalarCount < maximumCharacters else { break }
+            let scalarString = String(scalar)
+            let scalarBytes = scalarString.utf8.count
+            if resultBytes + scalarBytes > maximumBytes { break }
+            result.append(scalarString)
+            resultBytes += scalarBytes
+            scalarCount += 1
         }
         return result.isEmpty ? nil : result
     }

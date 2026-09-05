@@ -15,6 +15,17 @@ import Testing
     ]) == ["AXPress", "AXShowMenu"])
 }
 
+@Test func accessibilityBoundsProtocolTextByUnicodeScalars() {
+    let combiningText = String(repeating: "က\u{1037}", count: 100)
+    let bounded = AccessibilityTraversal.boundedText(
+        combiningText,
+        maximumCharacters: 10,
+        maximumBytes: 1_024
+    )
+
+    #expect(bounded?.unicodeScalars.count == 10)
+}
+
 @MainActor
 @Test func editableFocusFallsBackToPressOnlyForNativeAppleApplications() {
     #expect(AccessibilityRuntime.shouldFallbackEditableTextFocusToPress(

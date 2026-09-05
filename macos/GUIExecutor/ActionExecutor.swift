@@ -181,23 +181,38 @@ public final class ActionExecutor {
                 do {
                     try rejectSecureInput(for: action)
                     if case let .scrollElement(_, direction, pages) = action {
-                        let prior = try accessibility.scrollPosition(
-                            for: target,
-                            direction: direction
-                        )
-                        if !prior.isAtBoundary(for: direction) {
+                        let prior: AccessibilityScrollPosition?
+                        do {
+                            prior = try accessibility.scrollPosition(
+                                for: target,
+                                direction: direction
+                            )
+                        } catch let error as AccessibilityFailure
+                            where error == .operationFailed
+                        {
+                            // Some native controls advertise page-scroll actions
+                            // without exposing a readable scrollbar. Their
+                            // position cannot be verified, but a bounded wheel
+                            // fallback still provides the documented operation.
+                            prior = nil
+                        }
+                        if prior?.isAtBoundary(for: direction) != true {
                             var requiresFallback = false
-                            do {
-                                try accessibility.perform(action, target: target)
-                                try await Task.sleep(for: .milliseconds(150))
-                                let observed = try accessibility.scrollPosition(
-                                    for: target,
-                                    direction: direction
-                                )
-                                requiresFallback = !observed.moved(from: prior, in: direction)
-                            } catch let error as AccessibilityFailure
-                                where error == .operationFailed
-                            {
+                            if let prior {
+                                do {
+                                    try accessibility.perform(action, target: target)
+                                    try await Task.sleep(for: .milliseconds(150))
+                                    let observed = try accessibility.scrollPosition(
+                                        for: target,
+                                        direction: direction
+                                    )
+                                    requiresFallback = !observed.moved(from: prior, in: direction)
+                                } catch let error as AccessibilityFailure
+                                    where error == .operationFailed
+                                {
+                                    requiresFallback = true
+                                }
+                            } else {
                                 requiresFallback = true
                             }
                             if requiresFallback {
@@ -206,7 +221,8 @@ public final class ActionExecutor {
                                     pages: pages,
                                     target: target,
                                     context: context,
-                                    accessibility: accessibility
+                                    accessibility: accessibility,
+                                    prior: prior
                                 )
                             }
                         }
@@ -261,10 +277,10 @@ public final class ActionExecutor {
         pages: UInt8,
         target: ElementTarget,
         context: WindowContext,
-        accessibility: AccessibilityRuntime
+        accessibility: AccessibilityRuntime,
+        prior: AccessibilityScrollPosition? = nil
     ) async throws {
-        let prior = try accessibility.scrollPosition(for: target, direction: direction)
-        if prior.isAtBoundary(for: direction) { return }
+        if let prior, prior.isAtBoundary(for: direction) { return }
         let visibleFrame = try accessibility.visibleScreenFrame(
             for: target,
             windowFrame: context.windowFrame
@@ -304,9 +320,11 @@ public final class ActionExecutor {
         try await Task.sleep(for: .milliseconds(50))
         scroll.post(tap: .cghidEventTap)
         try await Task.sleep(for: .milliseconds(150))
-        let observed = try accessibility.scrollPosition(for: target, direction: direction)
-        guard observed.moved(from: prior, in: direction) else {
-            throw AccessibilityFailure.operationFailed
+        if let prior {
+            let observed = try accessibility.scrollPosition(for: target, direction: direction)
+            guard observed.moved(from: prior, in: direction) else {
+                throw AccessibilityFailure.operationFailed
+            }
         }
     }
 
