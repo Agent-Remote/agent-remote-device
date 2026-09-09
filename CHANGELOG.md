@@ -36,6 +36,80 @@ All notable changes to this repository are recorded here.
 - docs: define independent release policy (1c39d14)
 - feat: align device documentation and release automation (0ab0686)
 
+## v0.2.7 - 2026-08-13
+
+- fix: harden computer use interaction recovery (2cfaeb1)
+
+## v0.2.6 - 2026-08-10
+
+- fix: make computer use sessions resilient (1ff56a7)
+- test: support release Swift weak references (f153ccf)
+
+## v0.2.5 - 2026-08-09
+
+- docs: document default computer use v2 negotiation (306b257)
+
+## v0.2.4 - 2026-08-09
+
+- chore: release v0.2.4 (29e9715)
+
+## v0.2.3 - 2026-08-09
+
+- feat: harden computer use v2 workflows (6b3c9c2)
+- fix: require explicit self in relay closures (3b164fb)
+- test: support strict weak reference compilation (1a2e480)
+
+## v0.2.2 - 2026-08-07
+
+- fix: stabilize computer use v2 sessions (ef278e7)
+- fix: keep relay failures out of unified logs (b433986)
+- test: restore the Rust coverage gate (17e9acd)
+
+## v0.2.1 - 2026-08-05
+
+- feat: add AX-first computer use v2 (d598e21)
+
+## v0.2.0 - 2026-08-04
+
+- feat: add device branding and app icon (d99484f)
+
+## v0.1.9 - 2026-08-04
+
+- feat: stabilize the device control lifecycle and errors (1ace86d)
+
+## v0.1.8 - 2026-08-03
+
+- feat: add local device session binding (08a732d)
+
+## v0.1.7 - 2026-08-01
+
+- chore: release v0.1.7 (3efd420)
+
+## v0.1.6 - 2026-08-01
+
+- chore: release v0.1.6 (07c9f39)
+
+## v0.1.5 - 2026-07-31
+
+- chore: release v0.1.5 (a4e56f1)
+
+## v0.1.4 - 2026-07-31
+
+- chore: release v0.1.4 (3b166ad)
+
+## v0.1.3 - 2026-07-31
+
+- fix: avoid interactive runner trust changes (6b1805b)
+
+## v0.1.2 - 2026-07-31
+
+- fix: trust the community signer in the runner keychain (b29942f)
+
+## v0.1.1 - 2026-07-31
+
+- feat: build the community-signed macOS release (9fd1673)
+- fix: update the device release lockfile version (f01e8b6)
+
 ## v0.1.0 - 2026-07-31
 
 - feat: add the macOS device control app, approval UI, and executor XPC services

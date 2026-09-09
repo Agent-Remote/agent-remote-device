@@ -29,7 +29,7 @@ trap 'rm -f "$TMP"' EXIT
   if [ -n "$NOTES" ]; then
     printf "%s\n" "$NOTES"
   else
-    echo "- Release metadata update."
+    echo "- chore: prepare v${VERSION} from ${PREVIOUS_TAG:-the initial source} with repository-owned version metadata only."
   fi
   echo
   if [ -f CHANGELOG.md ]; then
