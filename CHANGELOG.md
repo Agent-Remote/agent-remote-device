@@ -2,6 +2,10 @@
 
 All notable changes to this repository are recorded here.
 
+## v0.2.14 - 2026-09-09
+
+- fix(release): complete changelog history (cce7293)
+
 ## v0.2.13 - 2026-09-05
 
 - fix(macos): handle scalar bounds and scroll fallback (287d0da)
